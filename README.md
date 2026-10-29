@@ -1,0 +1,323 @@
+# Gears
+
+Gears is a small extensible agent harness that runs on Linux and Motor OS. Its
+core owns provider streaming, one agent loop, cancellation, sessions, terminal
+UIs, command hooks, and configured directory tools. It does not prescribe a
+coding workflow.
+
+## Run
+
+Start `gears`. The first time, it asks which provider to use (the shipped
+`gears.toml` offers OpenRouter, OpenAI and a local server), the local server's
+address, a model from the provider's list or any other id, and the API key,
+which is typed hidden and saved in the Gears directory (mode 0600 on Linux). Later starts ask nothing; `/setup` asks again. A `-p` run never
+asks. Nothing needs editing in `gears.toml`.
+
+Each provider names its key file (`api_key_file`, kept in the Gears directory);
+`OPENROUTER_API_KEY` overrides it for one run, and a provider without a key
+file is sent no key. A model can also be given directly:
+
+    gears --model provider/model
+    gears -p "answer once" --model provider/model
+    gears ask --model provider/model "provider diagnostic"
+
+Gears chooses the full-screen UI when both input and output are terminals.
+Use --ui line or --ui tui to choose explicitly.
+
+Without `--config`, Gears reads `gears.toml` from the Gears directory. Run from
+its own source tree (`cargo run` or `lorry run` in the Gears source directory), it uses
+the shipped `config/gears.toml` and the `tools/` beside it when the Gears
+directory has none, and asks which to use when both exist. Keys, settings and sessions always stay in the Gears
+directory. A provider address saved in `provider.toml` replaces the
+configured one, and its host is allowed for egress.
+
+The optional `tools/sh` directory receives one string command and runs it in
+the selected workspace through `bash -c` on Linux or `/system/bin/rush -c` on
+Motor OS. It is not a
+sandbox: an approved command has the same filesystem authority as Gears and
+may leave the workspace. Stdout, stderr, status, timeout, cancellation, and
+truncation remain distinct. The working directory and exports it saves live
+beside a saved session, or in `sessions/ephemeral/` in the Gears directory
+for an ephemeral one; Gears removes the ephemeral state at exit, and what a
+killed Gears left there at its next start.
+
+Gears checks saved permission grants before hooks. A saved denial or hook
+denial blocks the call. A hook may allow it or require fresh confirmation.
+Otherwise a saved allowance runs only in an attended UI, which asks when no
+answer is saved. The choices are `y/s/g` to allow once, for this session, or
+globally, and `n/S/G` to deny at those scopes. Session grants survive resume;
+new, forked, and cloned sessions do not inherit them. In `-p` runs, saved
+allowances are ignored and calls without hook authority are denied. Gears does
+not infer safe shell commands. The provider credential is removed from the
+environment inherited by tool and hook processes.
+
+## Configuration
+
+The default configuration is ~/.gears/gears.toml on Linux and
+/user/cfg/gears/gears.toml on Motor OS. A minimal file is:
+
+    version = 1
+
+    [provider]
+    base_url = "https://openrouter.ai/api/v1"
+    model = "provider/model"
+
+No directory tool is enabled by default. To add the shipped shell tool, copy
+`tools/sh` into the Gears directory and add:
+
+    [[tools]]
+    directory = "tools/sh"
+    enabled = true
+
+    [models]
+    used = ["provider/model", "another/model"]
+
+[config/gears.toml](config/gears.toml) lists all shipped directories with tools
+disabled. Copy it and `tools/` into the Gears directory for the complete
+example. Linux manifests for `rg` and `cargo` use `/usr/bin`; adjust their
+absolute executable paths for other installations.
+
+Important optional fields are:
+
+    [net]
+    egress_allowlist = ["openrouter.ai"]
+
+    [provider]
+    api_key_file = "/absolute/path/to/key"
+    ca_cert = "/absolute/path/to/ca.pem"
+
+    [runtime]
+    max_tool_rounds = 32
+
+    [context]
+    window_tokens = 128000
+    output_reserve_tokens = 16384
+    recent_tail_tokens = 20000
+
+An unknown key anywhere in the file is an error, so a typo is reported at
+startup instead of being ignored.
+
+The optional batteries coding workflow has a separate sample configuration,
+[`config/gears-batteries.toml`](config/gears-batteries.toml). Install it in
+your Gears directory with the contents of `tools/`, and install
+`gears-batteries` beside `gears`.
+Copy the sample configuration and tools from this repository before use. Start from your workspace with:
+
+```sh
+gears --config /user/cfg/gears/gears-batteries.toml --model MODEL
+```
+
+On Linux, use `~/.gears/gears-batteries.toml` as the configuration path.
+The sample selects OpenRouter and reads `openrouter.key` in the Gears directory.
+For a local OpenAI-compatible server, set `providers.local.base_url` and
+select `--provider local --model MODEL`. Only loopback HTTP is enabled.
+If the server uses another host, add it to both `net.egress_allowlist` and
+`net.plain_http_allowlist` when using HTTP.
+The local provider has no key file and is sent no key.
+The sample registers project instructions and `todo`, enables the six
+batteries tools plus shell, Gix, Lorry and curl, and applies the batteries
+approval policy. Declare a literal check vector in the workspace's
+`.gears/batteries.toml`, for example `check = ["lorry", "test"]` on Motor OS
+or `check = ["cargo", "test", "--offline"]` on Linux.
+See the [batteries guide](batteries.md) for check evidence,
+file-read requirements and policy limits.
+
+Hooks are listed in execution order:
+
+    [[hooks]]
+    name = "project_policy"
+    command = ["/absolute/path/to/hook", "--json"]
+    events = ["permission", "tool_result"]
+    timeout_seconds = 30
+    max_output_bytes = 1048576
+
+Omitting `events` receives every event. An explicit list starts the hook only
+for those events; `events = []` disables its invocations. Include `initialize`
+to register prompt fragments or tools, and `tool_execute` to execute its tools.
+
+Configured hooks are trusted code and run with the user's authority. There is
+no directory scan, shell interpolation, hot reload, or in-process extension
+runtime. See [hook-protocol.md](hook-protocol.md) for the version-1 protocol.
+
+Hooks can register slash commands with help text. Their one-line hints appear
+in the TUI status line and after turns or hook commands in the line UI. An
+empty hint clears the current text; JSONL exposes updates as `hint` records.
+
+## Sessions
+
+Saved sessions are versioned append-only JSONL trees grouped by canonical
+workspace:
+
+- Linux: ~/.gears/sessions/
+- Motor OS: /user/cfg/gears/sessions/
+
+Each entry has an id and parent_id. Selecting an earlier entry changes only
+the conversation branch; it does not undo commands or filesystem changes.
+Only one process may write a saved session. A partial final record is ignored
+after a crash, while earlier corruption is reported. A session holding an
+entry of a kind this Gears does not write, or an unknown field, is refused.
+
+Interactive UIs display the saved active branch when a session is opened or
+selected, including messages from before compaction. The full-screen UI
+keeps the latest 1 MiB of display text; Page Up and Page Down scroll it.
+Displaying history does not rerun tools or request a model response.
+One-shot text and JSONL output contain only the new run's output.
+
+Gears also locks its user directory for the lifetime of the run: it holds an
+exclusive file lock on `gears.lock` (`flock` on Linux, a sys-io file lock on
+Motor OS), which the system releases when Gears exits or is killed. A second
+independent Gears exits with "Another gears session PID is running.
+Exiting."; nested runs share their checked ancestor's lock. The file stays in
+the Gears directory; the PID in it only names the current owner.
+
+Library callers can use `session::read_snapshot(path)` or `Store::read(id)`
+while the owning process writes. The immutable snapshot includes the usable
+complete prefix, omits unfinished records and tool rounds, and leaves the
+source file and writer lock untouched. `Store::clone_active_with_options`
+can copy that snapshot into a saved or ephemeral child session.
+The CLI accepts `--fork ID --ephemeral -p 'summarize this work'` to read a live
+parent's usable history and run a child without saving its conversation.
+Add `--fork-entry ENTRY` to end the copy at an exact saved entry, including
+one from before a later compaction. An unknown entry or unfinished tool round
+is refused; the source session remains unchanged and writable.
+
+For machine-readable one-shot output, use `-p PROMPT --output jsonl`.
+Version 1 starts with a `session` record containing `session_id`, `path`
+(null for an ephemeral session), and `session_format_version`. Streaming
+records have types `text`, `reasoning`, `tool_start`, `tool_output`,
+`tool_result`, `permission`, `notice`, `usage`, and `turn_end`. Tool results
+include the call id, error flag, and three-state outcome. Every record is
+one flushed JSON line; embedded newlines are escaped.
+
+The last `final` record contains `success`, `answer`, `error`, and numeric
+`usage` for this run, including compaction requests. `session_usage` includes
+earlier history too. Unknown cost is null; `cost_is_partial` identifies a
+partly priced total. A failed turn produces a final error and a nonzero
+exit status. Errors before a session is ready use stderr. JSONL runs are
+unattended and follow the same permission rules as other `-p` runs.
+
+Useful startup options are --continue, --resume ID, --session ID,
+--fork ID, --ephemeral, and --name NAME. Interactive commands include /new,
+/resume, /name, /session, /tree, /label, /fork, /clone, /compact, /tools,
+/tool, /permissions, and /permission. Use
+/label ENTRY [TEXT] to set or clear an entry label. Fork selects an earlier
+user prompt; clone copies the current active branch into a new file.
+Use `/tool enable|disable|reset NAME [--global]` to change a directory tool's
+effective state and `/permission revoke NAME [--global]` to remove grants.
+
+`gears reset` (or `/reset` in a running Gears) asks once, then removes
+everything the user and Gears added: key files, saved settings and model
+choices, `batteries.toml`, memory, skills and sessions in the Gears directory,
+and `.gears/` in the current directory. It keeps what an installation
+provides: `gears.toml`, `gears-batteries.toml` and `tools/`. `/reset`
+continues in a new session; the provider, model and key already loaded stay in
+use until Gears restarts. `gears reset` refuses to run inside another Gears.
+
+Compaction summarizes older active-branch context and retains a recent tail.
+It appends a compaction entry but never deletes history. /compact accepts optional
+focus text. Automatic compaction uses the configured context limit, output
+reserve, and recent-tail size.
+
+Prompt resources and hook/tool manifests are loaded from the current
+installation when a session is opened. Their hashes are appended as a runtime
+identity; a change produces one notice.
+
+## A llama.cpp server on the VM host
+
+Build and boot the development image from the repository root after setting
+up the Motor toolchain:
+
+    make -j"$(nproc)" dev.img BUILD=release
+    vm_images/release/run-dev.sh
+
+With the standard TAP setup, the host address is 192.168.4.1 and the guest is
+192.168.4.2. Restore the TAP after a host reboot with
+`vm_images/release/create-tap.sh` if needed. On the host, start llama.cpp with
+your model, using a context size the model supports:
+
+    llama-server -m /absolute/path/to/model.gguf --alias local \
+      --host 192.168.4.1 --port 8080 --ctx-size 32768 --parallel 1 --jinja
+
+Tool use requires a model and chat template supporting tool calls. An
+unauthenticated local server needs no key file. Save this as `/user/cfg/gears/gears.toml`:
+
+```toml
+version = 1
+
+[provider]
+base_url = "http://192.168.4.1:8080/v1"
+model = "local"
+
+[net]
+egress_allowlist = ["192.168.4.1"]
+plain_http_allowlist = ["192.168.4.1"]
+
+[context]
+window_tokens = 32768
+output_reserve_tokens = 4096
+recent_tail_tokens = 8192
+```
+
+The HTTP list must be a subset of the egress list. Both use exact host
+matching: an entry permits any port on that host, not just port 8080. HTTP
+sends prompts and any bearer key without encryption. HTTPS remains the
+default; a TLS failure never falls back to HTTP. A plaintext `base_url`
+whose host is missing from either list is refused when the config loads.
+OpenRouter receives earlier assistant reasoning on subsequent turns. Other
+hosts omit it by default; set `reasoning_echo = true` or `false` under
+`[provider]` or a named `[providers.NAME]` to override the host default.
+
+A provider without `api_key_file` is sent no `Authorization` header, and
+`OPENROUTER_API_KEY` is ignored for it, so a cloud key never travels over HTTP
+to a local server. If the server uses authentication, give the provider an
+`api_key_file` holding its key.
+
+Check the host connection and start Gears from the desired guest workspace:
+
+    /system/bin/curl --proto =http http://192.168.4.1:8080/health
+    /devtools/bin/gears ask "Reply with a short hello."
+    /devtools/bin/gears
+
+Use `--ui line` for the line interface or `-vv` for transport diagnostics.
+Gears appends `/chat/completions` to the configured API root. Match the Gears
+context settings to the server's context capacity.
+
+## Build and test
+
+Gears is maintained independently of Motor OS. On Linux, use the selected Rust
+toolchain and install curl 8.3 or newer, grep, Bash, and the common command-line
+utilities used by the shipped tools. Fetch dependencies before the offline gate:
+
+    cargo fetch --locked
+    sh tests/full-test.sh --release
+    cargo fmt -- --check
+    cargo clippy --all-targets --release -- -D warnings
+
+On Motor OS, copy this repository into a writable directory such as
+`/devtools/src/gears` on a developer image. Provision dependencies, then build
+and test entirely inside Motor OS:
+
+    cd /devtools/src/gears
+    lorry vendor --accept-all
+    rush tests/full-test.sh --release
+
+The gate builds gears, gears-batteries, and the existing smoke examples, runs
+unit and integration tests plus mock-provider tests, then exercises shipped
+tools and the batteries workflow with the local compiler. Omit `--release`
+for debug builds. Component gates are `tests/test-gears-http.sh` and
+`tests/test-gears-batteries.sh`, invoked with sh or rush on the respective OS.
+
+All automated provider traffic stays on local loopback. Tests do not boot VMs,
+use SSH, or require a Motor OS checkout. Dependency provisioning may access
+the network; automated tests never contact a real Internet provider.
+
+Unix process-group escape, executable-script permission/replacement, and
+Linux-only Cargo-manifest cases remain Unix-only. The former SSH pseudo-terminal
+setup-to-TUI case is omitted; existing native line-UI setup and session cases
+remain. The former guest curl and approval checks are covered by the existing
+local provider, CLI, and runtime suites. TLS fixtures are in `tests/tls`.
+Search tests and batteries use regular `grep` on Linux and the installed `rg`
+on Motor OS.
+
+For a manual mock-provider session, build and run the example locally on the
+same OS as Gears. A real-provider check is separate and must be authorized.
