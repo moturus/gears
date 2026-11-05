@@ -373,11 +373,23 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(10);
                 None
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+            // Everything that asks for another line rather than sending
+            // this one: Alt-Enter everywhere, Shift-Enter where the terminal
+            // reports the shift (`ESC[13;2u`), and the Ctrl+J a raw terminal
+            // reports for a bare line feed.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
                 self.editor.insert_char('\n');
                 None
             }
             KeyCode::Char('j') if control => {
+                self.editor.insert_char('\n');
+                None
+            }
+            KeyCode::Char('\n') => {
                 self.editor.insert_char('\n');
                 None
             }
@@ -584,10 +596,16 @@ impl App {
                 Kind::Error => "error> ",
             };
             let available = width.saturating_sub(prefix.len()).max(1);
+            // Continuation lines are indented by the prefix's own width, so a
+            // multi-line entry keeps its columns straight.
+            let indent = " ".repeat(prefix.len());
             for (index, line) in wrap(&entry.text, available).into_iter().enumerate() {
                 result.push((
                     entry.kind,
-                    format!("{}{line}", if index == 0 { prefix } else { "     " }),
+                    format!(
+                        "{}{line}",
+                        if index == 0 { prefix } else { indent.as_str() }
+                    ),
                 ));
             }
         }
@@ -1732,6 +1750,53 @@ mod tests {
             quit: false,
             last_frame: None,
         }
+    }
+
+    #[test]
+    fn entry_continuations_indent_to_the_prefix_width() {
+        let mut app = app();
+        app.push(Kind::Notice, "one\ntwo\nthree".to_string(), false);
+        app.push(Kind::User, "first\nsecond".to_string(), false);
+        assert_eq!(
+            app.transcript_lines(80),
+            [
+                (Kind::Notice, "note> one".to_string()),
+                (Kind::Notice, "      two".to_string()),
+                (Kind::Notice, "      three".to_string()),
+                (Kind::User, "you> first".to_string()),
+                (Kind::User, "     second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_bare_enter_submits_the_prompt() {
+        let mut app = app();
+        let press = |code, modifiers| KeyEvent::new(code, modifiers);
+        app.editor.insert_paste("one");
+        // Ctrl+J: what a raw terminal reports for a bare line feed.
+        assert!(
+            app.key(press(KeyCode::Char('j'), KeyModifiers::CONTROL))
+                .is_none()
+        );
+        app.editor.insert_paste("two");
+        // Shift-Enter, which a terminal reports as `ESC[13;2u`.
+        assert!(
+            app.key(press(KeyCode::Enter, KeyModifiers::SHIFT))
+                .is_none()
+        );
+        app.editor.insert_paste("three");
+        // Alt-Enter, which one reports as `ESC CR`.
+        assert!(app.key(press(KeyCode::Enter, KeyModifiers::ALT)).is_none());
+        assert!(
+            app.key(press(KeyCode::Char('\n'), KeyModifiers::NONE))
+                .is_none()
+        );
+        assert_eq!(app.editor.text(), "one\ntwo\nthree\n\n");
+        assert!(matches!(
+            app.key(press(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Submit(text)) if text == "one\ntwo\nthree\n\n"
+        ));
     }
 
     #[test]

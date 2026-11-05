@@ -5,7 +5,7 @@ pub mod select;
 pub mod tui;
 pub mod tui_editor;
 
-use crate::runtime::{Approver, Observer, Runtime};
+use crate::runtime::{Approver, Observer, Runtime, ToolStatus};
 use crate::session::ToolState;
 
 enum Operation {
@@ -114,23 +114,48 @@ pub(crate) fn format_tools(runtime: &Runtime) -> Result<String, String> {
     if tools.is_empty() {
         return Ok("no directory tools configured".to_string());
     }
-    Ok(tools
+    Ok(format_tool_rows(&tools))
+}
+
+/// Pads every column so the `:`, `(` and `)` line up: the state column is
+/// padded before the bracket, and the source is padded inside it, because a
+/// bracket only stays in column if the text before it does.
+fn format_tool_rows(tools: &[ToolStatus]) -> String {
+    let rows = tools
         .iter()
         .map(|tool| {
-            format!(
-                "{}: {} ({}){}",
-                tool.name,
+            (
+                tool.name.as_str(),
                 if tool.enabled { "enabled" } else { "disabled" },
                 tool.source,
                 if tool.available {
                     ""
                 } else {
                     ", unavailable here"
-                }
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let name_width = widest(&rows, |row| field_width(row.0));
+    let state_width = widest(&rows, |row| field_width(row.1));
+    let source_width = widest(&rows, |row| field_width(row.2));
+    rows.iter()
+        .map(|row| {
+            format!(
+                "{:<name_width$} : {:<state_width$} ({:<source_width$}){}",
+                row.0, row.1, row.2, row.3
             )
         })
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n")
+}
+
+fn widest<T>(rows: &[T], width: impl Fn(&T) -> usize) -> usize {
+    rows.iter().map(width).max().unwrap_or(0)
+}
+
+fn field_width(text: &str) -> usize {
+    text.chars().count()
 }
 
 pub(crate) fn parse_permission_action(argument: &str) -> Result<(&str, bool), String> {
@@ -214,5 +239,45 @@ mod tests {
         for invalid in ["", "revoke", "revoke sh extra", "revoke --global sh"] {
             assert!(parse_permission_action(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn tool_rows_align_their_colons_and_brackets() {
+        let rows = [
+            ToolStatus {
+                name: "sh".to_string(),
+                enabled: true,
+                available: true,
+                source: "config",
+            },
+            ToolStatus {
+                name: "web_search".to_string(),
+                enabled: false,
+                available: false,
+                source: "session",
+            },
+        ];
+        let text = format_tool_rows(&rows);
+        assert_eq!(
+            text,
+            "sh         : enabled  (config )\nweb_search : disabled (session), unavailable here"
+        );
+        let lines = text.lines().collect::<Vec<_>>();
+        let column = |line: &&str, mark: char| line.find(mark).unwrap();
+        assert!(
+            lines
+                .iter()
+                .all(|line| column(line, ':') == column(&lines[0], ':'))
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| column(line, '(') == column(&lines[0], '('))
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| column(line, ')') == column(&lines[0], ')'))
+        );
     }
 }

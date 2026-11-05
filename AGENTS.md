@@ -1,14 +1,36 @@
 # Gears development
 
+## What is Gears and Motor OS
+
+Gears (the current repo) is a (coding) agent harness that compiles natively
+for Motor OS and Linux (and can be cross-compiled from Linux for Motor OS).
+
+To determine which OS you are running, run `uname`.
+
+Motor OS is NOT Unix, but it has a posixy shell (rush) and a bunch of posixy
+commands in $PATH (run `echo $PATH`).
+
+Note that there is no `git`, but `gix` is close enough. There is no `cargo`,
+but `lorry` is close enough.
+
+## Lorry workflow
+
+`lorry fetch` - fetch dependencies of the repo
+`lorry vendor` (+ 'y') - approve dependencies of the repo
+`lorry build [--release]`
+`lorry test [--release]`
+(etc). 
+
+## Motor OS documentation
+
+/devtools/www/ should contain some high-level documents on Motor OS;
+if not there, ask the user where to find them.
+
+Use `curl` to inspect crates.io and github.com.
+
+## How to work on Gears
+
 Prefer secure, correct, simple Rust using std and native Motor OS APIs.
 Keep handwritten changes in small patches and add comments sparingly.
 Do not commit without explicit instructions. Format with the repository-selected
 Rust toolchain and introduce no compiler or Clippy warnings.
-
-Run `sh tests/full-test.sh --release` on Linux, or
-`rush tests/full-test.sh --release` on Motor OS after `lorry vendor --accept-all`.
-Tests execute locally and use local provider fixtures; do not add SSH, VM boot,
-remote test execution or Internet-provider requests to a test gate.
-Diagnose failures rather than adding retries, longer timeouts or ignored errors.
-Changes to Motor OS, its runtime, stdlib or external dependency forks must be
-discussed explicitly before implementation.
