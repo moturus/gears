@@ -163,6 +163,29 @@ keeps the latest 1 MiB of display text; Page Up and Page Down scroll it.
 Displaying history does not rerun tools or request a model response.
 One-shot text and JSONL output contain only the new run's output.
 
+In the full-screen prompt, bare Enter sends; Ctrl+J, Shift+Enter, Ctrl+Enter,
+and Alt+Enter insert a newline, and so does Enter typed right after a
+backslash, which it replaces. The backslash form works in every terminal and
+through every multiplexer, since it uses no key they might fail to report.
+Shift+Enter and Ctrl+Enter require a terminal that reports those modifiers. Gears requests the Kitty keyboard protocol;
+terminals that send the same bytes for modified and bare Enter cannot be
+distinguished. Inside rmux, use a build that preserves Ctrl+J and modified
+Enter and requests this reporting from the outer terminal.
+
+Inside tmux, Gears also requests extended keys using `modifyOtherKeys`.
+For an outer terminal that supports extended keys, add this to `~/.tmux.conf`
+and reload it with `tmux source-file ~/.tmux.conf`:
+
+    set -s extended-keys on
+    set -as terminal-features 'xterm*:extkeys'
+    set -sq extended-keys-format csi-u
+
+The last setting selects the encoding Gears reads on tmux 3.5 and later;
+`-q` leaves older tmux versions, which already use CSI-u, unchanged.
+These settings cannot recover modifiers discarded by the outer terminal.
+For example, VTE 0.84 sends the same CR for bare, Shift-, and Ctrl-Enter;
+use Ctrl+J or Alt+Enter there, or a terminal that reports modified Enter.
+
 Gears also locks its user directory for the lifetime of the run: it holds an
 exclusive file lock on `gears.lock` (`flock` on Linux, a sys-io file lock on
 Motor OS), which the system releases when Gears exits or is killed. A second

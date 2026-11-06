@@ -8,7 +8,8 @@ use std::time::Duration;
 use crossterm::cursor;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
@@ -20,6 +21,8 @@ use crate::ui::tui_editor::{Edit, Editor};
 
 const POLL: Duration = Duration::from_millis(50);
 const TRANSCRIPT_BYTES: usize = 1024 * 1024;
+const ENABLE_TMUX_KEYS: &str = "\x1b[>4;2m";
+const DISABLE_TMUX_KEYS: &str = "\x1b[>4;0m";
 // rmux `status::AMBER`: keep shared terminal chrome visually consistent.
 const STATUS_COLOR: Color = Color::AnsiValue(222);
 
@@ -88,6 +91,7 @@ enum Action {
 
 struct Screen {
     left: bool,
+    tmux: bool,
 }
 
 /// Motor OS takes one Ctrl+C registration per process, and the setup questions
@@ -103,11 +107,14 @@ impl Screen {
     fn enter() -> Result<Self, String> {
         enable_ctrl_c_events()?;
         enable_raw_mode().map_err(|error| error.to_string())?;
-        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste, cursor::Hide) {
-            let _ = disable_raw_mode();
-            return Err(error.to_string());
-        }
-        Ok(Self { left: false })
+        let screen = Self {
+            left: false,
+            tmux: std::env::var_os("TMUX").is_some(),
+        };
+        paint_enter(&mut io::stdout(), screen.tmux)
+            .and_then(|()| io::stdout().flush())
+            .map_err(|error| error.to_string())?;
+        Ok(screen)
     }
 
     fn leave(&mut self, session: &str) -> Result<(), String> {
@@ -115,7 +122,7 @@ impl Screen {
         let raw = disable_raw_mode();
         let output = {
             let mut output = io::stdout().lock();
-            paint_exit(&mut output, width, height, session).and_then(|()| output.flush())
+            paint_exit(&mut output, width, height, session, self.tmux).and_then(|()| output.flush())
         };
         self.left = true;
         raw.and(output).map_err(|error| error.to_string())
@@ -128,8 +135,12 @@ impl Drop for Screen {
             return;
         }
         let _ = disable_raw_mode();
+        if self.tmux {
+            let _ = execute!(io::stdout(), Print(DISABLE_TMUX_KEYS));
+        }
         let _ = execute!(
             io::stdout(),
+            PopKeyboardEnhancementFlags,
             ResetColor,
             cursor::Show,
             DisableBracketedPaste
@@ -373,15 +384,7 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(10);
                 None
             }
-            // Everything that asks for another line rather than sending
-            // this one: Alt-Enter everywhere, Shift-Enter where the terminal
-            // reports the shift (`ESC[13;2u`), and the Ctrl+J a raw terminal
-            // reports for a bare line feed.
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-            {
+            KeyCode::Enter if !key.modifiers.is_empty() => {
                 self.editor.insert_char('\n');
                 None
             }
@@ -393,7 +396,13 @@ impl App {
                 self.editor.insert_char('\n');
                 None
             }
-            KeyCode::Enter => Some(Action::Submit(self.editor.submit())),
+            KeyCode::Enter => {
+                if self.editor.continue_after_backslash() {
+                    None
+                } else {
+                    Some(Action::Submit(self.editor.submit()))
+                }
+            }
             KeyCode::Backspace => {
                 self.editor.backspace();
                 None
@@ -645,10 +654,34 @@ fn paint_frame<W: Write>(output: &mut W, previous: Option<&Frame>, next: &Frame)
     Ok(())
 }
 
-fn paint_exit<W: Write>(output: &mut W, width: u16, height: u16, session: &str) -> io::Result<()> {
+fn paint_enter<W: Write>(output: &mut W, tmux: bool) -> io::Result<()> {
+    if tmux {
+        // tmux uses modifyOtherKeys requests, even when forwarding CSI-u keys.
+        queue!(output, Print(ENABLE_TMUX_KEYS))?;
+    }
+    queue!(
+        output,
+        EnableBracketedPaste,
+        // Ask capable terminals to distinguish modified Enter from bare CR.
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        cursor::Hide
+    )
+}
+
+fn paint_exit<W: Write>(
+    output: &mut W,
+    width: u16,
+    height: u16,
+    session: &str,
+    tmux: bool,
+) -> io::Result<()> {
+    if tmux {
+        queue!(output, Print(DISABLE_TMUX_KEYS))?;
+    }
     let message = single_line(&format!("Motor OS Gears session {session} exited."));
     queue!(
         output,
+        PopKeyboardEnhancementFlags,
         cursor::MoveTo(0, height.saturating_sub(1)),
         Clear(ClearType::CurrentLine),
         SetForegroundColor(STATUS_COLOR),
@@ -1770,33 +1803,45 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bare_enter_submits_the_prompt() {
+    fn enter_after_a_backslash_inserts_a_newline_instead_of_sending() {
         let mut app = app();
-        let press = |code, modifiers| KeyEvent::new(code, modifiers);
-        app.editor.insert_paste("one");
-        // Ctrl+J: what a raw terminal reports for a bare line feed.
-        assert!(
-            app.key(press(KeyCode::Char('j'), KeyModifiers::CONTROL))
-                .is_none()
-        );
+        app.editor.insert_paste("one\\");
+        assert!(app.edit(InputEvent::Key(KeyCode::Enter.into())).is_none());
         app.editor.insert_paste("two");
-        // Shift-Enter, which a terminal reports as `ESC[13;2u`.
-        assert!(
-            app.key(press(KeyCode::Enter, KeyModifiers::SHIFT))
-                .is_none()
-        );
-        app.editor.insert_paste("three");
-        // Alt-Enter, which one reports as `ESC CR`.
-        assert!(app.key(press(KeyCode::Enter, KeyModifiers::ALT)).is_none());
-        assert!(
-            app.key(press(KeyCode::Char('\n'), KeyModifiers::NONE))
-                .is_none()
-        );
-        assert_eq!(app.editor.text(), "one\ntwo\nthree\n\n");
+        assert_eq!(app.editor.text(), "one\ntwo");
         assert!(matches!(
-            app.key(press(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(Action::Submit(text)) if text == "one\ntwo\nthree\n\n"
+            app.edit(InputEvent::Key(KeyCode::Enter.into())),
+            Some(Action::Submit(text)) if text == "one\ntwo"
         ));
+    }
+
+    #[test]
+    fn only_a_bare_enter_submits_the_prompt() {
+        let newlines = [
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE),
+        ]
+        .into_iter()
+        .chain(
+            KeyModifiers::all()
+                .iter()
+                .map(|modifier| KeyEvent::new(KeyCode::Enter, modifier)),
+        )
+        .chain([KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+        )]);
+        for key in newlines {
+            let mut app = app();
+            app.editor.insert_paste("one");
+            assert!(app.edit(InputEvent::Key(key)).is_none(), "{key:?}");
+            app.editor.insert_paste("two");
+            assert_eq!(app.editor.text(), "one\ntwo", "{key:?}");
+            assert!(matches!(
+                app.edit(InputEvent::Key(KeyCode::Enter.into())),
+                Some(Action::Submit(text)) if text == "one\ntwo"
+            ));
+        }
     }
 
     #[test]
@@ -2126,7 +2171,7 @@ mod tests {
     #[test]
     fn exit_replaces_only_the_status_row_and_leaves_a_shell_gap() {
         let mut output = Vec::new();
-        paint_exit(&mut output, 80, 24, "session-42").unwrap();
+        paint_exit(&mut output, 80, 24, "session-42", false).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         assert!(!output.contains("[2J"), "{output:?}");

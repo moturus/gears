@@ -157,6 +157,18 @@ impl Editor {
         Edit::Changed
     }
 
+    /// Enter typed right after a backslash asks for another line rather than a
+    /// send: the backslash goes and a newline takes its place. Reports whether
+    /// that happened; otherwise the caller sends the text.
+    pub fn continue_after_backslash(&mut self) -> bool {
+        if !self.text[..self.cursor].ends_with('\\') {
+            return false;
+        }
+        self.detach_history();
+        self.text.replace_range(self.cursor - 1..self.cursor, "\n");
+        true
+    }
+
     pub fn left(&mut self) -> Edit {
         let Some(previous) = self.text[..self.cursor]
             .char_indices()
@@ -297,6 +309,24 @@ mod tests {
         assert_eq!(editor.home(), Edit::Unchanged);
         assert_eq!(editor.end(), Edit::Changed);
         assert_eq!(editor.cursor(), 5);
+    }
+
+    #[test]
+    fn enter_after_a_backslash_continues_the_line() {
+        let mut editor = small();
+        editor.insert_paste("ab\\");
+        assert!(editor.continue_after_backslash());
+        assert_eq!(editor.text(), "ab\n");
+        assert_eq!(editor.cursor(), 3);
+        editor.insert_paste("c");
+        assert!(!editor.continue_after_backslash());
+        assert_eq!(editor.text(), "ab\nc");
+        // Only the character before the cursor counts.
+        editor.left();
+        editor.insert_char('\\');
+        assert!(editor.continue_after_backslash());
+        assert_eq!(editor.text(), "ab\n\nc");
+        assert_eq!(editor.cursor(), 4);
     }
 
     #[test]
