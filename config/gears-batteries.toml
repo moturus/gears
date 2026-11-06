@@ -9,7 +9,8 @@ default_provider = "openrouter"
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
 api_key_file = "openrouter.key"
-models = ["~deepseek/deepseek-v4-flash-latest", "google/gemini-3.8-flash",
+models = ["~deepseek/deepseek-flash-latest", "google/gemini-3.8-flash",
+          "~deepseek/deepseek-pro-latest",
           "google/gemma-4-26b-a4b-it:free", "openai/gpt-6.1-sol",
           "openai/gpt-6-astra"]
 
