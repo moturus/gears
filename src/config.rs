@@ -7,6 +7,10 @@ use std::time::Duration;
 use serde::Deserialize;
 
 const DEFAULT_CONTEXT_TOKENS: u64 = 128_000;
+/// Model round trips one turn of an unattended run may use; attended sessions
+/// have no cap.
+const DEFAULT_TOOL_ROUNDS: usize = 256;
+const MAX_TOOL_ROUNDS: usize = 4096;
 const DEFAULT_OUTPUT_RESERVE: u64 = 16_384;
 const DEFAULT_RECENT_TAIL: u64 = 20_000;
 
@@ -77,7 +81,7 @@ impl Default for Config {
             default_model: None,
             log_file: None,
             log_level: crate::trace::Level::Info,
-            max_tool_rounds: 32,
+            max_tool_rounds: DEFAULT_TOOL_ROUNDS,
             context: ContextConfig {
                 window_tokens: DEFAULT_CONTEXT_TOKENS,
                 output_reserve_tokens: DEFAULT_OUTPUT_RESERVE,
@@ -341,9 +345,11 @@ impl Config {
                 .ok_or_else(|| format!("unknown trace level {level:?}"))?,
             None => crate::trace::Level::Info,
         };
-        let max_tool_rounds = raw.runtime.max_tool_rounds.unwrap_or(32);
-        if !(1..=256).contains(&max_tool_rounds) {
-            return Err("runtime.max_tool_rounds must be between 1 and 256".to_string());
+        let max_tool_rounds = raw.runtime.max_tool_rounds.unwrap_or(DEFAULT_TOOL_ROUNDS);
+        if !(1..=MAX_TOOL_ROUNDS).contains(&max_tool_rounds) {
+            return Err(format!(
+                "runtime.max_tool_rounds must be between 1 and {MAX_TOOL_ROUNDS}"
+            ));
         }
         let context = ContextConfig {
             window_tokens: raw.context.window_tokens.unwrap_or(DEFAULT_CONTEXT_TOKENS),
@@ -646,7 +652,7 @@ plain_http_allowlist = ["192.168.4.1"]"#,
     #[test]
     fn minimal_config_has_redesign_defaults() {
         let config = Config::parse("version = 1").unwrap();
-        assert_eq!(config.max_tool_rounds, 32);
+        assert_eq!(config.max_tool_rounds, 256);
         assert_eq!(config.context.output_reserve_tokens, 16_384);
         assert!(config.hooks.is_empty());
         // No provider or host is built in; they come from the shipped gears.toml.

@@ -87,7 +87,7 @@ Important optional fields are:
     ca_cert = "/absolute/path/to/ca.pem"
 
     [runtime]
-    max_tool_rounds = 32
+    max_tool_rounds = 256
 
     [context]
     window_tokens = 128000
@@ -96,6 +96,11 @@ Important optional fields are:
 
 An unknown key anywhere in the file is an error, so a typo is reported at
 startup instead of being ignored.
+
+`max_tool_rounds` bounds the model round trips in one turn of an unattended
+run, where nothing can interrupt a model that keeps calling tools: the default
+is 256 and the ceiling 4096. An attended session has no such cap; a turn runs
+until the model stops or Ctrl+C cancels it.
 
 The optional batteries coding workflow has a separate sample configuration,
 [`config/gears-batteries.toml`](config/gears-batteries.toml). Install it in

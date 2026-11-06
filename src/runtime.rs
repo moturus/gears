@@ -775,7 +775,14 @@ impl Runtime {
         tool_rounds: &mut usize,
     ) -> Result<(), String> {
         let mut stop_reminders = 0;
-        for _ in 0..self.max_tool_rounds {
+        // An attended turn runs until the model stops or the user cancels it;
+        // the round budget protects runs nobody is watching.
+        let budget = (!approver.attended()).then_some(self.max_tool_rounds);
+        loop {
+            if budget.is_some_and(|budget| *tool_rounds >= budget) {
+                let error = format!("tool round limit ({}) reached", self.max_tool_rounds);
+                return self.fail_turn(error, false, observer);
+            }
             self.maybe_compact(false, None, observer)?;
             let messages = loop {
                 self.handle_hook_questions(approver, observer)?;
@@ -877,8 +884,6 @@ impl Runtime {
                 }
             }
         }
-        let error = format!("tool round limit ({}) reached", self.max_tool_rounds);
-        self.fail_turn(error, false, observer)
     }
 
     /// Lifecycle hooks still observe a cancelled turn: they run with a fresh

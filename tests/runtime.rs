@@ -473,7 +473,7 @@ fn hook_commands_dispatch_to_the_owner_without_a_model_turn() {
 #[test]
 fn turn_end_metadata_counts_rounds_and_identifies_the_last_entry_on_all_exits() {
     for (case, responses, status, rounds, limit) in [
-        ("chat", vec![answer("done")], "completed", 0, 32),
+        ("chat", vec![answer("done")], "completed", 0, None),
         (
             "tools",
             vec![
@@ -488,28 +488,28 @@ fn turn_end_metadata_counts_rounds_and_identifies_the_last_entry_on_all_exits() 
             ],
             "completed",
             1,
-            32,
+            None,
         ),
         (
             "error",
             vec![Err(ProviderError::Protocol("broken".into()))],
             "error",
             0,
-            32,
+            None,
         ),
         (
             "cancel",
             vec![Err(ProviderError::Aborted("cancelled".into()))],
             "cancelled",
             0,
-            32,
+            None,
         ),
         (
             "limit",
             vec![tool("sh", r#"{"command":"printf limited"}"#)],
             "error",
             1,
-            1,
+            Some(1),
         ),
     ] {
         let fixture = Fixture::new(&format!("turn-end-{case}"));
@@ -526,12 +526,19 @@ fn turn_end_metadata_counts_rounds_and_identifies_the_last_entry_on_all_exits() 
                 timeout: Duration::from_secs(2),
                 max_output_bytes: 4096,
             }],
-            max_tool_rounds: limit,
+            max_tool_rounds: limit.unwrap_or(Config::default().max_tool_rounds),
             ..Config::default()
         };
         let mut runtime = fixture.runtime(Scripted::new(responses), &config);
+        // The round budget applies to unattended runs only.
+        let mut attended = FixedApproval(false);
+        let mut unattended = UnattendedApproval;
+        let approver: &mut dyn Approver = match limit {
+            Some(_) => &mut unattended,
+            None => &mut attended,
+        };
         let mut end = None;
-        let result = runtime.turn("work".into(), &mut FixedApproval(false), &mut |event| {
+        let result = runtime.turn("work".into(), approver, &mut |event| {
             if let Event::TurnEnd {
                 status,
                 tool_rounds,
@@ -1460,7 +1467,7 @@ read_only = true
 [process]
 output = "stdout"
 [process.command]
-linux = ["/usr/bin/printf", "%s"]
+linux = ["/bin/sh", "-c", "shift; printf '%s' \"$@\"", "fixture"]
 motor = ["/system/bin/rush", "-c", "shift; printf '%s' \"$@\"", "fixture"]
 [process.arguments]
 after_double_dash = ["text"]
@@ -1984,11 +1991,9 @@ fn zero_tool_round_budget_reports_an_error_instead_of_panicking() {
     let provider = Scripted::new(Vec::new());
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let error = runtime
-        .turn(
-            "question".to_string(),
-            &mut FixedApproval(false),
-            &mut |_| Ok(()),
-        )
+        .turn("question".to_string(), &mut UnattendedApproval, &mut |_| {
+            Ok(())
+        })
         .unwrap_err();
     assert!(error.contains("tool round limit (0) reached"), "{error}");
     assert!(provider.requests.lock().unwrap().is_empty());
@@ -2011,11 +2016,9 @@ fn tool_round_limit_stops_after_the_last_result() {
     let provider = Scripted::new(vec![tool("sh", r#"{"command":": > no-file"}"#)]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let error = runtime
-        .turn(
-            "question".to_string(),
-            &mut FixedApproval(false),
-            &mut |_| Ok(()),
-        )
+        .turn("question".to_string(), &mut UnattendedApproval, &mut |_| {
+            Ok(())
+        })
         .unwrap_err();
     assert!(error.contains("tool round limit (1) reached"), "{error}");
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
@@ -2023,6 +2026,36 @@ fn tool_round_limit_stops_after_the_last_result() {
     assert_eq!(messages.len(), 4);
     assert!(messages[2].text_content().contains("denied"));
     assert!(messages[3].text_content().contains("ended early"));
+}
+
+#[test]
+fn an_attended_turn_runs_past_the_round_budget() {
+    let fixture = Fixture::new("attended-rounds");
+    let config = Config {
+        max_tool_rounds: 1,
+        ..Config::default()
+    };
+    let provider = Scripted::new(vec![
+        tool("sh", r#"{"command":": > no-file"}"#),
+        tool("sh", r#"{"command":": > no-file"}"#),
+        answer("done"),
+    ]);
+    let mut runtime = fixture.runtime(provider.clone(), &config);
+    let mut rounds = None;
+    runtime
+        .turn(
+            "question".to_string(),
+            &mut FixedApproval(false),
+            &mut |event| {
+                if let Event::TurnEnd { tool_rounds, .. } = event {
+                    rounds = Some(tool_rounds);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+    assert_eq!(rounds, Some(2));
 }
 
 #[test]
