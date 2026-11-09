@@ -1,8 +1,8 @@
 //! Optional coding workflows using Gears' command-hook protocol.
 
 pub mod check;
-pub mod check_receipt;
 pub mod check_config;
+pub mod check_receipt;
 pub mod check_state;
 pub mod file_patch;
 pub mod file_read;

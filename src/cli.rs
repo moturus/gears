@@ -3,25 +3,8 @@
 use std::path::PathBuf;
 
 pub const COMMAND_NAMES: &[&str] = &[
-    "quit",
-    "exit",
-    "help",
-    "status",
-    "tools",
-    "tool",
-    "session",
-    "name",
-    "new",
-    "resume",
-    "label",
-    "tree",
-    "fork",
-    "clone",
-    "compact",
-    "model",
-    "provider",
-    "reset",
-    "setup",
+    "quit", "exit", "help", "status", "tools", "tool", "session", "name", "new", "resume", "label",
+    "tree", "fork", "clone", "compact", "model", "provider", "reset", "setup",
 ];
 
 pub const USAGE: &str = "\

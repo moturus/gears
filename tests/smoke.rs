@@ -467,9 +467,13 @@ fn jsonl_tool_records_report_the_call_and_its_output() {
     let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let call = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_jsonl","function":{"name":"sh","arguments":"{\"command\":\"printf 'tool output\\n'; printf 'tool error\\n' >&2\"}"}}]},"finish_reason":"tool_calls"}]}"#;
-    let server = MockServer::start(vec![sse_response(&[call]), sse_response(&[
-        r#"{"choices":[{"index":0,"delta":{"content":"finished"},"finish_reason":"stop"}]}"#,
-    ])]).unwrap();
+    let server = MockServer::start(vec![
+        sse_response(&[call]),
+        sse_response(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"finished"},"finish_reason":"stop"}]}"#,
+        ]),
+    ])
+    .unwrap();
     let cfg = config(&root, &server);
     let mut text = std::fs::read_to_string(&cfg).unwrap();
     text.push_str(&format!(
@@ -701,9 +705,7 @@ fn malformed_line_commands_report_errors_and_keep_the_session_open() {
         .stdin
         .take()
         .unwrap()
-        .write_all(
-            b"/tool enable\n/tool enable missing\n/tool disable\nhello\n/quit\n",
-        )
+        .write_all(b"/tool enable\n/tool enable missing\n/tool disable\nhello\n/quit\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(

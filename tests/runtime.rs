@@ -600,7 +600,11 @@ fn entry_hooks_identify_saved_outcomes_and_read_only_tools() {
         assert_eq!(payload["tool"]["read_only"], index == 1);
         assert_eq!(
             payload["outcome"],
-            if index < 2 { "completed" } else { "not_started" }
+            if index < 2 {
+                "completed"
+            } else {
+                "not_started"
+            }
         );
         let entry = runtime
             .session()
@@ -836,11 +840,7 @@ fn empty_tool_configuration_is_chat_only() {
     )
     .unwrap();
     runtime
-        .turn(
-            "hello".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("hello".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     let requests = provider.requests.lock().unwrap();
     assert!(requests[0].tools.is_empty());
@@ -900,21 +900,17 @@ type = "string"
     let mut output = String::new();
     let mut detail = String::new();
     runtime
-        .turn(
-            "print".to_string(),
-            &mut Unattended,
-            &mut |event| {
-                match event {
-                    Event::ToolOutput { name, text, .. } => {
-                        assert_eq!(name, "print");
-                        output.push_str(&text);
-                    }
-                    Event::ToolStart { detail: shown, .. } => detail = shown,
-                    _ => {}
+        .turn("print".to_string(), &mut Unattended, &mut |event| {
+            match event {
+                Event::ToolOutput { name, text, .. } => {
+                    assert_eq!(name, "print");
+                    output.push_str(&text);
                 }
-                Ok(())
-            },
-        )
+                Event::ToolStart { detail: shown, .. } => detail = shown,
+                _ => {}
+            }
+            Ok(())
+        })
         .unwrap();
     assert_eq!(output, "two words");
     assert_eq!(detail, "\"two words\"");
@@ -931,11 +927,7 @@ type = "string"
     let provider = Scripted::new(vec![tool("print", "{}"), answer("done")]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
     runtime
-        .turn(
-            "print".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("print".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert!(
         provider.requests.lock().unwrap()[1]
@@ -949,11 +941,7 @@ type = "string"
     let provider = Scripted::new(vec![tool("print", r#"{"text":"not run"}"#), answer("done")]);
     let mut runtime = fixture.runtime(provider.clone(), &disabled);
     runtime
-        .turn(
-            "print".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("print".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     let requests = provider.requests.lock().unwrap();
     assert!(!requests[0].tools.iter().any(|spec| spec.name == "print"));
@@ -984,9 +972,7 @@ fn shipped_sh_tool_runs_from_its_directory() {
     ]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
     runtime
-        .turn("make it".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("make it".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("result.txt")).unwrap(),
@@ -1035,11 +1021,7 @@ fn shipped_sh_restores_directory_and_exports_after_resume() {
     ]);
     let mut runtime = fixture.runtime(provider, &config);
     runtime
-        .turn(
-            "set state".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("set state".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("nested/first.txt")).unwrap(),
@@ -1064,11 +1046,7 @@ fn shipped_sh_restores_directory_and_exports_after_resume() {
     let mut resumed =
         Runtime::new(provider, store, session, &config, "test/model".to_string()).unwrap();
     resumed
-        .turn(
-            "use state".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("use state".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("nested/resumed.txt")).unwrap(),
@@ -1250,17 +1228,13 @@ fn shipped_curl_returns_headers_without_following_redirects() {
     let mut runtime = fixture.runtime(provider, &config);
     let mut output = String::new();
     runtime
-        .turn(
-            "fetch".to_string(),
-            &mut Unattended,
-            &mut |event| {
-                if let Event::ToolOutput { name, text, .. } = event {
-                    assert_eq!(name, "curl");
-                    output.push_str(&text);
-                }
-                Ok(())
-            },
-        )
+        .turn("fetch".to_string(), &mut Unattended, &mut |event| {
+            if let Event::ToolOutput { name, text, .. } = event {
+                assert_eq!(name, "curl");
+                output.push_str(&text);
+            }
+            Ok(())
+        })
         .unwrap();
     assert!(
         output.contains("HTTP/1.1 200 OK") && output.contains("hello"),
@@ -1349,14 +1323,10 @@ fn text_only_turn_streams_and_is_durable() {
     let mut runtime = fixture.runtime(provider, &Config::default());
     let mut events = Vec::new();
     runtime
-        .turn(
-            "question".to_string(),
-            &mut Unattended,
-            &mut |event| {
-                events.push(event);
-                Ok(())
-            },
-        )
+        .turn("question".to_string(), &mut Unattended, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
         .unwrap();
     assert!(
         events
@@ -1378,11 +1348,7 @@ fn reasoning_only_reply_is_an_error_without_an_empty_assistant_message() {
     })]);
     let mut runtime = fixture.runtime(provider, &Config::default());
     let error = runtime
-        .turn(
-            "question".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("question".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap_err();
     assert!(error.contains("empty reply"), "{error}");
     let messages = runtime.session().context_messages().unwrap();
@@ -1400,9 +1366,7 @@ fn zero_tool_round_budget_reports_an_error_instead_of_panicking() {
     let provider = Scripted::new(Vec::new());
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let error = runtime
-        .turn("question".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("question".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap_err();
     assert!(error.contains("tool round limit (0) reached"), "{error}");
     assert!(provider.requests.lock().unwrap().is_empty());
@@ -1425,9 +1389,7 @@ fn tool_round_limit_stops_after_the_last_result() {
     let provider = Scripted::new(vec![tool("sh", r#"{"command":": > no-file"}"#)]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let error = runtime
-        .turn("question".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("question".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap_err();
     assert!(error.contains("tool round limit (1) reached"), "{error}");
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
@@ -1480,9 +1442,7 @@ fn an_unattended_sh_call_runs_in_the_workspace() {
     ]);
     let mut runtime = fixture.runtime(provider, &Config::default());
     runtime
-        .turn("make it".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("make it".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("result.txt")).unwrap(),
@@ -1524,9 +1484,7 @@ esac
     let provider = Scripted::new(vec![tool("echo_hook", "{}"), answer("done")]);
     let mut runtime = fixture.runtime(provider, &config);
     runtime
-        .turn("use hook".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("use hook".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert!(
         runtime
@@ -1616,9 +1574,7 @@ fn manual_compaction_appends_a_checkpoint_without_deleting_history() {
     let mut runtime = fixture.runtime(provider.clone(), &config);
     for prompt in ["one", "two", "three"] {
         runtime
-            .turn(prompt.to_string(), &mut Unattended, &mut |_| {
-                Ok(())
-            })
+            .turn(prompt.to_string(), &mut Unattended, &mut |_| Ok(()))
             .unwrap();
     }
     let entries_before = runtime.session().entries().len();
@@ -1689,11 +1645,7 @@ fn provider_failures_are_recorded() {
     let mut runtime = fixture.runtime(provider, &Config::default());
     assert!(
         runtime
-            .turn(
-                "question".to_string(),
-                &mut Unattended,
-                &mut |_| Ok(()),
-            )
+            .turn("question".to_string(), &mut Unattended, &mut |_| Ok(()),)
             .is_err()
     );
     assert!(
@@ -1718,11 +1670,9 @@ fn an_oversized_first_turn_records_its_error() {
     };
     let mut runtime = fixture.runtime(Scripted::new(Vec::new()), &config);
     let error = runtime
-        .turn(
-            "large input ".repeat(10_000),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("large input ".repeat(10_000), &mut Unattended, &mut |_| {
+            Ok(())
+        })
         .unwrap_err();
     assert!(error.contains("limit"), "{error}");
     assert!(runtime.session().entries().iter().any(|entry| {
@@ -1745,11 +1695,9 @@ fn resume_restores_context_model_and_cumulative_usage() {
     )
     .unwrap();
     runtime
-        .turn(
-            "first question".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("first question".to_string(), &mut Unattended, &mut |_| {
+            Ok(())
+        })
         .unwrap();
     let id = runtime.summary().id;
     drop(runtime);
@@ -1768,11 +1716,7 @@ fn resume_restores_context_model_and_cumulative_usage() {
     assert_eq!(resumed.model(), "test/one");
     assert_eq!(resumed.usage().total_tokens(), 12);
     resumed
-        .turn(
-            "follow up".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("follow up".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     let requests = second.requests.lock().unwrap();
     assert!(
@@ -1819,9 +1763,7 @@ fn resume_reports_discarded_crash_tail_and_completes_a_new_turn() {
             .any(|notice| notice.contains("discarded 2 incomplete session records"))
     );
     runtime
-        .turn("next".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("next".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert_eq!(runtime.session().context_messages().unwrap().len(), 3);
 }
@@ -1841,21 +1783,13 @@ fn a_provider_switch_is_recorded_and_used_on_the_next_turn() {
         }
     }));
     runtime
-        .turn(
-            "one".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("one".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     runtime.set_provider("second", &mut |_| Ok(())).unwrap();
     assert_eq!(runtime.provider_name(), "second");
     assert_eq!(runtime.session().provider().as_deref(), Some("second"));
     runtime
-        .turn(
-            "two".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("two".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert_eq!(first.requests.lock().unwrap().len(), 1);
     assert_eq!(second.requests.lock().unwrap().len(), 1);
@@ -1985,9 +1919,7 @@ fn resuming_another_session_restores_its_provider() {
     runtime.resume(&second_id).unwrap();
     assert_eq!(runtime.provider_name(), "second");
     runtime
-        .turn("hello".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("hello".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert!(first.requests.lock().unwrap().is_empty());
     assert_eq!(second.requests.lock().unwrap().len(), 1);
@@ -2016,17 +1948,13 @@ fn cancellation_stops_a_streaming_turn_and_records_it() {
     let cancellation = runtime.cancellation();
     let mut saw_text = false;
     let error = runtime
-        .turn(
-            "keep going".to_string(),
-            &mut Unattended,
-            &mut |event| {
-                if matches!(event, Event::Text(_)) {
-                    saw_text = true;
-                    cancellation.cancel();
-                }
-                Ok(())
-            },
-        )
+        .turn("keep going".to_string(), &mut Unattended, &mut |event| {
+            if matches!(event, Event::Text(_)) {
+                saw_text = true;
+                cancellation.cancel();
+            }
+            Ok(())
+        })
         .unwrap_err();
     assert!(saw_text);
     assert!(error.contains("cancelled"));
@@ -2065,17 +1993,13 @@ fn lifecycle_hooks_run_after_a_cancelled_turn() {
     let cancellation = runtime.cancellation();
     let mut saw_text = false;
     let error = runtime
-        .turn(
-            "interrupt".to_string(),
-            &mut Unattended,
-            &mut |event| {
-                if matches!(event, Event::Text(_)) {
-                    saw_text = true;
-                    cancellation.cancel();
-                }
-                Ok(())
-            },
-        )
+        .turn("interrupt".to_string(), &mut Unattended, &mut |event| {
+            if matches!(event, Event::Text(_)) {
+                saw_text = true;
+                cancellation.cancel();
+            }
+            Ok(())
+        })
         .unwrap_err();
     assert!(saw_text);
     assert!(error.contains("cancelled"), "{error}");
@@ -2620,16 +2544,10 @@ fn automatic_compaction_runs_before_an_oversized_follow_up() {
     };
     let mut runtime = fixture.runtime(provider.clone(), &config);
     runtime
-        .turn("first".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("first".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     runtime
-        .turn(
-            "follow up".to_string(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
+        .turn("follow up".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert!(
         runtime

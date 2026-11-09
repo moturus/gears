@@ -104,11 +104,9 @@ fn unconfirmed_cleanup_blocks_another_turn_and_session_mutation() {
     let path = runtime.session().path().unwrap().to_path_buf();
     let before = std::fs::read(&path).unwrap();
     let entries = runtime.session().entries().len();
-    let next = runtime.turn(
-        "next".into(),
-        &mut gears::runtime::Unattended,
-        &mut |_| Ok(()),
-    );
+    let next = runtime.turn("next".into(), &mut gears::runtime::Unattended, &mut |_| {
+        Ok(())
+    });
     assert!(next.unwrap_err().contains("further work is blocked"));
     assert_eq!(runtime.session().entries().len(), entries);
     assert_eq!(std::fs::read(&path).unwrap(), before);

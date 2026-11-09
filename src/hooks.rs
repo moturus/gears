@@ -829,7 +829,9 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(validate_result_fields("tool_execute", &serde_json::json!({"input": "no"})).is_err());
+        assert!(
+            validate_result_fields("tool_execute", &serde_json::json!({"input": "no"})).is_err()
+        );
     }
 
     #[test]

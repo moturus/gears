@@ -13,9 +13,7 @@ use crate::provider::{
     ContentBlock, EventSink, Message, Provider, ProviderError, Request, StreamEvent, ToolCall,
     ToolOutcome, ToolSpec, Usage, UsageMeter,
 };
-use crate::session::{
-    Compaction, Session, SessionInfo, Store, ToolState, TreeItem,
-};
+use crate::session::{Compaction, Session, SessionInfo, Store, ToolState, TreeItem};
 use crate::tool_state::Overrides;
 use crate::tools::{ExecutionContext, Registry};
 

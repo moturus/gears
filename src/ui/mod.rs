@@ -5,7 +5,7 @@ pub mod select;
 pub mod tui;
 pub mod tui_editor;
 
-use crate::runtime::{Responder, Observer, Runtime, ToolStatus};
+use crate::runtime::{Observer, Responder, Runtime, ToolStatus};
 use crate::session::ToolState;
 
 enum Operation {
