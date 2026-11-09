@@ -12,13 +12,12 @@ use gears::net::EgressPolicy;
 use gears::net::host_curl::HostCurl;
 #[cfg(not(unix))]
 use gears::net::motor_curl::MotorCurl as HostCurl;
-use gears::permissions::{Grant, Grants};
 use gears::provider::{
     Completion, ContentBlock, Endpoint, EventSink, FinishReason, Message, OpenAiCompat, Provider,
     ProviderError, Quirks, Request, StreamEvent, ToolCall, ToolOutcome,
 };
-use gears::runtime::{Approval, Approver, Event, Options, Permission, Runtime};
-use gears::session::{PermissionGrant, Store, ToolState};
+use gears::runtime::{Event, Options, Responder, Runtime, Unattended};
+use gears::session::{Store, ToolState};
 use gears::tools::Registry;
 
 struct Scripted {
@@ -62,63 +61,16 @@ impl Provider for Scripted {
     }
 }
 
-struct FixedApproval(bool);
-
-impl Approver for FixedApproval {
-    fn approve(&mut self, _request: &Permission) -> Approval {
-        if self.0 {
-            Approval::Once
-        } else {
-            Approval::Deny
-        }
-    }
-}
-
-/// Gives one fixed answer and counts how often the user was asked.
-struct CountingApproval {
-    answer: Approval,
-    asked: usize,
-}
-
-impl Approver for CountingApproval {
-    fn approve(&mut self, _request: &Permission) -> Approval {
-        self.asked += 1;
-        self.answer
-    }
-}
-
-struct UnexpectedApproval;
-
-impl Approver for UnexpectedApproval {
-    fn approve(&mut self, _request: &Permission) -> Approval {
-        panic!("permission hook should have allowed the call")
-    }
-}
-
-struct UnattendedApproval;
-
-impl Approver for UnattendedApproval {
-    fn approve(&mut self, _request: &Permission) -> Approval {
-        panic!("unattended run must not ask for approval")
-    }
-
-    fn attended(&self) -> bool {
-        false
-    }
-}
-
-struct QuestionApproval {
+/// Answers hook questions on the user's behalf and counts how often it was asked.
+struct Questions {
     answer: Option<String>,
     attended: bool,
     asked: usize,
 }
 
-impl Approver for QuestionApproval {
+impl Responder for Questions {
     fn attended(&self) -> bool {
         self.attended
-    }
-    fn approve(&mut self, _: &Permission) -> Approval {
-        Approval::Deny
     }
     fn answer(&mut self, _: &gears::hooks::Question) -> Result<Option<String>, String> {
         assert!(self.attended, "unattended run asked a question");
@@ -173,7 +125,7 @@ fn runtime_events_pair_tool_ids_and_report_numeric_usage() {
     let mut runtime = fixture.runtime(provider, &config);
     let mut events = Vec::new();
     runtime
-        .turn("work".into(), &mut FixedApproval(false), &mut |event| {
+        .turn("work".into(), &mut Unattended, &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -198,11 +150,11 @@ fn runtime_events_pair_tool_ids_and_report_numeric_usage() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(ended, (started, &ToolOutcome::NotStarted, &true));
+    assert_eq!(ended, (started, &ToolOutcome::Completed, &false));
     assert!(
-        !events
+        events
             .iter()
-            .any(|event| matches!(event, Event::ToolOutput { .. }))
+            .any(|event| matches!(event, Event::ToolOutput { text, .. } if text == "forbidden"))
     );
     let usage = events
         .iter()
@@ -236,7 +188,7 @@ fn compaction_reports_its_usage_as_a_numeric_event() {
     let mut runtime = fixture.runtime(provider, &config);
     for prompt in ["one", "two"] {
         runtime
-            .turn(prompt.into(), &mut UnexpectedApproval, &mut |_| Ok(()))
+            .turn(prompt.into(), &mut Unattended, &mut |_| Ok(()))
             .unwrap();
     }
     let mut reported = Vec::new();
@@ -285,21 +237,21 @@ fn endlessly_repeated_hook_questions_are_reported_and_bounded() {
     };
     let provider = Scripted::new(vec![answer("done")]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
-    let mut approver = QuestionApproval {
+    let mut responder = Questions {
         answer: Some("yes".into()),
         attended: true,
         asked: 0,
     };
     let mut notices = Vec::new();
     runtime
-        .turn("work".into(), &mut approver, &mut |event| {
+        .turn("work".into(), &mut responder, &mut |event| {
             if let Event::Notice(text) = event {
                 notices.push(text);
             }
             Ok(())
         })
         .unwrap();
-    assert_eq!(approver.asked, 16);
+    assert_eq!(responder.asked, 16);
     assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 16);
     assert!(
         notices
@@ -344,21 +296,21 @@ fn hook_questions_are_answered_before_requests_and_unattended_questions_are_skip
         };
         let provider = Scripted::new(vec![answer("done")]);
         let mut runtime = fixture.runtime(provider.clone(), &config);
-        let mut approver = QuestionApproval {
+        let mut responder = Questions {
             answer: value.map(str::to_string),
             attended,
             asked: 0,
         };
         let mut notices = Vec::new();
         runtime
-            .turn("work".into(), &mut approver, &mut |event| {
+            .turn("work".into(), &mut responder, &mut |event| {
                 if let Event::Notice(text) = event {
                     notices.push(text);
                 }
                 Ok(())
             })
             .unwrap();
-        assert_eq!(approver.asked, usize::from(attended));
+        assert_eq!(responder.asked, usize::from(attended));
         let event: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
         assert_eq!(event["payload"]["attended"], attended);
@@ -406,7 +358,7 @@ fn hook_hints_follow_setup_turn_end_and_command_responses() {
         Ok(())
     };
     runtime
-        .turn("work".into(), &mut FixedApproval(false), &mut observer)
+        .turn("work".into(), &mut Unattended, &mut observer)
         .unwrap();
     assert_eq!(runtime.hint(), Some("Review pending"));
     runtime
@@ -531,14 +483,18 @@ fn turn_end_metadata_counts_rounds_and_identifies_the_last_entry_on_all_exits() 
         };
         let mut runtime = fixture.runtime(Scripted::new(responses), &config);
         // The round budget applies to unattended runs only.
-        let mut attended = FixedApproval(false);
-        let mut unattended = UnattendedApproval;
-        let approver: &mut dyn Approver = match limit {
+        let mut attended = Questions {
+            answer: None,
+            attended: true,
+            asked: 0,
+        };
+        let mut unattended = Unattended;
+        let responder: &mut dyn Responder = match limit {
             Some(_) => &mut unattended,
             None => &mut attended,
         };
         let mut end = None;
-        let result = runtime.turn("work".into(), approver, &mut |event| {
+        let result = runtime.turn("work".into(), responder, &mut |event| {
             if let Event::TurnEnd {
                 status,
                 tool_rounds,
@@ -562,117 +518,97 @@ fn turn_end_metadata_counts_rounds_and_identifies_the_last_entry_on_all_exits() 
 }
 
 #[test]
-fn entry_hooks_identify_saved_outcomes_and_read_only_tools_even_when_not_started() {
-    for allow in [false, true] {
-        let fixture = Fixture::new(&format!("tool-entry-{allow}"));
-        let log = fixture.root.join("events.jsonl");
-        support::write(fixture.workspace.join("source"), "fixture text").unwrap();
-        let config = Config {
-            tools: ["sh", "cat"]
-                .into_iter()
-                .map(|name| ToolDirectory {
-                    directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("tools")
-                        .join(name),
-                    enabled: true,
-                })
-                .collect(),
-            hooks: vec![HookConfig {
-                name: "record".into(),
-                events: Some(vec!["entry".into(), "permission".into()]),
-                command: vec![
-                    support::SHELL.into(),
-                    "-c".into(),
-                    format!(
-                        "cat >> '{}'; printf '\\n' >> '{}'; printf '{{}}'",
-                        log.display(),
-                        log.display()
-                    ),
-                ],
-                timeout: Duration::from_secs(2),
-                max_output_bytes: 4096,
-            }],
-            ..Config::default()
-        };
-        let calls = vec![
-            ToolCall::new("write", "sh", r#"{"command":"printf output"}"#),
-            ToolCall::new("read", "cat", r#"{"path":"source"}"#),
-            ToolCall::new("unknown", "missing", "{}"),
-        ];
-        let provider = Scripted::new(vec![
-            Ok(Completion {
-                tool_calls: calls.clone(),
-                ..Completion::default()
-            }),
-            answer("done"),
-        ]);
-        let mut runtime = fixture.runtime(provider, &config);
-        runtime
-            .turn("work".into(), &mut FixedApproval(allow), &mut |_| Ok(()))
-            .unwrap();
-        let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+fn entry_hooks_identify_saved_outcomes_and_read_only_tools() {
+    let fixture = Fixture::new("tool-entry");
+    let log = fixture.root.join("events.jsonl");
+    support::write(fixture.workspace.join("source"), "fixture text").unwrap();
+    let config = Config {
+        tools: ["sh", "cat"]
+            .into_iter()
+            .map(|name| ToolDirectory {
+                directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tools")
+                    .join(name),
+                enabled: true,
+            })
+            .collect(),
+        hooks: vec![HookConfig {
+            name: "record".into(),
+            events: Some(vec!["entry".into()]),
+            command: vec![
+                support::SHELL.into(),
+                "-c".into(),
+                format!(
+                    "cat >> '{}'; printf '\\n' >> '{}'; printf '{{}}'",
+                    log.display(),
+                    log.display()
+                ),
+            ],
+            timeout: Duration::from_secs(2),
+            max_output_bytes: 4096,
+        }],
+        ..Config::default()
+    };
+    let calls = vec![
+        ToolCall::new("write", "sh", r#"{"command":"printf output"}"#),
+        ToolCall::new("read", "cat", r#"{"path":"source"}"#),
+        ToolCall::new("unknown", "missing", "{}"),
+    ];
+    let provider = Scripted::new(vec![
+        Ok(Completion {
+            tool_calls: calls.clone(),
+            ..Completion::default()
+        }),
+        answer("done"),
+    ]);
+    let mut runtime = fixture.runtime(provider, &config);
+    runtime
+        .turn("work".into(), &mut Unattended, &mut |_| Ok(()))
+        .unwrap();
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let entries: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "entry" && event["payload"]["role"] == "tool")
+        .collect();
+    assert_eq!(entries.len(), calls.len());
+    let shell = PathBuf::from(
+        entries[0]["payload"]["tool"]["shell_state_directory"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(
+        shell,
+        runtime.session().path().unwrap().with_extension("sh-state")
+    );
+    assert_eq!(
+        std::fs::read_to_string(shell.join("cwd"))
             .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let permissions: Vec<_> = events
-            .iter()
-            .filter(|event| event["event"] == "permission")
-            .collect();
-        assert_eq!(permissions.len(), 2);
-        assert_eq!(permissions[0]["payload"]["tool"]["read_only"], false);
-        assert_eq!(permissions[1]["payload"]["tool"]["read_only"], true);
-        let shell = PathBuf::from(
-            permissions[0]["payload"]["tool"]["shell_state_directory"]
-                .as_str()
-                .unwrap(),
-        );
+            .trim_end(),
+        fixture.workspace.to_str().unwrap()
+    );
+    assert!(entries[1]["payload"]["tool"]["shell_state_directory"].is_null());
+    for (index, event) in entries.iter().enumerate() {
+        let payload = &event["payload"];
         assert_eq!(
-            shell,
-            runtime.session().path().unwrap().with_extension("sh-state")
+            payload["tool_call"],
+            serde_json::to_value(&calls[index]).unwrap()
         );
-        assert!(permissions[1]["payload"]["tool"]["shell_state_directory"].is_null());
-        if allow {
-            assert_eq!(
-                std::fs::read_to_string(shell.join("cwd"))
-                    .unwrap()
-                    .trim_end(),
-                fixture.workspace.to_str().unwrap()
-            );
-        } else {
-            assert!(
-                !shell.exists(),
-                "permission metadata must not create shell state"
-            );
-        }
-        let entries: Vec<_> = events
-            .iter()
-            .filter(|event| event["event"] == "entry" && event["payload"]["role"] == "tool")
-            .collect();
-        assert_eq!(entries.len(), calls.len());
-        for (index, event) in entries.iter().enumerate() {
-            let payload = &event["payload"];
-            assert_eq!(
-                payload["tool_call"],
-                serde_json::to_value(&calls[index]).unwrap()
-            );
-            assert_eq!(payload["tool"]["read_only"], index == 1);
-            assert_eq!(
-                payload["outcome"],
-                if allow && index < 2 {
-                    "completed"
-                } else {
-                    "not_started"
-                }
-            );
-            let entry = runtime
-                .session()
-                .entry(payload["id"].as_str().unwrap())
-                .unwrap();
-            let message: Message = serde_json::from_value(entry.data.clone()).unwrap();
-            assert_eq!(payload["tool_result"]["content"], message.text_content());
-            assert_eq!(payload["tool_result_truncated"], false);
-        }
+        assert_eq!(payload["tool"]["read_only"], index == 1);
+        assert_eq!(
+            payload["outcome"],
+            if index < 2 { "completed" } else { "not_started" }
+        );
+        let entry = runtime
+            .session()
+            .entry(payload["id"].as_str().unwrap())
+            .unwrap();
+        let message: Message = serde_json::from_value(entry.data.clone()).unwrap();
+        assert_eq!(payload["tool_result"]["content"], message.text_content());
+        assert_eq!(payload["tool_result_truncated"], false);
     }
 }
 
@@ -723,7 +659,7 @@ esac"#,
         &config,
     );
     runtime
-        .turn("work".into(), &mut FixedApproval(true), &mut |_| Ok(()))
+        .turn("work".into(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     let event: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
@@ -738,78 +674,6 @@ esac"#,
         .unwrap();
     let saved: Message = serde_json::from_value(entry.data.clone()).unwrap();
     assert_eq!(saved.text_content(), text);
-}
-
-#[test]
-fn hook_details_reach_the_permission_prompt_and_invalid_details_deny_the_call() {
-    struct Capture(Vec<String>);
-    impl Approver for Capture {
-        fn approve(&mut self, permission: &Permission) -> Approval {
-            self.0.push(permission.detail.clone());
-            Approval::Once
-        }
-    }
-    for (case, detail, valid) in [
-        (
-            "valid",
-            "declared check: [\"/bin/check\",\"a file*\"]".into(),
-            true,
-        ),
-        ("empty", String::new(), false),
-        ("large", "x".repeat(16385), false),
-    ] {
-        let fixture = Fixture::new(&format!("permission-detail-{case}"));
-        let response = fixture.root.join("response.json");
-        support::write(
-            &response,
-            serde_json::json!({"decision": "confirm", "permission_detail": detail}).to_string(),
-        )
-        .unwrap();
-        let config = Config {
-            hooks: vec![HookConfig {
-                name: "policy".into(),
-                events: Some(vec!["permission".into()]),
-                command: vec![
-                    support::SHELL.into(),
-                    "-c".into(),
-                    format!("_input=$(cat); cat '{}'", response.display()),
-                ],
-                timeout: Duration::from_secs(2),
-                max_output_bytes: 32 * 1024,
-            }],
-            ..Config::default()
-        };
-        let mut runtime = fixture.runtime(
-            Scripted::new(vec![
-                tool("sh", r#"{"command":"printf result"}"#),
-                answer("done"),
-            ]),
-            &config,
-        );
-        let mut approver = Capture(Vec::new());
-        let mut shown = Vec::new();
-        let mut outcome = None;
-        runtime
-            .turn("work".into(), &mut approver, &mut |event| {
-                match event {
-                    Event::Permission(permission) => shown.push(permission.detail),
-                    Event::ToolEnd {
-                        outcome: recorded, ..
-                    } => outcome = Some(recorded),
-                    _ => {}
-                }
-                Ok(())
-            })
-            .unwrap();
-        if valid {
-            assert_eq!(approver.0, shown);
-            assert!(shown[0].contains(&format!("policy: {detail}")));
-            assert_eq!(outcome, Some(ToolOutcome::Completed));
-        } else {
-            assert!(approver.0.is_empty());
-            assert_eq!(outcome, Some(ToolOutcome::NotStarted));
-        }
-    }
 }
 
 impl Fixture {
@@ -913,14 +777,14 @@ fn tool_toggles_update_the_next_request_and_preserve_scope_precedence() {
     )
     .unwrap();
     runtime
-        .turn("first".into(), &mut FixedApproval(false), &mut |_| Ok(()))
+        .turn("first".into(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     let enabled_identity = runtime.session().latest_runtime_identity().unwrap();
     runtime
         .set_tool_state("sh", ToolState::Disabled, false)
         .unwrap();
     runtime
-        .turn("second".into(), &mut FixedApproval(false), &mut |_| Ok(()))
+        .turn("second".into(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     let disabled_identity = runtime.session().latest_runtime_identity().unwrap();
     runtime
@@ -933,7 +797,7 @@ fn tool_toggles_update_the_next_request_and_preserve_scope_precedence() {
         .unwrap();
     assert_eq!(runtime.tool_statuses().unwrap()[0].source, "global");
     runtime
-        .turn("third".into(), &mut FixedApproval(false), &mut |_| Ok(()))
+        .turn("third".into(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     let requests = provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
@@ -952,461 +816,6 @@ fn tool_toggles_update_the_next_request_and_preserve_scope_precedence() {
             .unwrap()
             .manifest_hash
     );
-}
-
-#[test]
-fn permission_listing_marks_stale_grants_and_revoke_clears_each_scope() {
-    let fixture = Fixture::new("permission-listing");
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let mut session = store.create(false, None).unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let registry = Registry::load_config(&config).unwrap();
-    let identity = registry.tools()[0].approval_identity().unwrap();
-    session
-        .append_permission_grant(&PermissionGrant {
-            name: "sh".into(),
-            identity: identity.clone(),
-            allow: Some(false),
-            ..PermissionGrant::default()
-        })
-        .unwrap();
-    let global_dir = fixture.root.join("global");
-    let mut global = Grants::default();
-    global.by_identity.insert(
-        "a".repeat(64),
-        Grant {
-            name: "sh".into(),
-            allow: true,
-            ..Grant::default()
-        },
-    );
-    global.save(&global_dir).unwrap();
-    let mut runtime = Runtime::with_options(
-        Scripted::new(Vec::new()),
-        store,
-        session,
-        &config,
-        "test/model".into(),
-        Options {
-            tools: Some(registry),
-            tool_state_directory: Some(global_dir),
-        },
-    )
-    .unwrap();
-    let listed = runtime.permission_statuses().unwrap();
-    assert_eq!(listed.len(), 2);
-    assert!(
-        listed
-            .iter()
-            .any(|grant| grant.scope == "session" && grant.current && !grant.allow)
-    );
-    assert!(
-        listed
-            .iter()
-            .any(|grant| grant.scope == "global" && !grant.current && grant.allow)
-    );
-    runtime.revoke_permission("sh", false).unwrap();
-    assert_eq!(runtime.permission_statuses().unwrap().len(), 1);
-    runtime.revoke_permission("sh", true).unwrap();
-    assert!(runtime.permission_statuses().unwrap().is_empty());
-}
-
-#[test]
-fn a_missing_executable_does_not_prevent_listing_or_revoking_grants() {
-    let fixture = Fixture::new("missing-grant-executable");
-    let directory = fixture.root.join("package");
-    std::fs::create_dir(&directory).unwrap();
-    support::write(directory.join("parameters.json"), r#"{"type":"object"}"#).unwrap();
-    support::write(directory.join("run"), "#!/bin/sh\nprintf original\n").unwrap();
-    support::write(
-        directory.join("tool.toml"),
-        r#"
-version = 1
-kind = "process"
-name = "package"
-description = "Fixture"
-parameters = "parameters.json"
-[process.command]
-common = ["./run"]
-"#,
-    )
-    .unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: directory.clone(),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let registry = Registry::load_config(&config).unwrap();
-    let identity = registry.tools()[0].approval_identity().unwrap();
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let mut session = store.create(false, None).unwrap();
-    session
-        .append_permission_grant(&PermissionGrant {
-            name: "package".into(),
-            identity,
-            allow: Some(true),
-            ..PermissionGrant::default()
-        })
-        .unwrap();
-    let mut runtime = Runtime::with_options(
-        Scripted::new(Vec::new()),
-        store,
-        session,
-        &config,
-        "test/model".into(),
-        Options {
-            tools: Some(registry),
-            tool_state_directory: Some(fixture.root.join("global")),
-        },
-    )
-    .unwrap();
-    std::fs::remove_file(directory.join("run")).unwrap();
-    let listed = runtime.permission_statuses().unwrap();
-    assert_eq!(listed.len(), 1);
-    assert!(!listed[0].current);
-    assert!(
-        listed[0]
-            .identity_error
-            .as_ref()
-            .unwrap()
-            .contains("executable disappeared")
-    );
-    runtime.revoke_permission("package", false).unwrap();
-    assert!(runtime.permission_statuses().unwrap().is_empty());
-}
-
-#[test]
-fn global_allow_survives_new_sessions_but_not_unattended_calls() {
-    let fixture = Fixture::new("global-allow-unattended");
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let session = store.create(false, None).unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let registry = Registry::load_config(&config).unwrap();
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":": > first"}"#),
-        answer("done"),
-        tool("sh", r#"{"command":": > unattended"}"#),
-        answer("done"),
-        tool("sh", r#"{"command":": > third"}"#),
-        answer("done"),
-    ]);
-    let mut runtime = Runtime::with_options(
-        provider,
-        store,
-        session,
-        &config,
-        "test/model".into(),
-        Options {
-            tools: Some(registry),
-            tool_state_directory: Some(fixture.root.join("global")),
-        },
-    )
-    .unwrap();
-    let mut grant = CountingApproval {
-        answer: Approval::Global,
-        asked: 0,
-    };
-    runtime
-        .turn("first".into(), &mut grant, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(grant.asked, 1);
-    let saved = Grants::load(&fixture.root.join("global")).unwrap();
-    let saved = saved.by_identity.values().next().unwrap();
-    assert_eq!(saved.kind, "process");
-    assert!(saved.owner.ends_with("tools/sh"));
-    assert!(saved.created_ms > 0);
-    runtime.new_session(false, None).unwrap();
-    runtime
-        .turn("second".into(), &mut UnattendedApproval, &mut |_| Ok(()))
-        .unwrap();
-    let mut deny = CountingApproval {
-        answer: Approval::Deny,
-        asked: 0,
-    };
-    runtime
-        .turn("third".into(), &mut deny, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(deny.asked, 0);
-    assert!(fixture.workspace.join("first").exists());
-    assert!(!fixture.workspace.join("unattended").exists());
-    assert!(fixture.workspace.join("third").exists());
-}
-
-#[test]
-fn failed_global_grant_write_keeps_the_pending_tool_unapproved() {
-    struct BreakGrantFile(PathBuf);
-    impl Approver for BreakGrantFile {
-        fn approve(&mut self, _request: &Permission) -> Approval {
-            std::fs::create_dir(self.0.join("permissions.toml")).unwrap();
-            Approval::Global
-        }
-    }
-
-    let fixture = Fixture::new("grant-write-failure");
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let session = store.create(false, None).unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let registry = Registry::load_config(&config).unwrap();
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":": > forbidden"}"#),
-        answer("done"),
-    ]);
-    let global_dir = fixture.root.join("global");
-    std::fs::create_dir(&global_dir).unwrap();
-    let mut runtime = Runtime::with_options(
-        provider,
-        store,
-        session,
-        &config,
-        "test/model".into(),
-        Options {
-            tools: Some(registry),
-            tool_state_directory: Some(global_dir.clone()),
-        },
-    )
-    .unwrap();
-    runtime
-        .turn("try".into(), &mut BreakGrantFile(global_dir), &mut |_| {
-            Ok(())
-        })
-        .unwrap();
-    assert!(!fixture.workspace.join("forbidden").exists());
-    assert!(
-        runtime
-            .session()
-            .context_messages()
-            .unwrap()
-            .iter()
-            .any(|message| message.text_content().contains("unsafe state entry"))
-    );
-}
-
-#[test]
-fn session_answers_override_global_answers_in_both_directions() {
-    for session_allow in [true, false] {
-        let fixture = Fixture::new(if session_allow {
-            "session-allow"
-        } else {
-            "session-deny"
-        });
-        let config = Config {
-            tools: vec![ToolDirectory {
-                directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-                enabled: true,
-            }],
-            ..Config::default()
-        };
-        let registry = Registry::load_config(&config).unwrap();
-        let identity = registry.tools()[0].approval_identity().unwrap();
-        let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-        let mut session = store.create(false, None).unwrap();
-        session
-            .append_permission_grant(&PermissionGrant {
-                name: "sh".into(),
-                identity: identity.clone(),
-                allow: Some(session_allow),
-                ..PermissionGrant::default()
-            })
-            .unwrap();
-        let global_dir = fixture.root.join("global");
-        let mut global = Grants::default();
-        global.by_identity.insert(
-            identity,
-            Grant {
-                name: "sh".into(),
-                allow: !session_allow,
-                ..Grant::default()
-            },
-        );
-        global.save(&global_dir).unwrap();
-        let provider = Scripted::new(vec![
-            tool("sh", r#"{"command":"printf made > result"}"#),
-            answer("done"),
-        ]);
-        let mut runtime = Runtime::with_options(
-            provider,
-            store,
-            session,
-            &config,
-            "test/model".into(),
-            Options {
-                tools: Some(registry),
-                tool_state_directory: Some(global_dir),
-            },
-        )
-        .unwrap();
-        runtime
-            .turn("go".into(), &mut UnexpectedApproval, &mut |_| Ok(()))
-            .unwrap();
-        assert_eq!(fixture.workspace.join("result").exists(), session_allow);
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn an_executable_change_invalidates_a_session_allow_before_the_next_call() {
-    // Parallel spawns can inherit a writable copy of the fixture executable until
-    // exec, making its own exec fail with ETXTBSY. Run alone in a child process.
-    const CHILD: &str = "GEARS_EXECUTABLE_CHANGE_FIXTURE_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .env(CHILD, "1")
-            .args([
-                "--exact",
-                "an_executable_change_invalidates_a_session_allow_before_the_next_call",
-                "--nocapture",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Fixture::new("executable-grant-change");
-    let directory = fixture.root.join("package");
-    std::fs::create_dir(&directory).unwrap();
-    let executable = directory.join("run");
-    support::write(&executable, "#!/bin/sh\nprintf original\n").unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    support::write(directory.join("parameters.json"), r#"{"type":"object"}"#).unwrap();
-    support::write(
-        directory.join("tool.toml"),
-        r#"
-version = 1
-kind = "process"
-name = "package"
-description = "Fixture"
-parameters = "parameters.json"
-[process.command]
-common = ["./run"]
-"#,
-    )
-    .unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory,
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let provider = Scripted::new(vec![
-        tool("package", "{}"),
-        tool("package", "{}"),
-        answer("done"),
-    ]);
-    let mut runtime = fixture.runtime(provider, &config);
-    let mut asked = 0;
-    let mut approver = |_: &Permission| {
-        asked += 1;
-        if asked == 1 {
-            Approval::Session
-        } else {
-            Approval::Deny
-        }
-    };
-    let mut output = String::new();
-    let mut completed = 0;
-    runtime
-        .turn("go".into(), &mut approver, &mut |event| {
-            if let Event::ToolOutput { ref text, .. } = event {
-                output.push_str(text);
-            }
-            if let Event::ToolEnd {
-                is_error: false, ..
-            } = event
-            {
-                completed += 1;
-                support::write(&executable, "#!/bin/sh\nprintf changed\n").unwrap();
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(asked, 2);
-    assert_eq!(completed, 1);
-    assert_eq!(output, "original");
-    assert!(!runtime.permission_statuses().unwrap()[0].current);
-}
-
-#[test]
-fn global_denial_persists_and_refuses_later_attended_calls() {
-    let fixture = Fixture::new("global-denial");
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let session = store.create(false, None).unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let registry = Registry::load_config(&config).unwrap();
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":": > first"}"#),
-        answer("done"),
-        tool("sh", r#"{"command":": > second"}"#),
-        answer("done"),
-    ]);
-    let global_dir = fixture.root.join("global");
-    let mut runtime = Runtime::with_options(
-        provider,
-        store,
-        session,
-        &config,
-        "test/model".into(),
-        Options {
-            tools: Some(registry),
-            tool_state_directory: Some(global_dir.clone()),
-        },
-    )
-    .unwrap();
-    let mut deny = CountingApproval {
-        answer: Approval::DenyGlobal,
-        asked: 0,
-    };
-    runtime
-        .turn("first".into(), &mut deny, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(deny.asked, 1);
-    assert!(
-        !Grants::load(&global_dir)
-            .unwrap()
-            .by_identity
-            .values()
-            .next()
-            .unwrap()
-            .allow
-    );
-    runtime.new_session(false, None).unwrap();
-    let mut allow = CountingApproval {
-        answer: Approval::Once,
-        asked: 0,
-    };
-    runtime
-        .turn("second".into(), &mut allow, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(allow.asked, 0);
-    assert!(!fixture.workspace.join("first").exists());
-    assert!(!fixture.workspace.join("second").exists());
 }
 
 #[test]
@@ -1429,7 +838,7 @@ fn empty_tool_configuration_is_chat_only() {
     runtime
         .turn(
             "hello".to_string(),
-            &mut UnexpectedApproval,
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -1493,14 +902,14 @@ type = "string"
     runtime
         .turn(
             "print".to_string(),
-            &mut FixedApproval(true),
+            &mut Unattended,
             &mut |event| {
                 match event {
                     Event::ToolOutput { name, text, .. } => {
                         assert_eq!(name, "print");
                         output.push_str(&text);
                     }
-                    Event::Permission(permission) => detail = permission.detail,
+                    Event::ToolStart { detail: shown, .. } => detail = shown,
                     _ => {}
                 }
                 Ok(())
@@ -1524,7 +933,7 @@ type = "string"
     runtime
         .turn(
             "print".to_string(),
-            &mut UnexpectedApproval,
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -1542,7 +951,7 @@ type = "string"
     runtime
         .turn(
             "print".to_string(),
-            &mut UnexpectedApproval,
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -1575,7 +984,7 @@ fn shipped_sh_tool_runs_from_its_directory() {
     ]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
     runtime
-        .turn("make it".to_string(), &mut FixedApproval(true), &mut |_| {
+        .turn("make it".to_string(), &mut Unattended, &mut |_| {
             Ok(())
         })
         .unwrap();
@@ -1628,7 +1037,7 @@ fn shipped_sh_restores_directory_and_exports_after_resume() {
     runtime
         .turn(
             "set state".to_string(),
-            &mut FixedApproval(true),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -1657,7 +1066,7 @@ fn shipped_sh_restores_directory_and_exports_after_resume() {
     resumed
         .turn(
             "use state".to_string(),
-            &mut FixedApproval(true),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -1695,7 +1104,7 @@ fn shipped_sh_uses_a_bounded_per_call_timeout() {
     ]);
     let mut runtime = fixture.runtime(provider, &config);
     runtime
-        .turn("run".to_string(), &mut FixedApproval(true), &mut |_| Ok(()))
+        .turn("run".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert!(!fixture.workspace.join("unstarted.txt").exists());
     assert_eq!(
@@ -1741,7 +1150,7 @@ fn run_shipped(fixture: &Fixture, name: &str, calls: &[&str]) -> (String, Runtim
     let mut runtime = fixture.runtime(Scripted::new(script), &config);
     let mut output = String::new();
     runtime
-        .turn("use it".into(), &mut FixedApproval(true), &mut |event| {
+        .turn("use it".into(), &mut Unattended, &mut |event| {
             if let Event::ToolOutput { text, .. } = event {
                 output.push_str(&text);
             }
@@ -1843,7 +1252,7 @@ fn shipped_curl_returns_headers_without_following_redirects() {
     runtime
         .turn(
             "fetch".to_string(),
-            &mut FixedApproval(true),
+            &mut Unattended,
             &mut |event| {
                 if let Event::ToolOutput { name, text, .. } = event {
                     assert_eq!(name, "curl");
@@ -1942,7 +1351,7 @@ fn text_only_turn_streams_and_is_durable() {
     runtime
         .turn(
             "question".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |event| {
                 events.push(event);
                 Ok(())
@@ -1971,7 +1380,7 @@ fn reasoning_only_reply_is_an_error_without_an_empty_assistant_message() {
     let error = runtime
         .turn(
             "question".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap_err();
@@ -1991,7 +1400,7 @@ fn zero_tool_round_budget_reports_an_error_instead_of_panicking() {
     let provider = Scripted::new(Vec::new());
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let error = runtime
-        .turn("question".to_string(), &mut UnattendedApproval, &mut |_| {
+        .turn("question".to_string(), &mut Unattended, &mut |_| {
             Ok(())
         })
         .unwrap_err();
@@ -2016,7 +1425,7 @@ fn tool_round_limit_stops_after_the_last_result() {
     let provider = Scripted::new(vec![tool("sh", r#"{"command":": > no-file"}"#)]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let error = runtime
-        .turn("question".to_string(), &mut UnattendedApproval, &mut |_| {
+        .turn("question".to_string(), &mut Unattended, &mut |_| {
             Ok(())
         })
         .unwrap_err();
@@ -2024,7 +1433,7 @@ fn tool_round_limit_stops_after_the_last_result() {
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
     let messages = runtime.session().context_messages().unwrap();
     assert_eq!(messages.len(), 4);
-    assert!(messages[2].text_content().contains("denied"));
+    assert!(fixture.workspace.join("no-file").is_file());
     assert!(messages[3].text_content().contains("ended early"));
 }
 
@@ -2045,7 +1454,11 @@ fn an_attended_turn_runs_past_the_round_budget() {
     runtime
         .turn(
             "question".to_string(),
-            &mut FixedApproval(false),
+            &mut Questions {
+                answer: None,
+                attended: true,
+                asked: 0,
+            },
             &mut |event| {
                 if let Event::TurnEnd { tool_rounds, .. } = event {
                     rounds = Some(tool_rounds);
@@ -2059,29 +1472,7 @@ fn an_attended_turn_runs_past_the_round_budget() {
 }
 
 #[test]
-fn a_denied_sh_call_is_returned_to_the_model() {
-    let fixture = Fixture::new("deny");
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":": > must-not-exist"}"#),
-        answer("understood"),
-    ]);
-    let mut runtime = fixture.runtime(provider, &Config::default());
-    runtime
-        .turn("do it".to_string(), &mut FixedApproval(false), &mut |_| {
-            Ok(())
-        })
-        .unwrap();
-    assert!(!fixture.workspace.join("must-not-exist").exists());
-    let messages = runtime.session().context_messages().unwrap();
-    assert!(
-        messages
-            .iter()
-            .any(|message| message.text_content().contains("denied"))
-    );
-}
-
-#[test]
-fn an_approved_sh_call_runs_in_the_workspace() {
+fn an_unattended_sh_call_runs_in_the_workspace() {
     let fixture = Fixture::new("sh");
     let provider = Scripted::new(vec![
         tool("sh", r#"{"command":"printf made > result.txt"}"#),
@@ -2089,7 +1480,7 @@ fn an_approved_sh_call_runs_in_the_workspace() {
     ]);
     let mut runtime = fixture.runtime(provider, &Config::default());
     runtime
-        .turn("make it".to_string(), &mut FixedApproval(true), &mut |_| {
+        .turn("make it".to_string(), &mut Unattended, &mut |_| {
             Ok(())
         })
         .unwrap();
@@ -2100,262 +1491,7 @@ fn an_approved_sh_call_runs_in_the_workspace() {
 }
 
 #[test]
-fn session_allow_survives_resume_but_not_a_new_session() {
-    let fixture = Fixture::new("always");
-    let touch = |name: &str| tool("sh", &format!(r#"{{"command":": > {name}"}}"#));
-    let provider = Scripted::new(vec![
-        touch("one"),
-        touch("two"),
-        answer("done"),
-        touch("three"),
-        answer("done"),
-        touch("four"),
-        answer("done"),
-        touch("five"),
-        answer("done"),
-    ]);
-    let mut runtime = fixture.runtime(provider, &Config::default());
-    let first = runtime.summary().id;
-    let mut always = CountingApproval {
-        answer: Approval::Session,
-        asked: 0,
-    };
-    // One answer covers the rest of the turn and the following turns.
-    for prompt in ["first", "second"] {
-        runtime
-            .turn(prompt.to_string(), &mut always, &mut |_| Ok(()))
-            .unwrap();
-    }
-    assert_eq!(always.asked, 1);
-    for name in ["one", "two", "three"] {
-        assert!(fixture.workspace.join(name).exists(), "{name}");
-    }
-
-    let mut deny = CountingApproval {
-        answer: Approval::Deny,
-        asked: 0,
-    };
-    runtime.new_session(false, None).unwrap();
-    runtime
-        .turn("third".to_string(), &mut deny, &mut |_| Ok(()))
-        .unwrap();
-    // The original session retains its own grant after returning to it.
-    runtime.resume(&first).unwrap();
-    runtime
-        .turn("fourth".to_string(), &mut deny, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(deny.asked, 1);
-    assert!(!fixture.workspace.join("four").exists());
-    assert!(fixture.workspace.join("five").exists());
-}
-
-#[test]
-fn session_allow_is_stored_with_the_session() {
-    let fixture = Fixture::new("always-restart");
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let open = |session, script| {
-        let provider = Scripted::new(script);
-        let config = Config {
-            tools: vec![ToolDirectory {
-                directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-                enabled: true,
-            }],
-            ..Config::default()
-        };
-        Runtime::new(
-            provider,
-            store.clone(),
-            session,
-            &config,
-            "test/model".to_string(),
-        )
-        .unwrap()
-    };
-    let mut runtime = open(
-        store.create(false, None).unwrap(),
-        vec![tool("sh", r#"{"command":": > before"}"#), answer("done")],
-    );
-    let mut always = CountingApproval {
-        answer: Approval::Session,
-        asked: 0,
-    };
-    runtime
-        .turn("first".to_string(), &mut always, &mut |_| Ok(()))
-        .unwrap();
-    let saved = runtime.session().permission_grants().unwrap();
-    let saved = saved.values().next().unwrap();
-    assert_eq!(saved.kind, "process");
-    assert!(saved.owner.ends_with("tools/sh"));
-    assert!(saved.created_ms > 0);
-    let id = runtime.summary().id;
-    drop(runtime);
-
-    // A restarted binary resuming the same session uses its saved grant.
-    let mut resumed = open(
-        store.open(&id).unwrap(),
-        vec![tool("sh", r#"{"command":": > after"}"#), answer("done")],
-    );
-    let mut deny = CountingApproval {
-        answer: Approval::Deny,
-        asked: 0,
-    };
-    resumed
-        .turn("second".to_string(), &mut deny, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(deny.asked, 0);
-    assert!(fixture.workspace.join("before").exists());
-    assert!(fixture.workspace.join("after").exists());
-}
-
-#[test]
-fn saved_denial_prevents_a_permission_hook_from_allowing_the_call() {
-    let fixture = Fixture::new("saved-denial-before-hook");
-    let hook = fixture.root.join("hook.sh");
-    let checks = fixture.root.join("checks");
-    support::write(
-        &hook,
-        format!(
-            "event=$(cat)\ncase \"$event\" in\n  *'\"event\":\"permission\"'*) printf x >> '{}' ; printf '%s' '{{\"decision\":\"allow\"}}' ;;\n  *) printf '%s' '{{}}' ;;\nesac\n",
-            checks.display()
-        ),
-    )
-    .unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        hooks: vec![HookConfig {
-            events: None,
-            name: "fixture".into(),
-            command: vec![support::SHELL.into(), hook.display().to_string()],
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let mut session = store.create(false, None).unwrap();
-    let identity = Registry::load_config(&config).unwrap().tools()[0]
-        .approval_identity()
-        .unwrap();
-    session
-        .append_permission_grant(&PermissionGrant {
-            name: "sh".into(),
-            identity,
-            allow: Some(false),
-            ..PermissionGrant::default()
-        })
-        .unwrap();
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":": > denied"}"#),
-        answer("done"),
-    ]);
-    let mut runtime = Runtime::new(provider, store, session, &config, "test/model".into()).unwrap();
-    runtime
-        .turn("try".into(), &mut UnexpectedApproval, &mut |_| Ok(()))
-        .unwrap();
-    assert!(!fixture.workspace.join("denied").exists());
-    assert!(!checks.exists());
-}
-
-#[test]
-fn hook_confirm_asks_even_after_a_saved_allowance() {
-    let fixture = Fixture::new("confirm-after-grant");
-    let hook = fixture.root.join("hook.sh");
-    support::write(
-        &hook,
-        "event=$(cat)\ncase \"$event\" in\n  *'\"event\":\"permission\"'*) printf '%s' '{\"decision\":\"confirm\"}' ;;\n  *) printf '%s' '{}' ;;\nesac\n",
-    )
-    .unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        hooks: vec![HookConfig {
-            events: None,
-            name: "fixture".into(),
-            command: vec![support::SHELL.into(), hook.display().to_string()],
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let mut session = store.create(false, None).unwrap();
-    let identity = Registry::load_config(&config).unwrap().tools()[0]
-        .approval_identity()
-        .unwrap();
-    session
-        .append_permission_grant(&PermissionGrant {
-            name: "sh".into(),
-            identity,
-            allow: Some(true),
-            ..PermissionGrant::default()
-        })
-        .unwrap();
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":": > unconfirmed"}"#),
-        answer("done"),
-    ]);
-    let mut runtime = Runtime::new(provider, store, session, &config, "test/model".into()).unwrap();
-    let mut deny = CountingApproval {
-        answer: Approval::Deny,
-        asked: 0,
-    };
-    runtime
-        .turn("try".into(), &mut deny, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(deny.asked, 1);
-    assert!(!fixture.workspace.join("unconfirmed").exists());
-}
-
-#[test]
-fn a_hook_denial_wins_over_always_allow() {
-    let fixture = Fixture::new("always-deny");
-    let hook = fixture.root.join("hook.sh");
-    support::write(
-        &hook,
-        r#"#!/bin/sh
-event=$(cat)
-case "$event" in
-  *'"event":"permission"'*forbidden*) printf '%s' '{"decision":"deny"}' ;;
-  *) printf '%s' '{}' ;;
-esac
-"#,
-    )
-    .unwrap();
-    let mut config = Config::default();
-    config.hooks.push(HookConfig {
-        events: None,
-        name: "fixture".to_string(),
-        // A parallel spawn can briefly inherit the script's writable fd.
-        // Let sh read it without executing that inode (ETXTBSY on Linux).
-        command: vec![support::SHELL.to_string(), hook.display().to_string()],
-        timeout: Duration::from_secs(2),
-        max_output_bytes: 64 * 1024,
-    });
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":": > fine"}"#),
-        tool("sh", r#"{"command":": > forbidden"}"#),
-        answer("done"),
-    ]);
-    let mut runtime = fixture.runtime(provider, &config);
-    let mut always = CountingApproval {
-        answer: Approval::Session,
-        asked: 0,
-    };
-    runtime
-        .turn("go".to_string(), &mut always, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(always.asked, 1);
-    assert!(fixture.workspace.join("fine").exists());
-    assert!(!fixture.workspace.join("forbidden").exists());
-}
-
-#[test]
-fn a_hook_can_register_authorize_and_execute_a_tool() {
+fn a_hook_can_register_and_execute_a_tool() {
     let fixture = Fixture::new("hook");
     let hook = fixture.root.join("hook.sh");
     support::write(
@@ -2366,9 +1502,6 @@ event=$(cat)
 case "$event" in
   *'"event":"initialize"'*)
     printf '%s' '{"tools":[{"name":"echo_hook","description":"fixture","parameters":{"type":"object"}}],"state":{"ready":true}}'
-    ;;
-  *'"event":"permission"'*)
-    printf '%s' '{"decision":"allow"}'
     ;;
   *'"event":"tool_execute"'*)
     printf '%s' '{"tool_result":{"content":"hook executed","is_error":false}}'
@@ -2391,7 +1524,7 @@ esac
     let provider = Scripted::new(vec![tool("echo_hook", "{}"), answer("done")]);
     let mut runtime = fixture.runtime(provider, &config);
     runtime
-        .turn("use hook".to_string(), &mut UnexpectedApproval, &mut |_| {
+        .turn("use hook".to_string(), &mut Unattended, &mut |_| {
             Ok(())
         })
         .unwrap();
@@ -2421,9 +1554,6 @@ case "$event" in
   *'"event":"initialize"'*)
     printf '%s' '{"tools":[{"name":"echo_hook","description":"fixture","parameters":{"type":"object"}}]}'
     ;;
-  *'"event":"permission"'*)
-    printf '%s' '{"decision":"allow"}'
-    ;;
   *'"event":"tool_execute"'*)
     printf '%s' '{"tool_result":{"content":"executed once","is_error":false},"notice":"finished"}'
     ;;
@@ -2442,7 +1572,7 @@ esac
     });
     let mut runtime = fixture.runtime(Scripted::new(vec![tool("echo_hook", "{}")]), &config);
     let error = runtime
-        .turn("go".to_string(), &mut UnexpectedApproval, &mut |event| {
+        .turn("go".to_string(), &mut Unattended, &mut |event| {
             if matches!(event, Event::Notice(ref message) if message.contains("finished")) {
                 Err("notice display failed".to_string())
             } else {
@@ -2486,7 +1616,7 @@ fn manual_compaction_appends_a_checkpoint_without_deleting_history() {
     let mut runtime = fixture.runtime(provider.clone(), &config);
     for prompt in ["one", "two", "three"] {
         runtime
-            .turn(prompt.to_string(), &mut FixedApproval(false), &mut |_| {
+            .turn(prompt.to_string(), &mut Unattended, &mut |_| {
                 Ok(())
             })
             .unwrap();
@@ -2561,7 +1691,7 @@ fn provider_failures_are_recorded() {
         runtime
             .turn(
                 "question".to_string(),
-                &mut FixedApproval(false),
+                &mut Unattended,
                 &mut |_| Ok(()),
             )
             .is_err()
@@ -2590,7 +1720,7 @@ fn an_oversized_first_turn_records_its_error() {
     let error = runtime
         .turn(
             "large input ".repeat(10_000),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap_err();
@@ -2617,7 +1747,7 @@ fn resume_restores_context_model_and_cumulative_usage() {
     runtime
         .turn(
             "first question".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2640,7 +1770,7 @@ fn resume_restores_context_model_and_cumulative_usage() {
     resumed
         .turn(
             "follow up".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2689,7 +1819,7 @@ fn resume_reports_discarded_crash_tail_and_completes_a_new_turn() {
             .any(|notice| notice.contains("discarded 2 incomplete session records"))
     );
     runtime
-        .turn("next".to_string(), &mut FixedApproval(false), &mut |_| {
+        .turn("next".to_string(), &mut Unattended, &mut |_| {
             Ok(())
         })
         .unwrap();
@@ -2713,7 +1843,7 @@ fn a_provider_switch_is_recorded_and_used_on_the_next_turn() {
     runtime
         .turn(
             "one".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2723,7 +1853,7 @@ fn a_provider_switch_is_recorded_and_used_on_the_next_turn() {
     runtime
         .turn(
             "two".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2779,12 +1909,12 @@ fn switched_provider_sees_reasoning_cache_markers_and_retry_notice() {
         }
     }));
     runtime
-        .turn("one".into(), &mut FixedApproval(false), &mut |_| Ok(()))
+        .turn("one".into(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     runtime.set_provider("second", &mut |_| Ok(())).unwrap();
     let mut events = Vec::new();
     runtime
-        .turn("two".into(), &mut FixedApproval(false), &mut |event| {
+        .turn("two".into(), &mut Unattended, &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -2855,7 +1985,7 @@ fn resuming_another_session_restores_its_provider() {
     runtime.resume(&second_id).unwrap();
     assert_eq!(runtime.provider_name(), "second");
     runtime
-        .turn("hello".to_string(), &mut FixedApproval(false), &mut |_| {
+        .turn("hello".to_string(), &mut Unattended, &mut |_| {
             Ok(())
         })
         .unwrap();
@@ -2888,7 +2018,7 @@ fn cancellation_stops_a_streaming_turn_and_records_it() {
     let error = runtime
         .turn(
             "keep going".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |event| {
                 if matches!(event, Event::Text(_)) {
                     saw_text = true;
@@ -2937,7 +2067,7 @@ fn lifecycle_hooks_run_after_a_cancelled_turn() {
     let error = runtime
         .turn(
             "interrupt".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |event| {
                 if matches!(event, Event::Text(_)) {
                     saw_text = true;
@@ -2974,7 +2104,7 @@ fn cancellation_pairs_every_call_in_a_tool_round() {
     let cancellation = runtime.cancellation();
     let mut saw_output = false;
     let error = runtime
-        .turn("go".to_string(), &mut FixedApproval(true), &mut |event| {
+        .turn("go".to_string(), &mut Unattended, &mut |event| {
             if matches!(event, Event::ToolOutput { .. }) {
                 saw_output = true;
                 cancellation.cancel();
@@ -3037,7 +2167,7 @@ fn before_stop_reminders_are_saved_as_user_notes_and_bounded_per_turn() {
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let mut reminders = 0;
     runtime
-        .turn("work".into(), &mut FixedApproval(true), &mut |event| {
+        .turn("work".into(), &mut Unattended, &mut |event| {
             if matches!(event, Event::Notice(ref text) if text.starts_with("before_stop:")) {
                 reminders += 1;
             }
@@ -3063,7 +2193,7 @@ fn before_stop_reminders_are_saved_as_user_notes_and_bounded_per_turn() {
     );
     drop(requests);
     runtime
-        .turn("hello".into(), &mut UnexpectedApproval, &mut |_| Ok(()))
+        .turn("hello".into(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     assert_eq!(provider.requests.lock().unwrap().len(), 6);
 }
@@ -3127,7 +2257,7 @@ fn session_changes_repeat_setup_and_replace_prompt_fragments() {
     support::write(&response, r#"{"prompt_fragments":["setup prompt two"]}"#).unwrap();
     runtime.new_session(false, None).unwrap();
     runtime
-        .turn("hello".into(), &mut UnexpectedApproval, &mut |_| Ok(()))
+        .turn("hello".into(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     runtime.clone_session().unwrap();
     let user = runtime
@@ -3179,7 +2309,7 @@ fn session_changes_repeat_setup_and_replace_prompt_fragments() {
     runtime
         .turn(
             "after failed setup".into(),
-            &mut UnexpectedApproval,
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -3237,13 +2367,13 @@ fn selection_changes_and_compaction_repeat_setup_with_current_metadata() {
     runtime.set_provider("remote", &mut |_| Ok(())).unwrap();
     for prompt in ["one", "two"] {
         runtime
-            .turn(prompt.into(), &mut UnexpectedApproval, &mut |_| Ok(()))
+            .turn(prompt.into(), &mut Unattended, &mut |_| Ok(()))
             .unwrap();
     }
     support::write(&response, r#"{"prompt_fragments":["setup compacted"]}"#).unwrap();
     runtime.compact(None, &mut |_| Ok(())).unwrap();
     runtime
-        .turn("three".into(), &mut UnexpectedApproval, &mut |_| Ok(()))
+        .turn("three".into(), &mut Unattended, &mut |_| Ok(()))
         .unwrap();
     let events = std::fs::read_to_string(&log)
         .unwrap()
@@ -3308,7 +2438,7 @@ fn a_failed_before_stop_hook_is_reported_without_repeating_the_answer() {
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let mut notices = Vec::new();
     runtime
-        .turn("work".into(), &mut FixedApproval(true), &mut |event| {
+        .turn("work".into(), &mut Unattended, &mut |event| {
             if let Event::Notice(text) = event {
                 notices.push(text);
             }
@@ -3358,7 +2488,7 @@ fn cancellation_keeps_the_tool_result_when_a_result_hook_cannot_run() {
     let cancellation = runtime.cancellation();
     let mut saw_output = false;
     let error = runtime
-        .turn("go".to_string(), &mut FixedApproval(true), &mut |event| {
+        .turn("go".to_string(), &mut Unattended, &mut |event| {
             if matches!(event, Event::ToolOutput { .. }) {
                 saw_output = true;
                 cancellation.cancel();
@@ -3393,9 +2523,9 @@ fn an_observer_error_pairs_calls_that_never_started() {
     })]);
     let mut runtime = fixture.runtime(provider, &Config::default());
     let error = runtime
-        .turn("go".to_string(), &mut FixedApproval(true), &mut |event| {
-            if matches!(event, Event::Permission(_)) {
-                Err("observer refused permission event".to_string())
+        .turn("go".to_string(), &mut Unattended, &mut |event| {
+            if matches!(event, Event::ToolStart { .. }) {
+                Err("observer refused tool start event".to_string())
             } else {
                 Ok(())
             }
@@ -3453,7 +2583,7 @@ fn a_failed_result_hook_preserves_the_completed_call() {
     })]);
     let mut runtime = fixture.runtime(provider, &config);
     let error = runtime
-        .turn("go".to_string(), &mut FixedApproval(true), &mut |_| Ok(()))
+        .turn("go".to_string(), &mut Unattended, &mut |_| Ok(()))
         .unwrap_err();
     assert!(error.contains("exited unsuccessfully"), "{error}");
     assert!(fixture.workspace.join("done").exists());
@@ -3490,14 +2620,14 @@ fn automatic_compaction_runs_before_an_oversized_follow_up() {
     };
     let mut runtime = fixture.runtime(provider.clone(), &config);
     runtime
-        .turn("first".to_string(), &mut FixedApproval(false), &mut |_| {
+        .turn("first".to_string(), &mut Unattended, &mut |_| {
             Ok(())
         })
         .unwrap();
     runtime
         .turn(
             "follow up".to_string(),
-            &mut FixedApproval(false),
+            &mut Unattended,
             &mut |_| Ok(()),
         )
         .unwrap();

@@ -41,7 +41,7 @@ pub fn observe(event: &Event, context: &ToolContext) -> Result<Value, String> {
                 }
             }
             if call.name == "check" {
-                match crate::batteries::check_approval::completed(event, &mut state) {
+                match crate::batteries::check_receipt::completed(event) {
                     Ok(Some(receipt)) => {
                         let entry_id = event.payload["id"]
                             .as_str()
@@ -173,8 +173,6 @@ mod tests {
             output_file: None,
         };
         for passed in [false, true] {
-            let approval = crate::batteries::check_approval::prepare(&event, &context).unwrap();
-            event.session.state = Some(approval["state"].clone());
             receipt.passed = passed;
             receipt.exit_status = Some(if passed { 0 } else { 1 });
             event.event = "entry".into();

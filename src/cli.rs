@@ -9,8 +9,6 @@ pub const COMMAND_NAMES: &[&str] = &[
     "status",
     "tools",
     "tool",
-    "permissions",
-    "permission",
     "session",
     "name",
     "new",
@@ -55,15 +53,14 @@ Options:
   --help              Print this help
 
 Interactive commands include /new, /resume, /name, /session, /tree, /label,
-/fork, /clone, /compact, /provider, /model, /tools, /tool, /permissions,
-/permission, /status, /setup, /reset, /help, and /quit.
+/fork, /clone, /compact, /provider, /model, /tools, /tool, /status, /setup,
+/reset, /help, and /quit.
 Without a chosen model, an interactive start asks for the provider, model and
 key; /setup asks again at any time.
 `gears reset` and /reset ask, then remove keys, saved settings, memory, skills
 and sessions from the Gears directory, keeping gears.toml, gears-batteries.toml
 and tools/, and remove .gears/ from the current directory.
 Use /tool enable|disable|reset NAME [--global] to change directory tools.
-Use /permission revoke NAME [--global] to remove saved grants.
 Use /provider NAME --default or /model ID --default to save both defaults.
 ";
 

@@ -1,10 +1,9 @@
 //! Optional coding workflows using Gears' command-hook protocol.
 
 pub mod check;
-pub mod check_approval;
+pub mod check_receipt;
 pub mod check_config;
 pub mod check_state;
-pub mod command_policy;
 pub mod file_patch;
 pub mod file_read;
 pub mod file_record;
@@ -21,7 +20,7 @@ pub mod memory_question;
 pub mod memory_tool;
 pub mod patch_match;
 pub mod paths;
-pub mod policy;
+
 pub mod provenance;
 pub mod remember;
 pub mod search;
@@ -127,7 +126,6 @@ pub fn hook(event: Event) -> Result<Value, String> {
                 Err(error) => with_tools(&event, initialization_notice(error)),
             },
         ),
-        "permission" => Ok(policy::permission(&event)),
         _ => Ok(json!({})),
     }
 }
@@ -262,11 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_events_and_defaults_permissions_to_denial() {
-        let event = json!({"protocol_version": 1, "event": "permission",
+    fn rejects_invalid_events() {
+        let event = json!({"protocol_version": 1, "event": "context",
             "workspace": "/work", "session": {"id": "s1"}, "future_field": true});
         let parsed = read_event(event.to_string().as_bytes()).unwrap();
-        assert_eq!(hook(parsed).unwrap()["decision"], "deny");
+        assert_eq!(hook(parsed).unwrap(), json!({}));
         for (field, value) in [
             ("protocol_version", json!(2)),
             ("event", json!("typo")),

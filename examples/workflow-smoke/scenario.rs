@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use gears::provider::{
     Completion, EventSink, FinishReason, Provider, ProviderError, Request, ToolCall,
 };
-use gears::runtime::{Approval, Approver, Permission};
+use gears::runtime::Responder;
 use serde_json::{Value, json};
 
 static NEXT_CALL: AtomicU32 = AtomicU32::new(0);
@@ -90,9 +90,17 @@ pub fn answer(text: &str) -> Completion {
     }
 }
 
+/// Declines every hook question and records nothing else.
 #[derive(Default)]
-pub struct Approvals(pub Vec<Permission>);
-impl Approver for Approvals {
+pub struct Answers {
+    pub asked: usize,
+}
+
+impl Responder for Answers {
+    fn attended(&self) -> bool {
+        true
+    }
+
     fn answer(&mut self, question: &gears::hooks::Question) -> Result<Option<String>, String> {
         if question
             .choices
@@ -103,11 +111,7 @@ impl Approver for Approvals {
         {
             return Err("unexpected workflow question".into());
         }
+        self.asked += 1;
         Ok(Some("no".into()))
-    }
-
-    fn approve(&mut self, permission: &Permission) -> Approval {
-        self.0.push(permission.clone());
-        Approval::Once
     }
 }

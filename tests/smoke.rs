@@ -462,75 +462,59 @@ fn jsonl_one_shot_streams_reasoning_text_and_numeric_usage() {
 }
 
 #[test]
-fn jsonl_tool_records_report_allowed_and_unattended_denied_calls() {
-    for allowed in [false, true] {
-        let root = fixture(if allowed {
-            "jsonl-tool-allow"
-        } else {
-            "jsonl-tool-deny"
-        });
-        let workspace = root.join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let call = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_jsonl","function":{"name":"sh","arguments":"{\"command\":\"printf 'tool output\\n'; printf 'tool error\\n' >&2\"}"}}]},"finish_reason":"tool_calls"}]}"#;
-        let server = MockServer::start(vec![sse_response(&[call]), sse_response(&[
-            r#"{"choices":[{"index":0,"delta":{"content":"finished"},"finish_reason":"stop"}]}"#,
-        ])]).unwrap();
-        let cfg = config(&root, &server);
-        let mut text = std::fs::read_to_string(&cfg).unwrap();
-        text.push_str(&format!(
-            "\n[[tools]]\ndirectory = {:?}\nenabled = true\n",
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tools/sh")
-                .to_str()
-                .unwrap()
-        ));
-        if allowed {
-            text.push_str("\n[[hooks]]\nname = 'policy'\nevents = ['permission']\ncommand = ['/bin/sh', '-c', \"_input=$(cat); printf '{\\\"decision\\\":\\\"allow\\\"}'\"]\n");
-        }
-        support::write(&cfg, text).unwrap();
-        let output = gears(&root, &workspace, &cfg)
-            .args(["-p", "work", "--output", "jsonl"])
-            .output()
-            .unwrap();
+fn jsonl_tool_records_report_the_call_and_its_output() {
+    let root = fixture("jsonl-tool");
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let call = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_jsonl","function":{"name":"sh","arguments":"{\"command\":\"printf 'tool output\\n'; printf 'tool error\\n' >&2\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+    let server = MockServer::start(vec![sse_response(&[call]), sse_response(&[
+        r#"{"choices":[{"index":0,"delta":{"content":"finished"},"finish_reason":"stop"}]}"#,
+    ])]).unwrap();
+    let cfg = config(&root, &server);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[[tools]]\ndirectory = {:?}\nenabled = true\n",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tools/sh")
+            .to_str()
+            .unwrap()
+    ));
+    support::write(&cfg, text).unwrap();
+    let output = gears(&root, &workspace, &cfg)
+        .args(["-p", "work", "--output", "jsonl"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = jsonl_records(&output.stdout);
+    let start = records
+        .iter()
+        .find(|record| record["type"] == "tool_start")
+        .unwrap();
+    let result = records
+        .iter()
+        .find(|record| record["type"] == "tool_result")
+        .unwrap();
+    assert_eq!(start["call_id"], "call_jsonl");
+    assert_eq!(result["call_id"], start["call_id"]);
+    assert_eq!(result["outcome"], "completed");
+    assert_eq!(result["is_error"], false);
+    let output = records
+        .iter()
+        .filter(|record| record["type"] == "tool_output")
+        .collect::<Vec<_>>();
+    for (stream, text) in [("stdout", "tool output\n"), ("stderr", "tool error\n")] {
         assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            output
+                .iter()
+                .any(|record| record["stream"] == stream && record["text"] == text)
         );
-        let records = jsonl_records(&output.stdout);
-        let start = records
-            .iter()
-            .find(|record| record["type"] == "tool_start")
-            .unwrap();
-        let result = records
-            .iter()
-            .find(|record| record["type"] == "tool_result")
-            .unwrap();
-        assert_eq!(start["call_id"], "call_jsonl");
-        assert_eq!(result["call_id"], start["call_id"]);
-        assert_eq!(
-            result["outcome"],
-            if allowed { "completed" } else { "not_started" }
-        );
-        assert_eq!(result["is_error"], !allowed);
-        let output = records
-            .iter()
-            .filter(|record| record["type"] == "tool_output")
-            .collect::<Vec<_>>();
-        if allowed {
-            for (stream, text) in [("stdout", "tool output\n"), ("stderr", "tool error\n")] {
-                assert!(
-                    output
-                        .iter()
-                        .any(|record| record["stream"] == stream && record["text"] == text)
-                );
-            }
-        } else {
-            assert!(output.is_empty());
-        }
-        assert_eq!(records.last().unwrap()["answer"], "finished");
-        std::fs::remove_dir_all(root).unwrap();
     }
+    assert_eq!(records.last().unwrap()["answer"], "finished");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -620,7 +604,6 @@ fn owned_nested_gears_stops_only_its_tool_and_parents_stop_everything() {
                 .to_str()
                 .unwrap()
         ));
-        text.push_str("\n[[hooks]]\nname = 'policy'\nevents = ['permission']\ncommand = ['/bin/sh', '-c', \"_input=$(cat); printf '{\\\"decision\\\":\\\"allow\\\"}'\"]\n");
         support::write(&cfg, text).unwrap();
         let cancellation = Cancellation::new();
         let mut streamed = String::new();
@@ -719,7 +702,7 @@ fn malformed_line_commands_report_errors_and_keep_the_session_open() {
         .take()
         .unwrap()
         .write_all(
-            b"/tool enable\n/tool enable missing\n/permission revoke sh --unknown\nhello\n/quit\n",
+            b"/tool enable\n/tool enable missing\n/tool disable\nhello\n/quit\n",
         )
         .unwrap();
     let output = child.wait_with_output().unwrap();
@@ -732,7 +715,7 @@ fn malformed_line_commands_report_errors_and_keep_the_session_open() {
     let errors = String::from_utf8_lossy(&output.stderr);
     assert!(errors.contains("usage: /tool"), "{errors}");
     assert!(errors.contains("unknown directory tool"), "{errors}");
-    assert!(errors.contains("usage: /permission"), "{errors}");
+    assert_eq!(errors.matches("usage: /tool").count(), 2, "{errors}");
     assert_eq!(server.requests().len(), 1);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -929,15 +912,15 @@ fn line_commands_save_provider_and_model_defaults() {
 }
 
 #[test]
-fn unattended_sh_is_denied_and_the_turn_continues() {
-    let root = fixture("deny");
+fn an_unknown_tool_is_reported_and_the_turn_continues() {
+    let root = fixture("unknown-tool");
     let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let call = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"sh","arguments":"{\"command\":\"touch denied-file\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+    let call = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"sh","arguments":"{\"command\":\"touch missing-file\"}"}}]},"finish_reason":"tool_calls"}]}"#;
     let server = MockServer::start(vec![
         sse_response(&[call]),
         sse_response(&[
-            r#"{"choices":[{"index":0,"delta":{"content":"denied safely"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"continued safely"}}]}"#,
             r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
         ]),
     ])
@@ -952,11 +935,11 @@ fn unattended_sh_is_denied_and_the_turn_continues() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!workspace.join("denied-file").exists());
+    assert!(!workspace.join("missing-file").exists());
     assert!(
         String::from_utf8(output.stdout)
             .unwrap()
-            .contains("denied safely")
+            .contains("continued safely")
     );
     assert_eq!(server.requests().len(), 2);
     std::fs::remove_dir_all(root).unwrap();

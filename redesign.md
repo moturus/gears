@@ -26,7 +26,7 @@ sh(command: string) -> stdout, stderr, exit status
 
 `sh` starts in the selected workspace through a platform backend: a POSIX
 shell on Linux and the native shell facility on Motor OS. It is not confined
-to the workspace; once approved, it has the same filesystem authority as the
+to the workspace; it has the same filesystem authority as the
 Gears process. Output remains bounded for model context and fully available to
 the UI/session where practical. Timeouts, cancellation, and process-tree
 cleanup remain core responsibilities.
@@ -84,7 +84,7 @@ the user trusts that project configuration.
 
 A hook is ordinary code running with the user's authority. It can contact any
 LLM endpoint using its own configuration and credentials, including a model
-dedicated to tool approval. Gears should not add a second-model abstraction to
+dedicated to reviewing tool calls. Gears should not add a second-model abstraction to
 the core. Initially hooks are separate processes per invocation, not persistent
 services.
 
@@ -94,7 +94,6 @@ The first hook surface should support:
   tool names, descriptions, and JSON schemas;
 - `input` and `context`: transform user input or the messages for the next
   request;
-- `permission`: decide a tool call before execution;
 - `tool_execute`: execute a tool registered by that hook;
 - `tool_result`: transform the model-facing result;
 - `before_compact` and `after_compact`: replace or observe compaction; and
@@ -104,27 +103,23 @@ The first hook surface should support:
 Custom tools use the normal generic TUI rendering in v1. Hook-provided UI code
 and renderers can wait until there is a demonstrated need.
 
-### Tool authorization
+### Tool execution
 
-Gears first checks saved session and global grants for the tool's approval
-identity. A saved denial blocks the call before hooks run. A hook denial or
-failure also blocks it; a hook's `confirm` answer asks an attended user even
-after a saved allowance. Otherwise a hook allowance runs the call, followed
-by an attended saved allowance or a fresh prompt. An unattended run ignores
-saved allowances and denies a call without hook authority.
+Enablement is the whole gate. A tool that is listed and enabled is sent to
+the model and its calls run; an unknown or disabled one is refused and the
+model is told so. A hook-owned tool runs inside its hook through
+`tool_execute`. There is no approval prompt, no saved grant, and no permission
+hook.
 
 Gears does not parse shell strings into a policy, infer safe commands, or add a
-sandbox in v1. `y` and `n` answer once; `s` and `S` save a session allowance or
-denial; `g` and `G` save a global one. Grants apply to the tool identity and
-all its arguments, so a persistent `sh` allowance permits later shell
-commands. Session grants survive resume but do not transfer to new, forked,
-or cloned sessions. Hook denials keep applying. The provider credential must
-continue to be passed only to the provider transport, never through the
-environment inherited by `sh` or hooks.
-
+sandbox in v1. A hook may ask the user a question; an unattended run receives
+no answers. The provider credential must continue to be passed only to the
+provider transport, never through the environment inherited by `sh` or hooks.
 ### Composition
 
+
 Use a deliberately small set of rules:
+
 
 - Hooks are listed explicitly in configuration and run sequentially in that
   order. There is no implicit directory scan or hot reload in v1.
@@ -135,12 +130,10 @@ Use a deliberately small set of rules:
 - Only the event-specific result fields documented above can mutate data.
   Later transform hooks see earlier results.
 - Each invocation has one configurable timeout and output bound and follows
-  turn cancellation. Observational-hook failure is reported and ignored;
-  permission-hook failure follows the deny rule above.
+  turn cancellation. Observational-hook failure is reported and ignored; a
+  fault in a transforming hook stops that operation and is reported.
 - Hooks are loaded at process start. Namespaced entries from an absent hook
   remain valid session data but have no effect and use generic rendering.
-- Each event includes that hook's latest namespaced state, and a result may
-  append its successor; there is no hidden persistent process state.
 
 Default prompt text lives in reviewable data files rather than Rust source.
 

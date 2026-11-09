@@ -16,13 +16,12 @@ The file tools read numbered pages, search with `grep` on Linux or `rg` on Motor
 atomically after complete reads of the current file. The `todo` hook tool
 keeps tasks in branch-aware session state.
 
-The hook automatically allows workspace reads and its task list. Writes
-and ordinary commands use Gears' grants and prompts. Its short static
-command list refuses protected deletions and common fork bombs, including
-shell wrappers and saved shell directories. Commands that may publish or
-discard work require fresh confirmation. This prevents accidents and makes
-no confinement claim. A malformed policy request denies the call; optional
-recording and setup failures report notices and preserve their prior state.
+The hook registers the batteries tools and its prompt fragments. A call runs
+as soon as its directory is enabled; the hook may add a notice or ask the
+user a question before it writes memory. The hook keeps no static command
+list and claims no confinement. A malformed hook request is reported to the
+model instead of running the call; optional recording and setup failures
+report notices and preserve their prior state.
 The default `gears.toml` keeps optional tools disabled. Copy `config/gears-batteries.toml` and `tools/` into
 `/user/cfg/gears` on Motor OS to enable the batteries hook and coding tools. Select it explicitly:
 
@@ -35,7 +34,7 @@ with `gears-batteries` beside `gears`. Use `~/.gears/gears-batteries.toml` as
 the config path. See [Gears setup](README.md) for provider selection
 and explicit key files. The bare batteries program name resolves beside the
 Gears executable for tools and hooks. The shipped hook subscribes to
-`initialize`, `permission`, `tool_execute`, `tool_result`, `turn_start`,
+`initialize`, `tool_execute`, `tool_result`, `turn_start`,
 `entry`, `before_stop`, `turn_end`, `answer` and `command`, and registers
 the `/remember` and `/remember-host` commands.
 
@@ -72,13 +71,12 @@ linux = ["cargo", "test", "--offline"]
 motor = ["lorry", "test"]
 ```
 
-The check approval prompt shows the declared vector. Its first run and each
-changed declaration require fresh confirmation; a denied call does not
-record approval. Only a completed check receipt matching that request
-establishes evidence. Later calls to tools that may write make it stale.
-After workspace work, a missing, failed or stale check gets at most three
-`before_stop` reminders per turn. A passing check is development evidence;
-whether the task is done is the user's call, in conversation.
+The declared vector is recorded with the receipt. Only a completed check
+receipt matching that request establishes evidence; later calls to tools that
+may write make it stale. After workspace work, a missing, failed or stale
+check gets at most three `before_stop` reminders per turn. A passing check is
+development evidence; whether the task is done is the user's call, in
+conversation.
 
 ## Memory
 

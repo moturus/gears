@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::config::{Config, ToolDirectory};
 use crate::process::{self, Cancellation, Stream};
@@ -148,51 +147,6 @@ impl Registry {
 }
 
 impl Tool {
-    /// Stable approval key for this directory tool and its executable.
-    pub fn approval_identity(&self) -> Result<String, String> {
-        let executable_hash = match self.process.command.as_ref().and_then(|argv| argv.first()) {
-            Some(program) if program.starts_with("./") => {
-                let relative = Path::new(program.trim_start_matches("./"));
-                let path = StateRoot::new(self.directory.clone())?
-                    .existing_file(relative)?
-                    .ok_or_else(|| {
-                        format!("{}: executable disappeared", self.directory.display())
-                    })?;
-                Some(hash_bytes(
-                    &std::fs::read(&path)
-                        .map_err(|error| format!("{}: {error}", path.display()))?,
-                ))
-            }
-            Some(program) if program == "gears-batteries" => {
-                let path = process::program_path(program)?;
-                Some(hash_bytes(
-                    &std::fs::read(&path)
-                        .map_err(|error| format!("{}: {error}", path.display()))?,
-                ))
-            }
-            _ => None,
-        };
-        let mut process = serde_json::to_value(&self.process)
-            .map_err(|error| format!("cannot serialize approval identity: {error}"))?;
-        process["allowed_flags"] = serde_json::json!([]);
-        let identity = serde_json::json!({
-            "name": self.name,
-            "kind": "process",
-            "owner": self.directory,
-            "description": self.description,
-            "parameters": self.parameters,
-            // Removed manifest fields keep their empty values, so saved approvals stay valid.
-            "prompt": null,
-            "display": self.display,
-            "read_only": self.read_only,
-            "process": process,
-            "executable_hash": executable_hash,
-        });
-        let bytes = serde_json::to_vec(&identity)
-            .map_err(|error| format!("cannot serialize approval identity: {error}"))?;
-        Ok(hash_bytes(&bytes))
-    }
-
     pub fn spec(&self) -> ToolSpec {
         ToolSpec::new(&self.name, &self.description, self.parameters.clone())
     }
@@ -389,11 +343,6 @@ impl Tool {
             process,
         })
     }
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn read_schema(directory: &Path, file: &str) -> Result<Value, String> {
@@ -1029,43 +978,6 @@ mod tests {
             gix.process.command.as_ref().unwrap(),
             &["/devtools/bin/gix"]
         );
-    }
-
-    #[test]
-    fn approval_identity_tracks_package_executable_and_schema() {
-        let directory =
-            std::env::temp_dir().join(format!("gears-approval-identity-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("run"), b"first").unwrap();
-        std::fs::write(directory.join("parameters.json"), r#"{"type":"object"}"#).unwrap();
-        std::fs::write(
-            directory.join("tool.toml"),
-            "version = 1\nkind = 'process'\nname = 'sample'\ndescription = 'Sample'\nparameters = 'parameters.json'\n[process.command]\ncommon = ['./run']\n",
-        )
-        .unwrap();
-        let tool = Tool::load(&directory, true).unwrap();
-        let original = tool.approval_identity().unwrap();
-        assert_eq!(original.len(), 64);
-        let mut disabled = tool.clone();
-        disabled.enabled = false;
-        assert_eq!(disabled.approval_identity().unwrap(), original);
-        std::fs::write(directory.join("run"), b"second").unwrap();
-        assert_ne!(tool.approval_identity().unwrap(), original);
-        let mut changed_schema = tool.clone();
-        changed_schema.parameters =
-            serde_json::json!({"type":"object","properties":{"x":{"type":"string"}}});
-        assert_ne!(
-            changed_schema.approval_identity().unwrap(),
-            tool.approval_identity().unwrap()
-        );
-        let mut changed_description = tool.clone();
-        changed_description.description.push_str(" updated");
-        assert_ne!(
-            changed_description.approval_identity().unwrap(),
-            tool.approval_identity().unwrap()
-        );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

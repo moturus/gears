@@ -11,16 +11,16 @@ The goals are:
 - adding a tool means creating one self-contained directory and naming it in
   the Gears configuration;
 - disabled tools are not sent to the model and cannot be called;
-- every enabled tool uses the existing permission, cancellation, output, and
+- every enabled tool uses the existing cancellation, output, and
   session machinery;
 - a tool behaves the same on Linux and Motor OS unless its manifest explicitly
   selects different commands; and
 - loading a tool never runs code. Code runs only after the model requests the
-  tool and the normal permission decision allows it.
+  tool and its directory is enabled.
 
 ## Tool kinds and forward compatibility
 
-The directory, configuration, enablement, authorization, provider schema, and
+The directory, configuration, enablement, provider schema, and
 UI layers are independent of how a tool executes. `tool.toml` therefore has an
 explicit `kind`. Version 1 accepts only:
 
@@ -36,8 +36,8 @@ does not select a WebAssembly runtime, ABI, WASI version, host-call surface, or
 sandbox policy.
 
 Future kinds must reuse the common tool name, description, parameter schema,
-optional prompt, enablement precedence, scoped approvals, runtime identity,
-and generic UI events. Each kind supplies only its loader/executor, detailed
+optional prompt, enablement precedence, runtime identity, and
+generic UI events. Each kind supplies only its loader/executor, detailed
 result mapping, and an identity contribution for its executable artifact. An
 unknown kind is a startup error rather than something Gears guesses how to
 run. This separation lets process and loadable tools coexist without changing
@@ -65,7 +65,7 @@ my_tool/
 `tool.toml` and `parameters.json` must be regular files. A relative executable
 path beginning with `./` is resolved inside the tool directory. An absolute
 program path may name a standard system command. Bare program names are
-rejected: tool behavior and approval identity must not depend on an ambient
+rejected: tool behavior and the displayed call must not depend on an ambient
 `PATH` that can change between invocations. The shipped `gears-batteries`
 program is the one exception: Gears resolves that bare name beside its own
 executable (`/devtools/bin` on Motor OS).
@@ -88,7 +88,7 @@ kind = "process"
 name = "example"
 description = "Describe exactly what the tool does for the model."
 parameters = "parameters.json"
-display = "{path}"                   # optional permission/UI detail
+display = "{path}"                   # optional UI detail
 read_only = false                    # optional; true only for read-only tools
 
 [process]
@@ -120,7 +120,7 @@ The fields mean:
   object-valued JSON Schema. The schema is sent to the provider. Version 1
   checks the top-level shape and mapped property types, but does not implement
   a complete JSON Schema validator; the tool must still validate its input.
-- `display` is an optional template used for the permission prompt and generic
+- `display` is an optional template used for the call detail and generic
   TUI rendering. Without it, Gears displays the tool name and compact argument
   JSON.
 - `[linux]` and `[motor]` may each give their own `description`, replacing
@@ -260,7 +260,7 @@ set, signal, timeout, cancellation, spawn failure, invalid argument object,
 or invalid template is an error. Stderr alone is not. Timeout and cancellation
 stop the process tree through Gears' shared runner.
 
-External tools are trusted code. Running an approved process tool grants it the
+External tools are trusted code. Running a process tool grants it the
 user's filesystem and process authority. The directory format is a packaging
 and review boundary, not a sandbox or signature scheme.
 
@@ -269,88 +269,23 @@ but the loader may expose it through a capability-limited virtual filesystem
 rather than as unrestricted host process state. The WebAssembly design must
 specify that boundary instead of inheriting process-tool authority by accident.
 
-## Authorization and approval scopes
+## Call execution
 
-Enablement and authorization are separate. Enabling a tool makes its schema
-available to the model; it does not grant permission to execute it. A global
-approval also does not enable a disabled tool.
+Enablement decides what the model may call. Enabling a tool makes its schema
+available to the model and lets its calls run.
 
 Every call follows this order:
 
-1. Reject an unknown or disabled tool without executing it.
-2. Look up matching session and global grants for the approval identity on
-   every call. A session grant beats a global grant; within a scope the latest
-   answer wins. A saved denial refuses the call.
-3. Run permission hooks. A hook denial or failure refuses the call. A hook's
-   `confirm` asks the attended user for fresh confirmation and refuses an
-   unattended call. A hook allowance runs the call.
-4. Without a hook decision, a saved allowance runs an attended call. Saved
-   allowances do not apply in `-p` runs, including workers and jobs. With
-   neither, ask the attended user or refuse the unattended call.
+1. An unknown or disabled tool is not executed; the refusal is reported to the
+   model as the call's result.
+2. A call to an enabled directory tool runs at once in the workspace.
+3. A call to a hook tool is passed to its owning hook through `tool_execute`;
+   the hook runs it and may ask the user a question. An unattended run (`-p`,
+   JSONL) receives no answers and runs with whatever the hook decides.
 
-The saved answer is checked before a hook can allow anything. A hook's
-`confirm` requires fresh confirmation even after a saved allowance.
-
-An interactive approval prompt offers six choices, allow or deny at each of
-three scopes:
-
-```text
-[y] allow once   [s] allow this tool for this session   [g] allow globally
-[n] deny once    [S] deny this tool for this session    [G] deny globally
-```
-
-`y` and `n` apply only to the pending call. `s` records an allow grant and then
-runs the pending call; `S` records a deny grant and refuses it, and later calls
-of the same identity in the session are refused without asking. For a saved
-session, a grant survives resume; for an ephemeral session it lasts until that
-session ends. A session grant belongs to the whole session rather than its
-active conversation branch, so `/tree` does not unexpectedly revoke or
-resurrect authority. Starting, forking, or cloning to a new session does not
-copy grants.
-
-`g` and `G` record an allow or deny grant for the current user across sessions
-and workspaces, then run or refuse the pending call. Global grants are stored
-atomically in a separate Gears-owned file:
-
-- Linux: `~/.gears/permissions.toml`
-- Motor OS: `/user/cfg/gears/permissions.toml`
-
-A grant records the tool name, kind, owner, complete approval-identity hash,
-its direction (allow or deny), and creation time. It does not constrain
-arguments: "allow this tool" means all calls and all argument values exposed
-by that tool. In particular, a grant for `sh` permits arbitrary shell
-commands, so the prompt must distinguish this clearly from allowing the
-displayed command once.
-
-If a session or global grant cannot be written, Gears does not run the call
-under the requested persistent scope. It reports the write error and returns
-to an unapproved state rather than silently treating the choice as `y`.
-
-Grants bind to a tool approval identity, not merely its display name. The
-identity includes the name, kind, model-facing schema, owner, execution
-settings, prompt, manifest, and hashes of package-controlled executable
-resources. A process tool using an absolute system program also includes the
-selected command vector and path; its grant deliberately trusts later updates
-to that system program. A future WebAssembly tool must include the module hash.
-A hook tool includes its owner hook, registered specification, and configured
-hook command. Changing an identity makes old grants non-matching and requires
-approval again. The same six interactive choices apply to process and hook
-tools and, later, to loadable tools.
-
-The following slash commands make persistent authority inspectable and
-revocable:
-
-```text
-/permissions
-/permission revoke NAME
-/permission revoke NAME --global
-```
-
-`/permissions` shows active session/global grants, each with its direction
-and a short approval-identity fingerprint. Session revoke appends a
-session-wide revocation; global revoke atomically removes matching global
-grants. Stale grants may be displayed for
-diagnosis but never match a changed tool.
+There is no approval prompt and no saved grant. A call's UI detail comes from
+`display`, and nothing else gates it. The provider credential is removed from
+the environment of every tool process.
 
 ## Gears configuration
 
@@ -369,7 +304,7 @@ enabled = false
 `directory` is absolute, or relative to the Gears directory: `/user/cfg/gears`
 on Motor OS and `~/.gears` on Linux. Phase 2.1 moves `gears.toml` into that
 directory; phase 3's tool registry reads it there. The directory also holds
-`tools.toml`, `permissions.toml`, the tool directories under `tools/`, the
+`tools.toml`, the tool directories under `tools/`, the
 sessions and the batteries' data. Gears reads `gears.toml` only from there
 (or from `--config PATH`); `api_key_file` and `ca_cert` in it may be
 relative to the directory as well. `enabled` is the
@@ -459,7 +394,7 @@ notices and leave the previous state unchanged.
 `sh` has one required string parameter, `command`, and an optional `timeout`
 in seconds bounded by its 120-second manifest limit. Its manifest selects `bash -c`
 on Linux and `/system/bin/rush -c` on Motor OS, uses `{command}` as the exact
-permission detail, gives the child a closed stdin, and defaults to the
+call detail, gives the child a closed stdin, and defaults to the
 120-second timeout. Its working directory and exported variables persist
 between calls on both systems. Once the registry is implemented, `sh` has no
 special execution path in Rust.
@@ -532,8 +467,8 @@ and bounded output, and has a 3600-second timeout.
 
 The Linux `rg` and `cargo` reference manifests expect system installations
 under `/usr/bin`. When using a different installation, such as Cargo from
-rustup, change the copied manifest to that executable's absolute path. The
-selected path is part of its approval identity.
+rustup, change the copied manifest to that executable's absolute path.
+The selected path is what the UI shows for its calls.
 
 The common commands follow the `ls` pattern, each a manifest naming the
 program's path per platform, a one-line description, typed parameters mapped
@@ -541,9 +476,9 @@ to a fixed argument vector, and a timeout. The read-only ones, `rg`, `head`,
 `tail`, `diff`, `find`, `wc` and `cat`, set `read_only = true`. The ones that
 change or publish things, `gix`, `lorry`, `cargo` and `sed`, leave it false.
 `curl` fetches one HTTP or HTTPS URL without following redirects.
-Running a command as its own tool gives it its own approval identity, so
-allowing `lorry` for a session does not allow arbitrary shell commands, and
-lets a policy hook allow the read-only ones without asking. Where the two
+Running a command as its own tool keeps it separate from the shell, so a
+call to `lorry` is not an arbitrary shell command, and lets a hook treat
+the read-only ones differently. Where the two
 systems' programs take different arguments, sysbox's `ls`, `find`, `head`,
 `tail`, `diff`, `wc` and `cat` against their GNU counterparts, the manifest
 gives a description and argument mapping per system. Sysbox-backed Motor OS tools call
@@ -555,7 +490,7 @@ listed as not available and never offered to the model.
 Pipeline filters are not shipped as tools: `sort`, `uniq`, `cut` and `tr`
 (the batteries plan's sysbox track) do their work between pipes, which
 only `sh` has, and `xargs` runs other programs, so it belongs behind the
-shell's approval rather than an identity of its own.
+shell rather than a tool of its own.
 
 ## Adding a tool
 

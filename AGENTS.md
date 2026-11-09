@@ -28,6 +28,14 @@ if not there, ask the user where to find them.
 
 Use `curl` to inspect crates.io and github.com.
 
+## Additional notes
+
+* Use /none/tmp/ as a scratch/temporary directory.
+* Motor OS does not have '/dev/' or '/dev/null'. Use `> /none/tmp/foo` instead
+  of `> /dev/null`
+* There's no `cmp` (yet), use `diff`
+* There's no `git`, so instead of `git diff` use `diff` or `gix diff`
+
 ## How to work on Gears
 
 Prefer secure, correct, simple Rust using std and native Motor OS APIs.

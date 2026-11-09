@@ -9,7 +9,7 @@ use gears::config::{Config, HookConfig};
 use gears::provider::{
     Completion, EventSink, FinishReason, Provider, ProviderError, Request, ToolCall,
 };
-use gears::runtime::{Approval, Approver, Event, Permission, Runtime};
+use gears::runtime::{Event, Responder, Runtime};
 use gears::session::Store;
 use serde_json::json;
 
@@ -46,10 +46,7 @@ struct Answers {
     asked: usize,
 }
 
-impl Approver for Answers {
-    fn approve(&mut self, _: &Permission) -> Approval {
-        panic!("the memory tool must use its own question, not a permission prompt");
-    }
+impl Responder for Answers {
     fn attended(&self) -> bool {
         self.choice.is_some()
     }

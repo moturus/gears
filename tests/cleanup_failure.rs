@@ -11,7 +11,7 @@ use gears::mock::{MockServer, sse_response};
 use gears::net::{EgressPolicy, host_curl::HostCurl};
 use gears::process::{Cancellation, sh};
 use gears::provider::{Endpoint, OpenAiCompat};
-use gears::runtime::{Approval, Event, Options, Permission, Runtime};
+use gears::runtime::{Event, Options, Runtime};
 use gears::session::Store;
 
 struct Escaped(PathBuf);
@@ -77,7 +77,7 @@ fn unconfirmed_cleanup_blocks_another_turn_and_session_mutation() {
     let mut started = false;
     let original = runtime.turn(
         "work".into(),
-        &mut |_: &Permission| Approval::Once,
+        &mut gears::runtime::Unattended,
         &mut |event| {
             if let Event::ToolOutput { text, .. } = event
                 && text.contains("escaped-ready")
@@ -106,7 +106,7 @@ fn unconfirmed_cleanup_blocks_another_turn_and_session_mutation() {
     let entries = runtime.session().entries().len();
     let next = runtime.turn(
         "next".into(),
-        &mut |_: &Permission| Approval::Once,
+        &mut gears::runtime::Unattended,
         &mut |_| Ok(()),
     );
     assert!(next.unwrap_err().contains("further work is blocked"));

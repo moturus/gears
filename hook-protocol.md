@@ -26,25 +26,25 @@ setup leaves the active session and its registrations usable.
 `turn_end` carries `status` (`completed`, `cancelled`, or `error`), an optional
 `error`, the number of `tool_rounds`, and `last_entry_id` before end-of-turn
 hooks run. A round counts a provider reply requesting tools, including calls
-that were denied or never started; several calls in one reply count once.
+that never started; several calls in one reply count once.
 
-Runtime `permission` events also carry `tool.read_only`, taken from the
-enabled directory manifest; hook tools and unknown tools default to false.
-For a shell-state tool, `tool.shell_state_directory` names the saved state
-without creating it. Its `cwd` file, when present and usable, is the shell's
-starting directory; otherwise the shell starts in the selected workspace.
 Tool-role `entry` events are sent after the result is saved. They include
 its entry `id`, `tool_call`, `tool.read_only`, runtime `outcome`, and
-`tool_result`. This covers denied, unknown and otherwise unstarted calls,
-including interrupted turns. Entry-notification result text is limited to
-64 KiB at a UTF-8 boundary, with `tool_result_truncated`; the saved result
-and model context retain their normal limits.
+`tool_result`. `tool.read_only` is taken from the enabled directory manifest;
+hook tools and unknown tools default to false. For a shell-state tool,
+`tool.shell_state_directory` names the saved state without creating it. Its
+`cwd` file, when present and usable, is the shell's starting directory;
+otherwise the shell starts in the selected workspace. This covers unknown and
+otherwise unstarted calls, including interrupted turns. Entry-notification
+result text is limited to 64 KiB at a UTF-8 boundary, with
+`tool_result_truncated`; the saved result and model context retain their
+normal limits.
 
 Every event has this envelope:
 
     {
       "protocol_version": 1,
-      "event": "permission",
+      "event": "tool_execute",
       "hook": "policy",
       "workspace": "/work/project",
       "session": {
@@ -76,7 +76,7 @@ A skipped or unattended question has a null answer; unattended runs never read
 input. Questions are queued in hook order, with at most 16 pending. Answers
 may ask another question; a turn, hook command, or standalone interaction
 handles at most 16 questions, then reports and discards further questions.
-Question answers do not replace Gears' tool permission decisions.
+Question answers never substitute for a hook result.
 The line UI accepts a choice number or value, or Enter to skip. The TUI uses
 number keys and Enter/Esc to skip; Page Up and Page Down keep the complete
 question and labels readable. Ctrl-C cancels the current operation.
@@ -88,7 +88,6 @@ Event-specific result fields are:
 | initialize | prompt_fragments, tools, commands |
 | input | input |
 | context | messages |
-| permission | decision: allow, deny, ask, or confirm; permission_detail |
 | tool_execute | tool_result |
 | tool_result | tool_result |
 | before_compact | compaction |
@@ -97,11 +96,6 @@ Event-specific result fields are:
 
 A tool result is {"content":"text","is_error":false}. Registered tools use
 {"name":"tool_name","description":"...","parameters":{...JSON Schema...}}.
-Permission hooks may add `permission_detail` to the existing approval
-description. Gears labels each addition with its hook name and shows the
-same detail in the permission event and prompt. The combined additions
-are limited to 16 KiB; empty text, NULs or an oversized addition deny the
-call. The decision rules and saved-denial precedence are unchanged.
 Registered commands use `{"name":"tasks","help":"Show the task list"}`.
 Names are 1–64 ASCII letters, digits, underscores or hyphens, without `/`;
 help is a nonempty line of at most 256 bytes. Built-in names and duplicate
@@ -126,11 +120,7 @@ invalid for its current event. Incompatible protocol changes require a new
 protocol_version.
 
 Hooks run sequentially in configuration order. Later transformations see
-earlier ones. Permission aggregation is deny over confirm over allow over ask.
-A saved denial refuses the call before permission hooks run. `confirm` requires
-a fresh attended answer even when an allowance was saved; unattended calls are
-refused. Otherwise hooks may allow the call, followed by saved attended
-allowances and the user prompt. A permission hook that fails, times out, or
-returns invalid output denies the call.
+earlier ones. A hook that fails, times out, or returns invalid output stops
+the operation it was asked to perform, and the model is told so.
 Observational-hook failures are reported and ignored; failures in transforming
 hooks stop the operation rather than silently changing its meaning.

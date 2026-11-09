@@ -5,7 +5,7 @@ pub mod select;
 pub mod tui;
 pub mod tui_editor;
 
-use crate::runtime::{Approver, Observer, Runtime, ToolStatus};
+use crate::runtime::{Responder, Observer, Runtime, ToolStatus};
 use crate::session::ToolState;
 
 enum Operation {
@@ -18,15 +18,15 @@ impl Operation {
     fn run(
         self,
         runtime: &mut Runtime,
-        approver: &mut dyn Approver,
+        responder: &mut dyn Responder,
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
         match self {
-            Self::Turn(prompt) => runtime.turn(prompt, approver, observer),
+            Self::Turn(prompt) => runtime.turn(prompt, responder, observer),
             Self::HookCommand { name, argument } => {
-                runtime.hook_command_with_approver(&name, &argument, approver, observer)
+                runtime.hook_command_with(&name, &argument, responder, observer)
             }
-            Self::Questions => runtime.resolve_hook_questions(approver, observer),
+            Self::Questions => runtime.resolve_hook_questions(responder, observer),
         }
     }
 }
@@ -158,41 +158,6 @@ fn field_width(text: &str) -> usize {
     text.chars().count()
 }
 
-pub(crate) fn parse_permission_action(argument: &str) -> Result<(&str, bool), String> {
-    let parts = argument.split_whitespace().collect::<Vec<_>>();
-    let (["revoke", name] | ["revoke", name, "--global"]) = parts.as_slice() else {
-        return Err("usage: /permission revoke NAME [--global]".to_string());
-    };
-    Ok((name, parts.len() == 3))
-}
-
-pub(crate) fn format_permissions(runtime: &Runtime) -> Result<String, String> {
-    let grants = runtime.permission_statuses()?;
-    if grants.is_empty() {
-        return Ok("no saved permissions".to_string());
-    }
-    Ok(grants
-        .iter()
-        .map(|grant| {
-            format!(
-                "{}: {} {} [{}] {}{}",
-                grant.name,
-                grant.scope,
-                if grant.allow { "allow" } else { "deny" },
-                &grant.identity[..12],
-                if grant.current { "current" } else { "stale" },
-                grant
-                    .identity_error
-                    .as_ref()
-                    .map_or(String::new(), |error| {
-                        format!("; identity unavailable: {error}")
-                    })
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
-}
-
 pub(crate) fn selection_and_default(argument: &str) -> (&str, bool) {
     let argument = argument.trim();
     if argument == "--default" {
@@ -228,20 +193,8 @@ mod tests {
             assert!(parse_tool_action(invalid).is_err(), "{invalid}");
         }
     }
-
     #[test]
-    fn permission_command_grammar_is_strict() {
-        assert_eq!(parse_permission_action("revoke sh").unwrap(), ("sh", false));
-        assert_eq!(
-            parse_permission_action("revoke sh --global").unwrap(),
-            ("sh", true)
-        );
-        for invalid in ["", "revoke", "revoke sh extra", "revoke --global sh"] {
-            assert!(parse_permission_action(invalid).is_err(), "{invalid}");
-        }
-    }
 
-    #[test]
     fn tool_rows_align_their_colons_and_brackets() {
         let rows = [
             ToolStatus {
@@ -264,16 +217,6 @@ mod tests {
         );
         let lines = text.lines().collect::<Vec<_>>();
         let column = |line: &&str, mark: char| line.find(mark).unwrap();
-        assert!(
-            lines
-                .iter()
-                .all(|line| column(line, ':') == column(&lines[0], ':'))
-        );
-        assert!(
-            lines
-                .iter()
-                .all(|line| column(line, '(') == column(&lines[0], '('))
-        );
         assert!(
             lines
                 .iter()

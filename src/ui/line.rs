@@ -5,7 +5,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::runtime::{Approval, Approver, Event, Observer, Permission, Runtime};
+use crate::runtime::{Event, Observer, Responder, Runtime};
 
 const POLL: Duration = Duration::from_millis(25);
 
@@ -132,16 +132,6 @@ fn command(
             let (name, state, global) = super::parse_tool_action(argument)?;
             runtime.set_tool_state(name, state, global)?;
             eprintln!("{}", super::format_tools(runtime)?);
-            Ok(Command::Continue)
-        }
-        "permissions" => {
-            eprintln!("{}", super::format_permissions(runtime)?);
-            Ok(Command::Continue)
-        }
-        "permission" => {
-            let (name, global) = super::parse_permission_action(argument)?;
-            runtime.revoke_permission(name, global)?;
-            eprintln!("{}", super::format_permissions(runtime)?);
             Ok(Command::Continue)
         }
         "session" => {
@@ -499,7 +489,7 @@ impl Observer for Renderer {
                 let outcome = if is_error { "error" } else { "done" };
                 eprintln!("tool {name} {outcome}> {}", fold(&content));
             }
-            Event::Permission(_) => {}
+
             Event::Notice(notice) => {
                 self.finish_stream();
                 eprintln!("gears: {notice}");
@@ -516,7 +506,7 @@ impl Observer for Renderer {
 
 enum TurnMessage {
     Event(Event),
-    Permission(Permission, mpsc::Sender<Approval>),
+
     Question(crate::hooks::Question, mpsc::Sender<Option<String>>),
     Done(Result<(), String>),
 }
@@ -533,12 +523,12 @@ impl Observer for ChannelObserver {
     }
 }
 
-struct ChannelApprover {
+struct ChannelResponder {
     sender: mpsc::Sender<TurnMessage>,
     interactive: bool,
 }
 
-impl Approver for ChannelApprover {
+impl Responder for ChannelResponder {
     fn attended(&self) -> bool {
         self.interactive
     }
@@ -552,22 +542,6 @@ impl Approver for ChannelApprover {
             .send(TurnMessage::Question(question.clone(), sender))
             .map_err(|_| "line UI closed".to_string())?;
         receiver.recv().map_err(|_| "line UI closed".to_string())
-    }
-
-    fn approve(&mut self, request: &Permission) -> Approval {
-        if !self.interactive {
-            eprintln!("gears: denied unattended tool call: {}", request.detail);
-            return Approval::Deny;
-        }
-        let (sender, receiver) = mpsc::channel();
-        if self
-            .sender
-            .send(TurnMessage::Permission(request.clone(), sender))
-            .is_err()
-        {
-            return Approval::Deny;
-        }
-        receiver.recv().unwrap_or(Approval::Deny)
     }
 }
 
@@ -602,11 +576,11 @@ fn run_operation(
             let mut observer = ChannelObserver {
                 sender: worker_sender.clone(),
             };
-            let mut approver = ChannelApprover {
+            let mut responder = ChannelResponder {
                 sender: worker_sender,
                 interactive,
             };
-            let result = operation.run(runtime, &mut approver, &mut observer);
+            let result = operation.run(runtime, &mut responder, &mut observer);
             let _ = sender.send(TurnMessage::Done(result));
         });
         loop {
@@ -628,19 +602,6 @@ fn run_operation(
                         };
                         let _ = reply.send(answer);
                     }
-                    Ok(TurnMessage::Permission(request, reply)) => {
-                        renderer.finish_stream();
-                        eprintln!(
-                            "Allow {} in {}?\n  {}",
-                            request.tool,
-                            request.workspace.display(),
-                            request.detail
-                        );
-                        let answer = input.read_line(
-                            "[y allow once / s session / g global / n deny once / S session / G global] ",
-                        )?;
-                        let _ = reply.send(parse_approval(answer.as_deref()));
-                    }
                     Ok(TurnMessage::Done(result)) => return result,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -653,18 +614,6 @@ fn run_operation(
             }
         }
     })
-}
-
-/// Anything but one explicit choice denies once, including end of input.
-fn parse_approval(answer: Option<&str>) -> Approval {
-    match answer.map(str::trim) {
-        Some("y") => Approval::Once,
-        Some("s") => Approval::Session,
-        Some("g") => Approval::Global,
-        Some("S") => Approval::DenySession,
-        Some("G") => Approval::DenyGlobal,
-        _ => Approval::Deny,
-    }
 }
 
 struct Input {
@@ -984,17 +933,5 @@ mod tests {
                 .is_none()
         );
         assert_eq!(echo, b"one\ntwo\n");
-    }
-
-    #[test]
-    fn all_six_approval_answers_are_distinct() {
-        assert_eq!(parse_approval(Some(" y ")), Approval::Once);
-        assert_eq!(parse_approval(Some("s")), Approval::Session);
-        assert_eq!(parse_approval(Some("g")), Approval::Global);
-        assert_eq!(parse_approval(Some("S")), Approval::DenySession);
-        assert_eq!(parse_approval(Some("G")), Approval::DenyGlobal);
-        for answer in [None, Some(""), Some("n"), Some("a"), Some("ya")] {
-            assert_eq!(parse_approval(answer), Approval::Deny);
-        }
     }
 }

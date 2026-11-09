@@ -40,7 +40,7 @@ fn run() -> Result<(), String> {
         "batteries workflow workspace: {}",
         fixture.workspace.display()
     );
-    let mut approvals = scenario::Approvals::default();
+    let mut answers = scenario::Answers::default();
     let mut memory_notices = 0;
     let mut observer = |event| {
         if let Event::Notice(text) = event {
@@ -56,7 +56,7 @@ fn run() -> Result<(), String> {
         }
         Ok(())
     };
-    runtime.turn(fixture.label.clone(), &mut approvals, &mut observer)?;
+    runtime.turn(fixture.label.clone(), &mut answers, &mut observer)?;
     let state = runtime
         .session()
         .hook_state(&fixture.hook)
@@ -74,22 +74,17 @@ fn run() -> Result<(), String> {
         std::fs::read_to_string(fixture.workspace.join("notes/a file*")).unwrap(),
         "literal fixture\n"
     );
-    assert!(
-        approvals
-            .0
-            .iter()
-            .find(|permission| permission.tool == "check")
-            .unwrap()
-            .detail
-            .contains(&compiler)
-    );
+    let argv = state["last_check"]["receipt"]["argv"]
+        .as_array()
+        .ok_or("missing check argv")?;
+    assert!(argv.iter().any(|item| item.as_str() == Some(&compiler)));
     let context = gears::batteries::paths::ToolContext::new(
         fixture.workspace.clone(),
         fixture.state.clone(),
         runtime.session().id().into(),
         runtime.session().path(),
     )?;
-    runtime.turn("update task list".into(), &mut approvals, &mut observer)?;
+    runtime.turn("update task list".into(), &mut answers, &mut observer)?;
     assert_eq!(memory_notices, 2);
     let selected = runtime
         .session()
@@ -130,7 +125,7 @@ fn run() -> Result<(), String> {
     };
     runtime.turn(
         "exercise missing check reminders".into(),
-        &mut approvals,
+        &mut answers,
         &mut reminder_observer,
     )?;
     assert_eq!(notices, 3);
@@ -141,7 +136,7 @@ fn run() -> Result<(), String> {
     // Every scripted reply was used; an extra request would already have failed.
     assert_eq!(provider.remaining(), 0);
     let requests = provider.requests.lock().unwrap();
-    // The scripted approver declined the proposed entry: logged, never written.
+    // The scripted responder declined the proposed entry: logged, never written.
     let history = gears::batteries::memory_history::history(&context, 0, 10)?;
     assert_eq!(history["total"], 1);
     assert_eq!(history["records"][0]["decision"], "no");
@@ -165,9 +160,8 @@ fn run() -> Result<(), String> {
         })
         .count();
     assert_eq!(reminders, 3);
-    // The hook allows reading, searching, todo and memory; the two writes, check and
-    // the second patch were asked.
-    assert_eq!(approvals.0.len(), 4);
+    // Every tool ran straight away; only the memory proposal needed the user.
+    assert_eq!(answers.asked, 1);
     let asked = requests.len();
     drop(requests);
     // The user's own words go to memory at once, without a question or a request.
@@ -189,7 +183,7 @@ fn run() -> Result<(), String> {
             .contains("Run the fixture check offline.")
     );
     assert_eq!(provider.requests.lock().unwrap().len(), asked);
-    assert_eq!(approvals.0.len(), 4);
+    assert_eq!(answers.asked, 1);
     drop(runtime);
     memory::run(&binary, &fixture.root)?;
     fixture.cleanup(&group, &sessions, &snapshots)?;

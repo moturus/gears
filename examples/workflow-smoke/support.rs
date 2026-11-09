@@ -21,7 +21,6 @@ impl Fixture {
         // Runtime hook failures use these distinct prefixes instead.
         for prefix in [
             format!("hook {} ", self.hook),
-            format!("permission hook {} ", self.hook),
             format!("before_stop hook {} ", self.hook),
         ] {
             if text.starts_with(&prefix) {
@@ -101,7 +100,6 @@ impl Fixture {
                 events: Some(
                     [
                         "initialize",
-                        "permission",
                         "tool_execute",
                         "tool_result",
                         "turn_start",

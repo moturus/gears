@@ -6,7 +6,6 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::config::HookConfig;
 use crate::process::{Cancellation, Request as ProcessRequest, run};
@@ -22,7 +21,6 @@ pub const EVENTS: &[&str] = &[
     "turn_start",
     "input",
     "context",
-    "permission",
     "tool_execute",
     "tool_result",
     "before_stop",
@@ -63,8 +61,6 @@ struct Response {
     commands: Vec<CommandSpec>,
     input: Option<String>,
     messages: Option<Vec<Message>>,
-    decision: Option<Decision>,
-    permission_detail: Option<String>,
     tool_result: Option<ToolResult>,
     compaction: Option<CompactionAdvice>,
     state: Option<Value>,
@@ -73,20 +69,6 @@ struct Response {
     message: Option<String>,
     question: Option<Question>,
     hint: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Decision {
-    Allow,
-    Deny,
-    Ask,
-    Confirm,
-}
-
-pub struct PermissionReview {
-    pub decision: Decision,
-    pub details: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -412,67 +394,6 @@ impl Manager {
         Ok(messages)
     }
 
-    pub fn permission_review(
-        &self,
-        call: &ToolCall,
-        metadata: Value,
-        session: &mut Session,
-        cancellation: &Cancellation,
-        notice: &mut dyn FnMut(String),
-    ) -> PermissionReview {
-        let mut result = Decision::Ask;
-        let mut details = Vec::new();
-        for index in 0..self.hooks.len() {
-            let response = self.invoke(
-                index,
-                "permission",
-                serde_json::json!({"tool_call": call, "tool": metadata}),
-                session,
-                cancellation,
-                notice,
-            );
-            let decision = match response {
-                Ok(response) => {
-                    if let Some(detail) = response.permission_detail {
-                        let total = details.iter().map(String::len).sum::<usize>()
-                            + detail.len()
-                            + self.hooks[index].config.name.len()
-                            + 2;
-                        if detail.trim().is_empty() || total > 16 * 1024 || detail.contains('\0') {
-                            notice(format!(
-                                "permission hook {} returned invalid permission_detail; denying call",
-                                self.hooks[index].config.name
-                            ));
-                            result = Decision::Deny;
-                            continue;
-                        }
-                        details.push(format!("{}: {detail}", self.hooks[index].config.name));
-                    }
-                    response.decision.unwrap_or(Decision::Ask)
-                }
-                Err(error) => {
-                    notice(format!(
-                        "permission hook {} failed; denying call: {error}",
-                        self.hooks[index].config.name
-                    ));
-                    Decision::Deny
-                }
-            };
-            result = match (result, decision) {
-                (_, Decision::Deny) => Decision::Deny,
-                (Decision::Deny, _) => Decision::Deny,
-                (_, Decision::Confirm) => Decision::Confirm,
-                (Decision::Confirm, _) => Decision::Confirm,
-                (_, Decision::Allow) => Decision::Allow,
-                (current, Decision::Ask) => current,
-            };
-        }
-        PermissionReview {
-            decision: result,
-            details,
-        }
-    }
-
     pub fn owns_tool(&self, name: &str) -> bool {
         self.tool_owner.contains_key(name)
     }
@@ -480,25 +401,6 @@ impl Manager {
     pub fn tool_owner(&self, name: &str) -> Option<&str> {
         let index = *self.tool_owner.get(name)?;
         Some(&self.hooks[index].config.name)
-    }
-
-    pub fn approval_identity(&self, name: &str) -> Option<String> {
-        let index = *self.tool_owner.get(name)?;
-        let spec = self.tools.iter().find(|tool| tool.name == name)?;
-        let config = &self.hooks[index].config;
-        let identity = serde_json::json!({
-            "name": name,
-            "kind": "hook",
-            "owner": config.name,
-            "command": config.command,
-            "events": config.events,
-            "timeout_ms": config.timeout.as_millis(),
-            "max_output_bytes": config.max_output_bytes,
-            "spec": spec,
-        });
-        let bytes = serde_json::to_vec(&identity).ok()?;
-        let digest = Sha256::digest(bytes);
-        Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     pub fn execute_tool(
@@ -862,10 +764,6 @@ fn validate_result_fields(event: &str, value: &Value) -> Result<(), String> {
         "context" => {
             allowed.insert("messages");
         }
-        "permission" => {
-            allowed.insert("decision");
-            allowed.insert("permission_detail");
-        }
         "tool_execute" | "tool_result" => {
             allowed.insert("tool_result");
         }
@@ -926,18 +824,12 @@ mod tests {
     fn event_fields_are_event_specific() {
         assert!(
             validate_result_fields(
-                "permission",
-                &serde_json::json!({"decision": "allow", "state": {"n": 1}})
+                "tool_execute",
+                &serde_json::json!({"tool_result": {"content": "ok"}})
             )
             .is_ok()
         );
-        assert!(
-            validate_result_fields(
-                "permission",
-                &serde_json::json!({"input": "not allowed here"})
-            )
-            .is_err()
-        );
+        assert!(validate_result_fields("tool_execute", &serde_json::json!({"input": "no"})).is_err());
     }
 
     #[test]
@@ -1245,113 +1137,16 @@ printf '%s' '{"tools":[{"name":"same","description":"test","parameters":{"type":
 
     #[cfg(unix)]
     #[test]
-    fn permission_denial_wins_over_allow() {
-        let (_root, workspace, mut session) = fixture("permission-order");
-        let permission_hook = |name, decision| {
-            hook(
-                name,
-                &format!(
-                    r#"event=$(cat)
-case "$event" in
-  *'"event":"permission"'*) printf '%s' '{{"decision":"{decision}"}}' ;;
-  *) printf '%s' '{{}}' ;;
-esac"#
-                ),
-                std::time::Duration::from_secs(2),
-            )
-        };
-        let cancellation = Cancellation::new();
-        let manager = Manager::initialize(
-            vec![
-                permission_hook("allow", "allow"),
-                permission_hook("deny", "deny"),
-            ],
-            workspace,
-            &[],
-            Value::Object(Default::default()),
-            &mut session,
-            &cancellation,
-            &mut |_| {},
-        )
-        .unwrap();
-        assert_eq!(
-            manager
-                .permission_review(
-                    &ToolCall::new("c1", "sh", r#"{"command":"true"}"#),
-                    Value::Null,
-                    &mut session,
-                    &cancellation,
-                    &mut |_| {},
-                )
-                .decision,
-            Decision::Deny
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn malformed_timeout_and_cancellation_deny_permission() {
-        for (name, permission, cancellation) in [
-            ("malformed", "printf '%s' not-json", Cancellation::new()),
-            ("timeout", "sleep 1; printf '%s' '{}'", Cancellation::new()),
-            ("cancel", "sleep 1; printf '%s' '{}'", {
-                let cancellation = Cancellation::new();
-                cancellation.cancel();
-                cancellation
-            }),
-        ] {
-            let (_root, workspace, mut session) = fixture(name);
-            let script = format!(
-                r#"event=$(cat)
-case "$event" in
-  *'"event":"permission"'*) {permission} ;;
-  *) printf '%s' '{{}}' ;;
-esac"#
-            );
-            let mut manager = Manager::initialize(
-                vec![hook(name, &script, std::time::Duration::from_secs(2))],
-                workspace,
-                &[],
-                Value::Object(Default::default()),
-                &mut session,
-                &Cancellation::new(),
-                &mut |_| {},
-            )
-            .unwrap();
-            if name == "timeout" {
-                // The short deadline tests permission, not setup process scheduling.
-                manager.hooks[0].config.timeout = std::time::Duration::from_millis(20);
-            }
-            let mut notices = Vec::new();
-            assert_eq!(
-                manager
-                    .permission_review(
-                        &ToolCall::new("c1", "sh", r#"{"command":"true"}"#),
-                        Value::Null,
-                        &mut session,
-                        &cancellation,
-                        &mut |notice| notices.push(notice),
-                    )
-                    .decision,
-                Decision::Deny,
-                "{name}"
-            );
-            assert!(notices.iter().any(|notice| notice.contains("denying")));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn only_subscribed_events_start_the_hook() {
         let (_root, workspace, mut session) = fixture("event-filter");
         let log = workspace.join("events");
         let script = format!(
-            "cat >> '{}'; printf '\\n' >> '{}'; printf '{{\"decision\":\"allow\"}}'",
+            "cat >> '{}'; printf '\\n' >> '{}'; printf '{{\"input\":\"changed\"}}'",
             log.display(),
             log.display()
         );
         let mut config = hook("policy", &script, std::time::Duration::from_secs(2));
-        config.events = Some(vec!["permission".into()]);
+        config.events = Some(vec!["input".into()]);
         let manager = Manager::initialize(
             vec![config],
             workspace.clone(),
@@ -1363,7 +1158,7 @@ esac"#
         )
         .unwrap();
         assert!(!log.exists());
-        manager
+        let input = manager
             .transform_input(
                 "unchanged".into(),
                 &mut session,
@@ -1371,22 +1166,10 @@ esac"#
                 &mut |_| {},
             )
             .unwrap();
-        assert!(!log.exists());
-        assert_eq!(
-            manager
-                .permission_review(
-                    &ToolCall::new("c1", "sh", "{}"),
-                    Value::Null,
-                    &mut session,
-                    &Cancellation::new(),
-                    &mut |_| {}
-                )
-                .decision,
-            Decision::Allow
-        );
+        assert_eq!(input, "changed");
         let events = std::fs::read_to_string(&log).unwrap();
         assert_eq!(events.lines().count(), 1);
-        assert!(events.contains("\"event\":\"permission\""));
+        assert!(events.contains("\"event\":\"input\""));
         let mut config = hook("disabled", "exit 1", std::time::Duration::from_secs(2));
         config.events = Some(Vec::new());
         let manager = Manager::initialize(
@@ -1401,15 +1184,14 @@ esac"#
         .unwrap();
         assert_eq!(
             manager
-                .permission_review(
-                    &ToolCall::new("c2", "sh", "{}"),
-                    Value::Null,
+                .transform_input(
+                    "unchanged".into(),
                     &mut session,
                     &Cancellation::new(),
                     &mut |_| {}
                 )
-                .decision,
-            Decision::Ask
+                .unwrap(),
+            "unchanged"
         );
     }
 

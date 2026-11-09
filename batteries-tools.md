@@ -2,8 +2,8 @@
 
 These external tools run `gears-batteries tool NAME`, read one JSON object
 on stdin, and return the model-facing result on stdout. An unsuccessful
-operation writes a diagnostic to stderr and exits nonzero. Gears owns
-approval, execution, timeouts and cancellation.
+operation writes a diagnostic to stderr and exits nonzero. Gears owns execution,
+timeouts and cancellation.
 
 | Tool | Parameters | Result |
 | --- | --- | --- |
@@ -13,11 +13,10 @@ approval, execution, timeouts and cancellation.
 | `search_files` | required `pattern`; optional `path`, default `.` | Bounded `grep -r -n -H -E -e PATTERN -- PATH` output on Linux (path, line number, and matching line); `rg --json --no-config -e PATTERN -- PATH` output on Motor OS. No-match exit 1 is a normal result. |
 
 Relative file paths start at the selected workspace root. Absolute paths
-and `..` can name other user-accessible files, subject to the normal Gears
-approval policy. Automatic reading approval covers the workspace only.
-Symbolic links are refused. File tools cannot access the Gears directory;
-reading the current session's saved tool results is the sole exception.
-Those results cannot be rewritten through these tools.
+and `..` can name other user-accessible files. Symbolic links are refused.
+File tools cannot access the Gears directory; reading the current session's
+saved tool results is the sole exception. Those results cannot be rewritten
+through these tools.
 Searches whose root contains the Gears directory are refused; select a
 narrower directory to keep private Gears state out of recursive searches.
 

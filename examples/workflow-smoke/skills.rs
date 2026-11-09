@@ -10,7 +10,7 @@ use gears::runtime::{Event, Runtime};
 use gears::session::Store;
 use serde_json::json;
 
-use super::scenario::{Approvals, Scripted, answer, call};
+use super::scenario::{Answers, Scripted, answer, call};
 use super::support::Fixture;
 
 pub fn run(binary: &Path, compiler: &str) -> Result<(), String> {
@@ -45,7 +45,7 @@ pub fn run(binary: &Path, compiler: &str) -> Result<(), String> {
         "fixture/model".into(),
     )?;
     let sessions = vec![runtime.session().id().to_string()];
-    let mut approvals = Approvals::default();
+    let mut answers = Answers::default();
     let mut observer = |event| {
         if let Event::Notice(text) = event {
             fixture.observe_notice(&text)?;
@@ -54,14 +54,14 @@ pub fn run(binary: &Path, compiler: &str) -> Result<(), String> {
     };
     runtime.turn(
         "list and load the skill".into(),
-        &mut approvals,
+        &mut answers,
         &mut observer,
     )?;
     let state = runtime.session().hook_state(&fixture.hook).unwrap();
     let snapshots = vec![state["prompt_snapshot"].as_str().unwrap().to_string()];
     assert_eq!(state["skills_loaded"], json!([name]));
     // Listing and loading never ask the user.
-    assert!(approvals.0.is_empty());
+    assert_eq!(answers.asked, 0);
     let requests = provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
     assert!(requests.iter().all(|request| {

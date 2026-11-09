@@ -109,10 +109,6 @@ impl<W: Write> Observer for Renderer<W> {
                 "type": "tool_result", "call_id": call_id, "name": name,
                 "content": content, "is_error": is_error, "outcome": outcome,
             }),
-            Event::Permission(permission) => json!({
-                "type": "permission", "tool": permission.tool,
-                "detail": permission.detail, "workspace": permission.workspace,
-            }),
             Event::Notice(text) => json!({"type": "notice", "text": text}),
             Event::Hint(hint) => json!({"type": "hint", "text": hint}),
             Event::Usage { request, total } => {

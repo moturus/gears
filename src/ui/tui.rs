@@ -15,7 +15,7 @@ use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
 
-use crate::runtime::{Approval, Approver, Event, Observer, Permission, Runtime, SessionSummary};
+use crate::runtime::{Event, Observer, Responder, Runtime, SessionSummary};
 use crate::ui::history::Kind;
 use crate::ui::tui_editor::{Edit, Editor};
 
@@ -163,7 +163,6 @@ struct App {
     hint: Option<String>,
     model: String,
     session: SessionSummary,
-    approval: Option<Permission>,
     input_enabled: bool,
     quit: bool,
     last_frame: Option<Frame>,
@@ -172,8 +171,6 @@ struct App {
 #[derive(Debug, PartialEq, Eq)]
 struct Layout {
     transcript_rows: usize,
-    approval_start: usize,
-    approval_rows: usize,
     editor_start: usize,
     editor_rows: usize,
     status_row: usize,
@@ -216,21 +213,13 @@ impl Frame {
     }
 }
 
-fn screen_layout(height: usize, editor_rows: usize, approval: bool) -> Layout {
+fn screen_layout(height: usize, editor_rows: usize) -> Layout {
     let status_row = height.saturating_sub(1);
     let available = status_row;
-    let approval_rows = if approval {
-        4.min(available.saturating_sub(1))
-    } else {
-        0
-    };
-    let editor_rows = editor_rows.min(available.saturating_sub(approval_rows));
+    let editor_rows = editor_rows.min(available.saturating_sub(1));
     let editor_start = status_row.saturating_sub(editor_rows);
-    let approval_start = editor_start.saturating_sub(approval_rows);
     Layout {
-        transcript_rows: approval_start,
-        approval_start,
-        approval_rows,
+        transcript_rows: editor_start,
         editor_start,
         editor_rows,
         status_row,
@@ -248,7 +237,6 @@ impl App {
             hint: runtime.hint().map(str::to_string),
             model: runtime.model().to_string(),
             session: runtime.summary(),
-            approval: None,
             input_enabled: true,
             quit: false,
             last_frame: None,
@@ -307,7 +295,6 @@ impl App {
                     false,
                 );
             }
-            Event::Permission(_) => self.status = "checking permission".to_string(),
             Event::Notice(text) => self.push(Kind::Notice, text, false),
             Event::Hint(hint) => self.hint = hint,
             Event::Usage { total, .. } => self.status = total.summary(),
@@ -491,22 +478,6 @@ impl App {
         self.last_frame = None;
     }
 
-    fn begin_approval(&mut self, permission: Permission) {
-        self.push(
-            Kind::Notice,
-            format!(
-                "Permission for {} in {}:\n{}",
-                permission.tool,
-                permission.workspace.display(),
-                permission.detail
-            ),
-            false,
-        );
-        self.scroll = 0;
-        self.approval = Some(permission);
-        self.status = "waiting for permission".to_string();
-    }
-
     fn frame(&self, width: u16, height: u16) -> Frame {
         let width = usize::from(width).max(1);
         let height = usize::from(height);
@@ -518,7 +489,7 @@ impl App {
         let draft_lines = wrap(self.editor.text(), editor_width);
         let (cursor_row, cursor_column) =
             editor_cursor(self.editor.text(), self.editor.cursor(), editor_width);
-        let layout = screen_layout(height, draft_lines.len(), self.approval.is_some());
+        let layout = screen_layout(height, draft_lines.len());
         let lines = self.transcript_lines(width);
         let max_scroll = lines.len().saturating_sub(layout.transcript_rows);
         let end = lines.len().saturating_sub(self.scroll.min(max_scroll));
@@ -526,24 +497,6 @@ impl App {
         let transcript_start = layout.transcript_rows.saturating_sub(end - start);
         for (index, (kind, line)) in lines[start..end].iter().enumerate() {
             frame.lines[transcript_start + index].push(color(*kind), line, width);
-        }
-        if let Some(permission) = &self.approval {
-            let approval = [
-                clipped(
-                    &single_line(&format!(
-                        "Allow {} in {}?",
-                        permission.tool,
-                        permission.workspace.display()
-                    )),
-                    width,
-                ),
-                clipped("Full detail above; PgUp/PgDn scroll", width),
-                clipped("allow: [y] once  [s] session  [g] global", width),
-                clipped("deny:  [n] once  [S] session  [G] global", width),
-            ];
-            for (index, line) in approval.iter().take(layout.approval_rows).enumerate() {
-                frame.lines[layout.approval_start + index].push(Color::Yellow, line, width);
-            }
         }
         let editor_first = cursor_row
             .saturating_add(1)
@@ -726,7 +679,6 @@ fn paint_line<W: Write>(
 
 enum TurnMessage {
     Event(Event),
-    Permission(Permission, mpsc::Sender<Approval>),
     Question(crate::hooks::Question, mpsc::Sender<Option<String>>),
     Done(Result<(), String>),
 }
@@ -757,11 +709,11 @@ fn run_operation(
             let mut observer = ChannelObserver {
                 sender: worker_sender.clone(),
             };
-            let mut approver = ChannelApprover {
+            let mut responder = ChannelResponder {
                 sender: worker_sender,
                 interactive,
             };
-            let result = operation.run(runtime, &mut approver, &mut observer);
+            let result = operation.run(runtime, &mut responder, &mut observer);
             let _ = sender.send(TurnMessage::Done(result));
         });
         loop {
@@ -775,21 +727,6 @@ fn run_operation(
                         }
                         TurnMessage::Question(question, reply) => {
                             let answer = question_input(&cancellation, app, &question)?;
-                            let _ = reply.send(answer);
-                        }
-                        TurnMessage::Permission(permission, reply) => {
-                            app.begin_approval(permission);
-                            app.render()?;
-                            let answer = permission_input(&cancellation, app)?;
-                            app.approval = None;
-                            app.scroll = 0;
-                            app.status = if cancellation.cancelled() {
-                                "cancelling"
-                            } else {
-                                "working"
-                            }
-                            .to_string();
-                            app.render()?;
                             let _ = reply.send(answer);
                         }
                         TurnMessage::Done(result) => {
@@ -867,9 +804,6 @@ fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> R
                         app.render()?;
                         return result;
                     }
-                    Ok(TurnMessage::Permission(_, reply)) => {
-                        let _ = reply.send(Approval::Deny);
-                    }
                     Ok(TurnMessage::Question(_, reply)) => {
                         let _ = reply.send(None);
                     }
@@ -900,32 +834,6 @@ fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> R
             }
         }
     })
-}
-
-fn permission_input(
-    cancellation: &crate::process::Cancellation,
-    app: &mut App,
-) -> Result<Approval, String> {
-    loop {
-        match event::read().map_err(|error| error.to_string())? {
-            InputEvent::Resize(_, _) => app.render()?,
-            InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    cancellation.cancel();
-                    return Ok(Approval::Deny);
-                }
-                if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
-                    app.key(key);
-                    app.render()?;
-                    continue;
-                }
-                if let Some(approval) = approval_key(key) {
-                    return Ok(approval);
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 fn question_input(
@@ -982,20 +890,6 @@ fn question_key(key: KeyEvent, count: usize) -> Option<usize> {
     (index < count).then_some(index)
 }
 
-/// Maps one key press at the permission prompt; None keeps waiting.
-fn approval_key(key: KeyEvent) -> Option<Approval> {
-    let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
-    match key.code {
-        KeyCode::Char('y') if plain => Some(Approval::Once),
-        KeyCode::Char('s') if plain => Some(Approval::Session),
-        KeyCode::Char('g') if plain => Some(Approval::Global),
-        KeyCode::Char('S') if plain => Some(Approval::DenySession),
-        KeyCode::Char('G') if plain => Some(Approval::DenyGlobal),
-        KeyCode::Char('n') | KeyCode::Esc | KeyCode::Enter => Some(Approval::Deny),
-        _ => None,
-    }
-}
-
 struct ChannelObserver {
     sender: mpsc::Sender<TurnMessage>,
 }
@@ -1008,12 +902,12 @@ impl Observer for ChannelObserver {
     }
 }
 
-struct ChannelApprover {
+struct ChannelResponder {
     sender: mpsc::Sender<TurnMessage>,
     interactive: bool,
 }
 
-impl Approver for ChannelApprover {
+impl Responder for ChannelResponder {
     fn attended(&self) -> bool {
         self.interactive
     }
@@ -1029,21 +923,6 @@ impl Approver for ChannelApprover {
         receiver
             .recv()
             .map_err(|_| "terminal UI closed".to_string())
-    }
-
-    fn approve(&mut self, request: &Permission) -> Approval {
-        if !self.interactive {
-            return Approval::Deny;
-        }
-        let (sender, receiver) = mpsc::channel();
-        if self
-            .sender
-            .send(TurnMessage::Permission(request.clone(), sender))
-            .is_err()
-        {
-            return Approval::Deny;
-        }
-        receiver.recv().unwrap_or(Approval::Deny)
     }
 }
 
@@ -1075,12 +954,6 @@ fn handle_command(
             let (name, state, global) = super::parse_tool_action(argument)?;
             runtime.set_tool_state(name, state, global)?;
             app.push(Kind::Notice, super::format_tools(runtime)?, false);
-        }
-        "permissions" => app.push(Kind::Notice, super::format_permissions(runtime)?, false),
-        "permission" => {
-            let (name, global) = super::parse_permission_action(argument)?;
-            runtime.revoke_permission(name, global)?;
-            app.push(Kind::Notice, super::format_permissions(runtime)?, false);
         }
         "session" => {
             let session = runtime.summary();
@@ -1778,7 +1651,6 @@ mod tests {
                 entries: 0,
                 ephemeral: true,
             },
-            approval: None,
             input_enabled: true,
             quit: false,
             last_frame: None,
@@ -1842,67 +1714,6 @@ mod tests {
                 Some(Action::Submit(text)) if text == "one\ntwo"
             ));
         }
-    }
-
-    #[test]
-    fn permission_keys_map_to_six_answers() {
-        let key = |code, modifiers| KeyEvent::new(code, modifiers);
-        let none = KeyModifiers::NONE;
-        assert_eq!(
-            approval_key(key(KeyCode::Char('y'), none)),
-            Some(Approval::Once)
-        );
-        assert_eq!(
-            approval_key(key(KeyCode::Char('s'), none)),
-            Some(Approval::Session)
-        );
-        assert_eq!(
-            approval_key(key(KeyCode::Char('g'), none)),
-            Some(Approval::Global)
-        );
-        assert_eq!(
-            approval_key(key(KeyCode::Char('S'), none)),
-            Some(Approval::DenySession)
-        );
-        assert_eq!(
-            approval_key(key(KeyCode::Char('G'), none)),
-            Some(Approval::DenyGlobal)
-        );
-        for code in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Enter] {
-            assert_eq!(approval_key(key(code, none)), Some(Approval::Deny));
-        }
-        // Modified keys are never grants.
-        assert_eq!(
-            approval_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
-            None
-        );
-        assert_eq!(approval_key(key(KeyCode::Char('x'), none)), None);
-        assert_eq!(
-            approval_key(key(KeyCode::Char('s'), KeyModifiers::ALT)),
-            None
-        );
-    }
-
-    #[test]
-    fn one_shot_tui_does_not_ask_for_permission() {
-        let (sender, receiver) = mpsc::channel();
-        let mut approver = ChannelApprover {
-            sender,
-            interactive: false,
-        };
-        assert!(!approver.attended());
-        assert_eq!(
-            approver.approve(&Permission {
-                tool: "sh".into(),
-                detail: "unattended".into(),
-                workspace: "/work".into(),
-            }),
-            Approval::Deny
-        );
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
     }
 
     #[test]
@@ -1976,42 +1787,6 @@ mod tests {
     }
 
     #[test]
-    fn long_permission_details_can_be_read_before_answering() {
-        let mut app = app();
-        let detail = (0..30)
-            .map(|index| format!("command line {index}\n"))
-            .collect::<String>();
-        let workspace = format!("/work/{}", "long-path/".repeat(10));
-        app.begin_approval(Permission {
-            tool: "sh".into(),
-            detail: detail.clone(),
-            workspace: workspace.clone().into(),
-        });
-        let entry = app.transcript.back().unwrap();
-        assert!(entry.text.contains(&workspace));
-        assert!(entry.text.ends_with(&detail));
-        let rendered = |app: &App| {
-            app.frame(80, 24)
-                .lines
-                .iter()
-                .map(|line| line.0.iter().map(|cell| cell.character).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let frame = rendered(&app);
-        assert!(frame.contains("command line 29"), "{frame}");
-        assert!(frame.contains("[s] session  [g] global"));
-        assert!(frame.contains("[S] session  [G] global"));
-        app.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        assert_eq!(app.scroll, 10);
-        let scrolled = rendered(&app);
-        assert!(scrolled.contains("command line 10"), "{scrolled}");
-        app.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.scroll, 0);
-        assert_eq!(rendered(&app), frame);
-    }
-
-    #[test]
     fn hidden_text_shows_dots_and_long_text_keeps_its_end_in_view() {
         let text = |frame: Frame| {
             frame
@@ -2070,24 +1845,20 @@ mod tests {
     #[test]
     fn transcript_editor_and_status_are_anchored_from_the_bottom() {
         assert_eq!(
-            screen_layout(24, 1, false),
+            screen_layout(24, 1),
             Layout {
                 transcript_rows: 22,
-                approval_start: 22,
-                approval_rows: 0,
                 editor_start: 22,
                 editor_rows: 1,
                 status_row: 23,
             }
         );
         assert_eq!(
-            screen_layout(24, 1, true),
+            screen_layout(24, 10),
             Layout {
-                transcript_rows: 18,
-                approval_start: 18,
-                approval_rows: 4,
-                editor_start: 22,
-                editor_rows: 1,
+                transcript_rows: 13,
+                editor_start: 13,
+                editor_rows: 10,
                 status_row: 23,
             }
         );
@@ -2128,12 +1899,6 @@ mod tests {
         assert!(status(&app).starts_with("gears | thinking |"));
         app.apply(Event::Text("answer".to_string()));
         assert!(status(&app).starts_with("gears | responding |"));
-        app.apply(Event::Permission(Permission {
-            tool: "sh".to_string(),
-            detail: "true".to_string(),
-            workspace: "/tmp".into(),
-        }));
-        assert!(status(&app).starts_with("gears | checking permission |"));
         app.apply(Event::TurnEnd {
             status: "completed",
             tool_rounds: 0,

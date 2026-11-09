@@ -28,6 +28,8 @@ const ENTRY_KINDS: [&str; 12] = [
     "compaction",
     "hook_state",
     "tool_state",
+    // No longer written; accepted so that sessions from before permissions
+    // were removed still load.
     "permission_grant",
     "runtime_identity",
     "label",
@@ -92,20 +94,6 @@ pub enum ToolState {
 pub struct ToolStateEntry {
     pub name: String,
     pub state: ToolState,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct PermissionGrant {
-    pub name: String,
-    pub identity: String,
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub owner: String,
-    #[serde(default)]
-    pub created_ms: u64,
-    /// None revokes an earlier answer for this identity.
-    pub allow: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -327,7 +315,7 @@ impl Store {
             workspace: self.workspace.clone(),
             parent_session: parent.map(Path::to_path_buf),
         };
-        // Grants belong to the source session, not to its conversation path.
+        // Legacy permission grants from older sessions are dropped.
         let mut retained = Vec::with_capacity(records.len());
         for record in records
             .iter()
@@ -585,7 +573,7 @@ impl Session {
     }
 
     /// Allocate shell state only when the session first runs `sh`.
-    /// The saved shell directory, without creating it during permission checks.
+    /// The saved shell directory, without creating it while deciding a call.
     pub fn shell_state_path(&self) -> Option<PathBuf> {
         self.ephemeral_shell_state.clone().or_else(|| {
             self.path
@@ -757,33 +745,6 @@ impl Session {
         )
     }
 
-    pub fn append_permission_grant(&mut self, grant: &PermissionGrant) -> Result<String, String> {
-        self.append("permission_grant", grant)
-    }
-
-    /// Grants are session-wide, even when the selected conversation branch moves.
-    pub fn permission_grants(&self) -> Result<BTreeMap<String, PermissionGrant>, String> {
-        let mut grants = BTreeMap::new();
-        for entry in self
-            .entries
-            .iter()
-            .filter(|entry| entry.kind == "permission_grant")
-        {
-            let grant: PermissionGrant = serde_json::from_value(entry.data.clone())
-                .map_err(|error| format!("entry {}: bad permission grant: {error}", entry.id))?;
-            if grant.name.is_empty() || !crate::permissions::valid_identity(&grant.identity) {
-                return Err(format!("entry {}: invalid permission grant", entry.id));
-            }
-            if grant.allow.is_some() {
-                grants.insert(grant.identity.clone(), grant);
-            } else {
-                grants.remove(&grant.identity);
-            }
-        }
-        Ok(grants)
-    }
-
-    /// Only the selected conversation branch contributes enablement overrides.
     pub fn tool_states(&self) -> Result<BTreeMap<String, ToolState>, String> {
         let mut states = BTreeMap::new();
         for entry in self.active_entries()? {
@@ -1473,25 +1434,16 @@ mod tests {
     }
 
     #[test]
-    fn a_live_snapshot_can_be_forked_ephemerally_without_saved_grants() {
+    fn a_live_snapshot_can_be_forked_ephemerally() {
         let (base, _, store) = fixture("live-ephemeral-fork");
         let mut writer = store.create(false, Some("parent")).unwrap();
         writer.append_message(&Message::user("work")).unwrap();
-        writer
-            .append_permission_grant(&PermissionGrant {
-                name: "sh".into(),
-                identity: "a".repeat(64),
-                allow: Some(true),
-                ..PermissionGrant::default()
-            })
-            .unwrap();
         let snapshot = store.read(writer.id()).unwrap();
         let mut fork = store.clone_active_with_options(&snapshot, true).unwrap();
         assert!(fork.is_ephemeral());
         assert!(fork.path().is_none());
         assert_eq!(fork.header.parent_session.as_deref(), writer.path());
         assert_eq!(fork.name().as_deref(), Some("parent"));
-        assert!(fork.permission_grants().unwrap().is_empty());
         fork.append_message(&Message::assistant("child")).unwrap();
         assert_eq!(writer.context_messages().unwrap(), [Message::user("work")]);
         assert_eq!(store.list().unwrap().len(), 1);
@@ -1611,88 +1563,6 @@ mod tests {
         assert_eq!(resumed.tool_states().unwrap()["ls"], ToolState::Enabled);
         assert!(!resumed.tool_states().unwrap().contains_key("sh"));
         drop(resumed);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn permission_grants_ignore_branches_but_not_session_boundaries() {
-        let (base, _, store) = fixture("permission-grants");
-        let mut session = store.create(false, None).unwrap();
-        let user = session.append_message(&Message::user("first")).unwrap();
-        let grant = PermissionGrant {
-            name: "sh".into(),
-            identity: "a".repeat(64),
-            allow: Some(false),
-            ..PermissionGrant::default()
-        };
-        session.append_permission_grant(&grant).unwrap();
-        session
-            .append_message(&Message::assistant("answer"))
-            .unwrap();
-        let cloned = store.clone_active(&session).unwrap();
-        assert!(cloned.permission_grants().unwrap().is_empty());
-        assert_eq!(cloned.context_messages().unwrap().len(), 2);
-        drop(cloned);
-        session.select(&user).unwrap();
-        assert_eq!(session.permission_grants().unwrap()[&grant.identity], grant);
-        let (forked, _) = store.fork_at_user(&session, &user).unwrap();
-        assert!(forked.permission_grants().unwrap().is_empty());
-        drop(forked);
-        let path = session.path().unwrap().to_path_buf();
-        drop(session);
-        let mut resumed = store.open_path(&path).unwrap();
-        assert_eq!(resumed.permission_grants().unwrap()[&grant.identity], grant);
-        resumed
-            .append_permission_grant(&PermissionGrant {
-                allow: None,
-                ..grant
-            })
-            .unwrap();
-        assert!(resumed.permission_grants().unwrap().is_empty());
-        drop(resumed);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn malformed_permission_identities_are_reported() {
-        let (base, _, store) = fixture("bad-permission-identity");
-        for identity in ["short".to_string(), "é".repeat(32), "z".repeat(64)] {
-            let mut session = store.create(true, None).unwrap();
-            session
-                .append_permission_grant(&PermissionGrant {
-                    name: "sh".into(),
-                    identity,
-                    allow: Some(true),
-                    ..PermissionGrant::default()
-                })
-                .unwrap();
-            assert!(session.permission_grants().is_err());
-        }
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn failed_grant_write_does_not_change_the_session_answer() {
-        let (base, _, store) = fixture("grant-write-failure");
-        let mut session = store.create(false, None).unwrap();
-        let grant = PermissionGrant {
-            name: "sh".into(),
-            identity: "a".repeat(64),
-            allow: Some(false),
-            ..PermissionGrant::default()
-        };
-        session.append_permission_grant(&grant).unwrap();
-        session.writer = Some(std::fs::File::open(session.path().unwrap()).unwrap());
-        assert!(
-            session
-                .append_permission_grant(&PermissionGrant {
-                    allow: Some(true),
-                    ..grant.clone()
-                })
-                .is_err()
-        );
-        assert_eq!(session.permission_grants().unwrap()[&grant.identity], grant);
-        drop(session);
         std::fs::remove_dir_all(base).unwrap();
     }
 

@@ -9,7 +9,6 @@ pub mod directory;
 pub mod hooks;
 pub mod mock;
 pub mod net;
-pub mod permissions;
 pub mod platform;
 pub mod process;
 pub mod prompt;

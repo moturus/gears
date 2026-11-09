@@ -903,12 +903,12 @@ command = ["two"]
             ))
             .is_ok()
         );
-        let config = Config::parse("version = 1\n[[hooks]]\nname = 'policy'\ncommand = ['/hook']\nevents = ['permission', 'tool_result']").unwrap();
+        let config = Config::parse("version = 1\n[[hooks]]\nname = 'policy'\ncommand = ['/hook']\nevents = ['tool_execute', 'tool_result']").unwrap();
         assert_eq!(
             config.hooks[0].events.as_deref().unwrap(),
-            ["permission", "tool_result"]
+            ["tool_execute", "tool_result"]
         );
-        for events in ["['typo']", "['permission', 'permission']"] {
+        for events in ["['typo']", "['tool_execute', 'tool_execute']"] {
             assert!(Config::parse(&format!("version = 1\n[[hooks]]\nname = 'policy'\ncommand = ['/hook']\nevents = {events}")).is_err());
         }
         let empty = Config::parse(

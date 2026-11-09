@@ -61,21 +61,10 @@ fn check(gears: &Path, sh_directory: &Path, root: &Path) -> Result<(), String> {
         let server = MockServer::start(scripts).map_err(|error| error.to_string())?;
         let key = workspace.join("key");
         std::fs::write(&key, "fixture-owned-key").map_err(|error| error.to_string())?;
-        #[cfg(unix)]
-        let shell = "/bin/sh";
-        #[cfg(not(unix))]
-        let shell = "/system/bin/rush";
-        // Read the hook event without echoing it to the JSON response.
-        let policy_file = workspace.join("policy.sh");
-        std::fs::write(
-            &policy_file,
-            "event=$(cat); printf '{\"decision\":\"allow\"}'",
-        )
-        .map_err(|error| error.to_string())?;
         let config = workspace.join("gears.toml");
         std::fs::write(&config, format!(
-            "version = 1\n[provider]\nbase_url = {:?}\nmodel = 'test/model'\napi_key_file = {:?}\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[[tools]]\ndirectory = {:?}\nenabled = true\n[[hooks]]\nname = 'policy'\nevents = ['permission']\ncommand = [{:?}, {:?}]\n",
-            server.url("/v1"), key, tools, shell, policy_file,
+            "version = 1\n[provider]\nbase_url = {:?}\nmodel = 'test/model'\napi_key_file = {:?}\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[[tools]]\ndirectory = {:?}\nenabled = true\n",
+            server.url("/v1"), key, tools,
         )).map_err(|error| error.to_string())?;
         let cancellation = Cancellation::new();
         let mut streamed = String::new();

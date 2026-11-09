@@ -80,7 +80,6 @@ mod tests {
             "gears/tools/sh/tool.toml",
             "gears/openrouter.key",
             "gears/provider.toml",
-            "gears/permissions.toml",
             "gears/tools.toml",
             "gears/batteries.toml",
             "gears/batteries/MEMORY.md",
@@ -90,7 +89,7 @@ mod tests {
         ] {
             std::fs::write(root.join(file), "x").unwrap();
         }
-        assert_eq!(reset(&directory, &workspace).unwrap(), 8);
+        assert_eq!(reset(&directory, &workspace).unwrap(), 7);
         let mut left = std::fs::read_dir(&directory)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())

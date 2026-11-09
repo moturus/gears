@@ -215,7 +215,7 @@ impl EgressPolicy {
     }
 
     /// Let this host through for the rest of the run. Only `fetch` calls it,
-    /// and only once the permission gate has said yes: egress stays enforced
+    /// and only once the caller allows plaintext: egress stays enforced
     /// in [`EgressPolicy::check`] and nowhere else, so what the user agreed to
     /// has to be recorded here rather than worked around at the call site.
     pub fn grant(&self, host: &str) {
@@ -529,7 +529,7 @@ mod tests {
         assert!(policy.check(&url("http://127.0.0.1:8099/x")).is_err());
     }
 
-    /// What the permission gate said yes to, and what it did not.
+    /// A plaintext grant covers loopback and nothing else.
     #[test]
     fn a_granted_host_passes_without_becoming_policy() {
         let policy = EgressPolicy::new(&["openrouter.ai".to_string()]);

@@ -34,22 +34,19 @@ configured one, and its host is allowed for egress.
 The optional `tools/sh` directory receives one string command and runs it in
 the selected workspace through `bash -c` on Linux or `/system/bin/rush -c` on
 Motor OS. It is not a
-sandbox: an approved command has the same filesystem authority as Gears and
+sandbox: a command has the same filesystem authority as Gears and
 may leave the workspace. Stdout, stderr, status, timeout, cancellation, and
 truncation remain distinct. The working directory and exports it saves live
 beside a saved session, or in `sessions/ephemeral/` in the Gears directory
 for an ephemeral one; Gears removes the ephemeral state at exit, and what a
 killed Gears left there at its next start.
 
-Gears checks saved permission grants before hooks. A saved denial or hook
-denial blocks the call. A hook may allow it or require fresh confirmation.
-Otherwise a saved allowance runs only in an attended UI, which asks when no
-answer is saved. The choices are `y/s/g` to allow once, for this session, or
-globally, and `n/S/G` to deny at those scopes. Session grants survive resume;
-new, forked, and cloned sessions do not inherit them. In `-p` runs, saved
-allowances are ignored and calls without hook authority are denied. Gears does
-not infer safe shell commands. The provider credential is removed from the
-environment inherited by tool and hook processes.
+A call to an enabled directory tool runs at once. A name no tool provides, or
+one whose directory is disabled, is reported to the model instead of running.
+A hook that owns the tool through `tool_execute` runs it and may also ask the
+user a question; an unattended run (`-p`, JSONL) receives no answers. Gears
+does not infer safe shell commands. The provider credential is removed from
+the environment inherited by tool and hook processes.
 
 ## Configuration
 
@@ -119,20 +116,20 @@ select `--provider local --model MODEL`. Only loopback HTTP is enabled.
 If the server uses another host, add it to both `net.egress_allowlist` and
 `net.plain_http_allowlist` when using HTTP.
 The local provider has no key file and is sent no key.
-The sample registers project instructions and `todo`, enables the six
-batteries tools plus shell, Gix, Lorry and curl, and applies the batteries
-approval policy. Declare a literal check vector in the workspace's
+The sample registers project instructions, `todo`, `memory` and `skill_view`,
+enables the six batteries tools plus shell, Gix, Lorry and curl, and runs the
+batteries hook. Declare a literal check vector in the workspace's
 `.gears/batteries.toml`, for example `check = ["lorry", "test"]` on Motor OS
 or `check = ["cargo", "test", "--offline"]` on Linux.
-See the [batteries guide](batteries.md) for check evidence,
-file-read requirements and policy limits.
+See the [batteries guide](batteries.md) for check evidence, file-read
+requirements and memory questions.
 
 Hooks are listed in execution order:
 
     [[hooks]]
-    name = "project_policy"
+    name = "project_rules"
     command = ["/absolute/path/to/hook", "--json"]
-    events = ["permission", "tool_result"]
+    events = ["turn_start", "tool_result"]
     timeout_seconds = 30
     max_output_bytes = 1048576
 
@@ -213,7 +210,7 @@ For machine-readable one-shot output, use `-p PROMPT --output jsonl`.
 Version 1 starts with a `session` record containing `session_id`, `path`
 (null for an ephemeral session), and `session_format_version`. Streaming
 records have types `text`, `reasoning`, `tool_start`, `tool_output`,
-`tool_result`, `permission`, `notice`, `usage`, and `turn_end`. Tool results
+`tool_result`, `notice`, `usage`, and `turn_end`. Tool results
 include the call id, error flag, and three-state outcome. Every record is
 one flushed JSON line; embedded newlines are escaped.
 
@@ -222,16 +219,16 @@ The last `final` record contains `success`, `answer`, `error`, and numeric
 earlier history too. Unknown cost is null; `cost_is_partial` identifies a
 partly priced total. A failed turn produces a final error and a nonzero
 exit status. Errors before a session is ready use stderr. JSONL runs are
-unattended and follow the same permission rules as other `-p` runs.
+unattended: hooks receive no answers to their questions.
 
 Useful startup options are --continue, --resume ID, --session ID,
 --fork ID, --ephemeral, and --name NAME. Interactive commands include /new,
 /resume, /name, /session, /tree, /label, /fork, /clone, /compact, /tools,
-/tool, /permissions, and /permission. Use
+and /tool. Use
 /label ENTRY [TEXT] to set or clear an entry label. Fork selects an earlier
 user prompt; clone copies the current active branch into a new file.
 Use `/tool enable|disable|reset NAME [--global]` to change a directory tool's
-effective state and `/permission revoke NAME [--global]` to remove grants.
+effective state.
 
 `gears reset` (or `/reset` in a running Gears) asks once, then removes
 everything the user and Gears added: key files, saved settings and model
@@ -342,7 +339,7 @@ the network; automated tests never contact a real Internet provider.
 Unix process-group escape, executable-script permission/replacement, and
 Linux-only Cargo-manifest cases remain Unix-only. The former SSH pseudo-terminal
 setup-to-TUI case is omitted; existing native line-UI setup and session cases
-remain. The former guest curl and approval checks are covered by the existing
+remain. The former guest curl checks are covered by the existing
 local provider, CLI, and runtime suites. TLS fixtures are in `tests/tls`.
 Search tests and batteries use regular `grep` on Linux and the installed `rg`
 on Motor OS.

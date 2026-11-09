@@ -6,8 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::config::{Config, ContextConfig};
-use crate::hooks::{Decision, Manager as Hooks, ToolResult};
-use crate::permissions::{Grant, Grants};
+use crate::hooks::{Manager as Hooks, ToolResult};
 use crate::process::{Cancellation, Stream};
 use crate::prompt::Effective;
 use crate::provider::{
@@ -15,7 +14,7 @@ use crate::provider::{
     ToolOutcome, ToolSpec, Usage, UsageMeter,
 };
 use crate::session::{
-    Compaction, PermissionGrant, Session, SessionInfo, Store, ToolState, TreeItem,
+    Compaction, Session, SessionInfo, Store, ToolState, TreeItem,
 };
 use crate::tool_state::Overrides;
 use crate::tools::{ExecutionContext, Registry};
@@ -43,7 +42,6 @@ pub enum Event {
         is_error: bool,
         outcome: ToolOutcome,
     },
-    Permission(Permission),
     Notice(String),
     Hint(Option<String>),
     Usage {
@@ -57,13 +55,6 @@ pub enum Event {
         tool_rounds: usize,
         last_entry_id: Option<String>,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct Permission {
-    pub tool: String,
-    pub detail: String,
-    pub workspace: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -83,16 +74,6 @@ pub struct ToolStatus {
     pub source: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionStatus {
-    pub name: String,
-    pub identity: String,
-    pub allow: bool,
-    pub scope: &'static str,
-    pub current: bool,
-    pub identity_error: Option<String>,
-}
-
 pub trait Observer {
     fn event(&mut self, event: Event) -> Result<(), String>;
 }
@@ -106,20 +87,8 @@ where
     }
 }
 
-/// The user's answer to one permission prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Approval {
-    Deny,
-    Once,
-    Session,
-    Global,
-    DenySession,
-    DenyGlobal,
-}
-
-pub trait Approver {
-    fn approve(&mut self, request: &Permission) -> Approval;
-
+/// How an interface answers hook questions; unattended runs answer none.
+pub trait Responder {
     fn answer(&mut self, _question: &crate::hooks::Question) -> Result<Option<String>, String> {
         Ok(None)
     }
@@ -129,24 +98,12 @@ pub trait Approver {
     }
 }
 
-impl<F> Approver for F
-where
-    F: FnMut(&Permission) -> Approval,
-{
-    fn approve(&mut self, request: &Permission) -> Approval {
-        self(request)
-    }
-}
-
 pub type ProviderFactory = Arc<dyn Fn(&str) -> Result<Arc<dyn Provider>, String> + Send + Sync>;
 
-/// Answers every question with a denial, for runs nobody is watching.
+/// Answers every question with a skip, for runs nobody is watching.
 pub struct Unattended;
 
-impl Approver for Unattended {
-    fn approve(&mut self, _: &Permission) -> Approval {
-        Approval::Deny
-    }
+impl Responder for Unattended {
     fn attended(&self) -> bool {
         false
     }
@@ -328,101 +285,6 @@ impl Runtime {
             .collect())
     }
 
-    pub fn permission_statuses(&self) -> Result<Vec<PermissionStatus>, String> {
-        let current = self.current_permission_identities()?;
-        let mut statuses = Vec::new();
-        for (identity, grant) in self.session.permission_grants()? {
-            statuses.push(PermissionStatus {
-                current: current
-                    .get(&grant.name)
-                    .and_then(|result| result.as_ref().ok())
-                    == Some(&identity),
-                identity_error: current
-                    .get(&grant.name)
-                    .and_then(|result| result.as_ref().err())
-                    .cloned(),
-                name: grant.name,
-                identity,
-                allow: grant
-                    .allow
-                    .expect("effective session grants have an answer"),
-                scope: "session",
-            });
-        }
-        for (identity, grant) in Grants::load(&self.tool_state_directory)?.by_identity {
-            statuses.push(PermissionStatus {
-                current: current
-                    .get(&grant.name)
-                    .and_then(|result| result.as_ref().ok())
-                    == Some(&identity),
-                identity_error: current
-                    .get(&grant.name)
-                    .and_then(|result| result.as_ref().err())
-                    .cloned(),
-                name: grant.name,
-                identity,
-                allow: grant.allow,
-                scope: "global",
-            });
-        }
-        statuses.sort_by(|left, right| {
-            (&left.name, left.scope, &left.identity).cmp(&(
-                &right.name,
-                right.scope,
-                &right.identity,
-            ))
-        });
-        Ok(statuses)
-    }
-
-    pub fn revoke_permission(&mut self, name: &str, global_scope: bool) -> Result<(), String> {
-        self.prepare_write()?;
-        if global_scope {
-            let mut grants = Grants::load(&self.tool_state_directory)?;
-            let before = grants.by_identity.len();
-            grants.by_identity.retain(|_, grant| grant.name != name);
-            if grants.by_identity.len() == before {
-                return Err(format!("no global grant for {name:?}"));
-            }
-            grants.save(&self.tool_state_directory)
-        } else {
-            let matching = self
-                .session
-                .permission_grants()?
-                .into_iter()
-                .filter(|(_, grant)| grant.name == name)
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
-                return Err(format!("no session grant for {name:?}"));
-            }
-            for (_, grant) in matching {
-                self.session.append_permission_grant(&PermissionGrant {
-                    allow: None,
-                    created_ms: crate::session::now_ms(),
-                    ..grant
-                })?;
-            }
-            Ok(())
-        }
-    }
-
-    fn current_permission_identities(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, Result<String, String>>, String> {
-        let mut identities = std::collections::BTreeMap::new();
-        for tool in self.tools.tools() {
-            identities.insert(tool.name.clone(), tool.approval_identity());
-        }
-        for tool in self.hooks.initialized().tools {
-            let identity = self
-                .hooks
-                .approval_identity(&tool.name)
-                .ok_or_else(|| format!("no approval identity for {:?}", tool.name))?;
-            identities.insert(tool.name, Ok(identity));
-        }
-        Ok(identities)
-    }
-
     pub fn set_tool_state(
         &mut self,
         name: &str,
@@ -464,58 +326,6 @@ impl Runtime {
         Ok(())
     }
 
-    fn save_approval(
-        &mut self,
-        name: &str,
-        identity: &str,
-        answer: Approval,
-    ) -> Result<(), String> {
-        let allow = match answer {
-            Approval::Session | Approval::Global => Some(true),
-            Approval::DenySession | Approval::DenyGlobal => Some(false),
-            Approval::Once | Approval::Deny => None,
-        };
-        let Some(allow) = allow else {
-            return Ok(());
-        };
-        let (kind, owner) = if let Some(tool) = self.tools.enabled(name) {
-            ("process", tool.directory.display().to_string())
-        } else {
-            (
-                "hook",
-                self.hooks
-                    .tool_owner(name)
-                    .ok_or_else(|| format!("unknown tool {name:?}"))?
-                    .to_string(),
-            )
-        };
-        let created_ms = crate::session::now_ms();
-        if matches!(answer, Approval::Global | Approval::DenyGlobal) {
-            let mut grants = Grants::load(&self.tool_state_directory)?;
-            grants.by_identity.insert(
-                identity.to_string(),
-                Grant {
-                    name: name.to_string(),
-                    kind: kind.to_string(),
-                    owner,
-                    created_ms,
-                    allow,
-                },
-            );
-            grants.save(&self.tool_state_directory)
-        } else {
-            self.session.append_permission_grant(&PermissionGrant {
-                name: name.to_string(),
-                identity: identity.to_string(),
-                kind: kind.to_string(),
-                owner,
-                created_ms,
-                allow: Some(allow),
-            })?;
-            Ok(())
-        }
-    }
-
     pub fn take_startup_notices(&mut self) -> Vec<String> {
         if let Some(hint) = self.hooks.take_hint() {
             self.hint = hint;
@@ -545,20 +355,20 @@ impl Runtime {
         argument: &str,
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
-        self.hook_command_with_approver(name, argument, &mut Unattended, observer)
+        self.hook_command_with(name, argument, &mut Unattended, observer)
     }
 
-    pub fn hook_command_with_approver(
+    pub fn hook_command_with(
         &mut self,
         name: &str,
         argument: &str,
-        approver: &mut dyn Approver,
+        responder: &mut dyn Responder,
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
         self.prepare_write()?;
         self.cancellation.reset();
         self.questions_answered = 0;
-        self.handle_hook_questions(approver, observer)?;
+        self.handle_hook_questions(responder, observer)?;
         emit_notices(observer, self.take_startup_notices())?;
         let mut notices = Vec::new();
         let result = self.hooks.command(
@@ -571,7 +381,7 @@ impl Runtime {
         emit_notices(observer, notices)?;
         self.emit_hook_hint(observer)?;
         result?;
-        self.handle_hook_questions(approver, observer)?;
+        self.handle_hook_questions(responder, observer)?;
         if self.cancellation.cancelled() {
             return Err("command cancelled".into());
         }
@@ -584,17 +394,17 @@ impl Runtime {
 
     pub fn resolve_hook_questions(
         &mut self,
-        approver: &mut dyn Approver,
+        responder: &mut dyn Responder,
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
         self.prepare_write()?;
         self.questions_answered = 0;
-        self.handle_hook_questions(approver, observer).map(|_| ())
+        self.handle_hook_questions(responder, observer).map(|_| ())
     }
 
     fn handle_hook_questions(
         &mut self,
-        approver: &mut dyn Approver,
+        responder: &mut dyn Responder,
         observer: &mut dyn Observer,
     ) -> Result<bool, String> {
         let mut handled = false;
@@ -608,9 +418,9 @@ impl Runtime {
                 break;
             }
             self.questions_answered += 1;
-            let attended = approver.attended();
+            let attended = responder.attended();
             let mut answer = if attended && !self.cancellation.cancelled() {
-                match approver.answer(&pending.question) {
+                match responder.answer(&pending.question) {
                     Ok(answer) => answer,
                     Err(error) => {
                         observer.event(Event::Notice(format!(
@@ -701,14 +511,14 @@ impl Runtime {
     pub fn turn(
         &mut self,
         input: String,
-        approver: &mut dyn Approver,
+        responder: &mut dyn Responder,
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
         self.prepare_write()?;
         emit_notices(observer, self.take_startup_notices())?;
         self.cancellation.reset();
         self.questions_answered = 0;
-        self.handle_hook_questions(approver, observer)?;
+        self.handle_hook_questions(responder, observer)?;
         let mut notices = Vec::new();
         let input = self.hooks.transform_input(
             input,
@@ -717,7 +527,7 @@ impl Runtime {
             &mut |notice| notices.push(notice),
         )?;
         emit_notices(observer, notices)?;
-        self.handle_hook_questions(approver, observer)?;
+        self.handle_hook_questions(responder, observer)?;
         if input.trim().is_empty() {
             return Err("prompt must not be empty".to_string());
         }
@@ -732,7 +542,7 @@ impl Runtime {
         let entries_before = self.session.entries().len();
         let mut tool_rounds = 0;
         let result = self
-            .run_turn(approver, observer, &mut tool_rounds)
+            .run_turn(responder, observer, &mut tool_rounds)
             .or_else(|error| {
                 let recorded = self.session.entries()[entries_before..]
                     .iter()
@@ -757,7 +567,7 @@ impl Runtime {
             .after_cancellation(status == "cancelled", |runtime| {
                 runtime.notify("turn_end", payload, observer)
             })
-            .and_then(|()| self.handle_hook_questions(approver, observer).map(|_| ()))
+            .and_then(|()| self.handle_hook_questions(responder, observer).map(|_| ()))
             .and_then(|()| {
                 observer.event(Event::TurnEnd {
                     status,
@@ -770,14 +580,14 @@ impl Runtime {
 
     fn run_turn(
         &mut self,
-        approver: &mut dyn Approver,
+        responder: &mut dyn Responder,
         observer: &mut dyn Observer,
         tool_rounds: &mut usize,
     ) -> Result<(), String> {
         let mut stop_reminders = 0;
         // An attended turn runs until the model stops or the user cancels it;
         // the round budget protects runs nobody is watching.
-        let budget = (!approver.attended()).then_some(self.max_tool_rounds);
+        let budget = (!responder.attended()).then_some(self.max_tool_rounds);
         loop {
             if budget.is_some_and(|budget| *tool_rounds >= budget) {
                 let error = format!("tool round limit ({}) reached", self.max_tool_rounds);
@@ -785,7 +595,7 @@ impl Runtime {
             }
             self.maybe_compact(false, None, observer)?;
             let messages = loop {
-                self.handle_hook_questions(approver, observer)?;
+                self.handle_hook_questions(responder, observer)?;
                 let messages = self.session.context_messages()?;
                 let mut notices = Vec::new();
                 let messages = self.hooks.transform_context(
@@ -795,7 +605,7 @@ impl Runtime {
                     &mut |notice| notices.push(notice),
                 )?;
                 emit_notices(observer, notices)?;
-                let changed = self.handle_hook_questions(approver, observer)?;
+                let changed = self.handle_hook_questions(responder, observer)?;
                 if !changed || self.questions_answered >= 16 {
                     break messages;
                 }
@@ -870,7 +680,7 @@ impl Runtime {
             *tool_rounds += 1;
             let calls = completion.tool_calls;
             for (index, call) in calls.iter().cloned().enumerate() {
-                if let Err(error) = self.execute_call(call, approver, observer) {
+                if let Err(error) = self.execute_call(call, responder, observer) {
                     self.record_unstarted_calls(
                         &calls[index + 1..],
                         "an earlier call ended the round",
@@ -1222,7 +1032,7 @@ impl Runtime {
     fn execute_call(
         &mut self,
         call: ToolCall,
-        approver: &mut dyn Approver,
+        responder: &mut dyn Responder,
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
         if self.tools.enabled(&call.name).is_none() && !self.hooks.owns_tool(&call.name) {
@@ -1244,100 +1054,10 @@ impl Runtime {
         } else {
             call_detail(&call)
         };
-        let identity = if let Some(tool) = self.tools.enabled(&call.name) {
-            tool.approval_identity()
-        } else {
-            self.hooks
-                .approval_identity(&call.name)
-                .ok_or_else(|| format!("no approval identity for {:?}", call.name))
-        };
-        let identity = match identity {
-            Ok(identity) => identity,
-            Err(error) => {
-                return self.record_unstarted_calls(std::slice::from_ref(&call), &error, observer);
-            }
-        };
-        let saved_answer = (|| {
-            let session = self.session.permission_grants()?;
-            let global = Grants::load(&self.tool_state_directory)?;
-            Ok::<_, String>(
-                session
-                    .get(&identity)
-                    .and_then(|grant| grant.allow)
-                    .or_else(|| global.by_identity.get(&identity).map(|grant| grant.allow)),
-            )
-        })();
-        let saved_answer = match saved_answer {
-            Ok(answer) => answer,
-            Err(error) => {
-                return self.record_unstarted_calls(std::slice::from_ref(&call), &error, observer);
-            }
-        };
-        let mut notices = Vec::new();
-        let review = if saved_answer == Some(false) {
-            crate::hooks::PermissionReview {
-                decision: Decision::Deny,
-                details: Vec::new(),
-            }
-        } else {
-            self.hooks.permission_review(
-                &call,
-                self.tool_metadata(&call.name),
-                &mut self.session,
-                &self.cancellation,
-                &mut |notice| notices.push(notice),
-            )
-        };
-        let mut detail = detail;
-        for additional in review.details {
-            detail.push('\n');
-            detail.push_str(&additional);
-        }
-        let permission = Permission {
-            tool: call.name.clone(),
-            detail: detail.clone(),
-            workspace: self.store.workspace().to_path_buf(),
-        };
-        if let Err(error) = observer.event(Event::Permission(permission.clone())) {
-            self.record_unstarted_calls(
-                std::slice::from_ref(&call),
-                "permission event failed",
-                observer,
-            )?;
-            return Err(error);
-        }
-        if let Err(error) = emit_notices(observer, notices) {
-            self.record_unstarted_calls(
-                std::slice::from_ref(&call),
-                "permission notice failed",
-                observer,
-            )?;
-            return Err(error);
-        }
-        if let Err(error) = self.handle_hook_questions(approver, observer) {
+        if let Err(error) = self.handle_hook_questions(responder, observer) {
             self.record_unstarted_calls(std::slice::from_ref(&call), &error, observer)?;
             return Err(error);
         }
-        let allowed = match review.decision {
-            Decision::Deny => false,
-            Decision::Allow => true,
-            Decision::Ask if saved_answer == Some(true) && approver.attended() => true,
-            Decision::Ask | Decision::Confirm if approver.attended() => {
-                let answer = approver.approve(&permission);
-                if let Err(error) = self.save_approval(&call.name, &identity, answer) {
-                    return self.record_unstarted_calls(
-                        std::slice::from_ref(&call),
-                        &error,
-                        observer,
-                    );
-                }
-                matches!(
-                    answer,
-                    Approval::Once | Approval::Session | Approval::Global
-                )
-            }
-            Decision::Ask | Decision::Confirm => false,
-        };
         if let Err(error) = observer.event(Event::ToolStart {
             call_id: call.id.clone(),
             name: call.name.clone(),
@@ -1355,15 +1075,7 @@ impl Runtime {
             return Err("turn cancelled".into());
         }
         let mut post_error = None;
-        let (result, outcome) = if !allowed {
-            (
-                ToolResult {
-                    content: "tool call denied".to_string(),
-                    is_error: true,
-                },
-                ToolOutcome::NotStarted,
-            )
-        } else if let Some(tool) = self.tools.enabled(&call.name) {
+        let (result, outcome) = if let Some(tool) = self.tools.enabled(&call.name) {
             let shell_state = tool
                 .process
                 .shell_state
@@ -1454,7 +1166,7 @@ impl Runtime {
             is_error: result.is_error,
             outcome,
         });
-        if let Err(error) = self.handle_hook_questions(approver, observer) {
+        if let Err(error) = self.handle_hook_questions(responder, observer) {
             post_error.get_or_insert(error);
         }
         match post_error
@@ -2036,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn sh_permission_displays_the_exact_command() {
+    fn sh_detail_displays_the_exact_command() {
         let call = ToolCall::new("one", "sh", r#"{"command":"printf '%s' hello"}"#);
         assert_eq!(call_detail(&call), "printf '%s' hello");
     }
