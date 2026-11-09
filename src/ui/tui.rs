@@ -15,7 +15,7 @@ use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
 
-use crate::runtime::{Event, Observer, Responder, Runtime, SessionSummary};
+use crate::runtime::{Event, Observer, Runtime, SessionSummary};
 use crate::ui::history::Kind;
 use crate::ui::tui_editor::{Edit, Editor};
 
@@ -39,12 +39,9 @@ pub fn run(
         for notice in runtime.take_startup_notices() {
             app.apply(Event::Notice(notice));
         }
-        if interactive && runtime.pending_hook_questions() {
-            run_operation(runtime, super::Operation::Questions, true, &mut app)?;
-        }
         if let Some(prompt) = initial {
             app.push(Kind::User, prompt.clone(), false);
-            run_turn(runtime, prompt, interactive, &mut app)?;
+            run_turn(runtime, prompt, &mut app)?;
             if !interactive {
                 app.render()?;
                 return Ok(());
@@ -61,9 +58,6 @@ pub fn run(
                 Action::Quit => app.quit = true,
                 Action::Submit(text) if text.starts_with('/') => {
                     let result = handle_command(runtime, &mut app, &text, config);
-                    if !app.quit && runtime.pending_hook_questions() {
-                        run_operation(runtime, super::Operation::Questions, true, &mut app)?;
-                    }
                     show_runtime_notices(runtime, &mut app);
                     if let Err(error) = result {
                         app.push(Kind::Error, error, false);
@@ -71,7 +65,7 @@ pub fn run(
                 }
                 Action::Submit(text) if !text.trim().is_empty() => {
                     app.push(Kind::User, text.clone(), false);
-                    if let Err(error) = run_turn(runtime, text, true, &mut app) {
+                    if let Err(error) = run_turn(runtime, text, &mut app) {
                         app.push(Kind::Error, error, false);
                     }
                 }
@@ -160,7 +154,6 @@ struct App {
     editor: Editor,
     scroll: usize,
     status: String,
-    hint: Option<String>,
     model: String,
     session: SessionSummary,
     input_enabled: bool,
@@ -227,6 +220,11 @@ fn screen_layout(height: usize, editor_rows: usize) -> Layout {
 }
 
 impl App {
+    fn begin_operation(&mut self) {
+        self.input_enabled = false;
+        self.status = "working".to_string();
+    }
+
     fn new(runtime: &Runtime, interactive: bool) -> Result<Self, String> {
         let mut app = Self {
             transcript: VecDeque::new(),
@@ -234,7 +232,6 @@ impl App {
             editor: Editor::new(),
             scroll: 0,
             status: "idle".to_string(),
-            hint: runtime.hint().map(str::to_string),
             model: runtime.model().to_string(),
             session: runtime.summary(),
             input_enabled: true,
@@ -296,7 +293,6 @@ impl App {
                 );
             }
             Event::Notice(text) => self.push(Kind::Notice, text, false),
-            Event::Hint(hint) => self.hint = hint,
             Event::Usage { total, .. } => self.status = total.summary(),
             Event::ModelChanged(model) => self.model = model,
             Event::SessionChanged(session) => self.session = session,
@@ -447,20 +443,6 @@ impl App {
     fn refresh(&mut self, runtime: &Runtime) {
         self.model = runtime.model().to_string();
         self.session = runtime.summary();
-        self.hint = runtime.hint().map(str::to_string);
-    }
-
-    fn begin_question(&mut self, question: &crate::hooks::Question) {
-        let mut text = question.text.clone();
-        for (index, choice) in question.choices.iter().enumerate() {
-            text.push_str(&format!("\n{}. {}", index + 1, choice.label));
-        }
-        self.push(Kind::Notice, text, false);
-        self.scroll = 0;
-        self.status = format!(
-            "answer 1–{} | Enter/Esc skip | Ctrl-C cancel",
-            question.choices.len()
-        );
     }
 
     fn render(&mut self) -> Result<(), String> {
@@ -523,11 +505,8 @@ impl App {
             target.push(Color::White, line, width);
         }
         let status = single_line(&format!(
-            "gears | {}{} | {} | {}{}",
+            "gears | {} | {} | {}{}",
             self.status,
-            self.hint
-                .as_ref()
-                .map_or(String::new(), |hint| format!(" | {hint}")),
             self.model,
             self.session.name.as_deref().unwrap_or(&self.session.id),
             if self.session.ephemeral {
@@ -679,27 +658,19 @@ fn paint_line<W: Write>(
 
 enum TurnMessage {
     Event(Event),
-    Question(crate::hooks::Question, mpsc::Sender<Option<String>>),
     Done(Result<(), String>),
 }
 
-fn run_turn(
-    runtime: &mut Runtime,
-    prompt: String,
-    interactive: bool,
-    app: &mut App,
-) -> Result<(), String> {
-    run_operation(runtime, super::Operation::Turn(prompt), interactive, app)
+fn run_turn(runtime: &mut Runtime, prompt: String, app: &mut App) -> Result<(), String> {
+    run_operation(runtime, super::Operation::Turn(prompt), app)
 }
 
 fn run_operation(
     runtime: &mut Runtime,
     operation: super::Operation,
-    interactive: bool,
     app: &mut App,
 ) -> Result<(), String> {
-    app.input_enabled = false;
-    app.status = "working".to_string();
+    app.begin_operation();
     app.render()?;
     let cancellation = runtime.cancellation();
     let (sender, receiver) = mpsc::channel();
@@ -709,11 +680,7 @@ fn run_operation(
             let mut observer = ChannelObserver {
                 sender: worker_sender.clone(),
             };
-            let mut responder = ChannelResponder {
-                sender: worker_sender,
-                interactive,
-            };
-            let result = operation.run(runtime, &mut responder, &mut observer);
+            let result = operation.run(runtime, &mut observer);
             let _ = sender.send(TurnMessage::Done(result));
         });
         loop {
@@ -724,10 +691,6 @@ fn run_operation(
                         TurnMessage::Event(event) => {
                             app.apply(event);
                             dirty = true;
-                        }
-                        TurnMessage::Question(question, reply) => {
-                            let answer = question_input(&cancellation, app, &question)?;
-                            let _ = reply.send(answer);
                         }
                         TurnMessage::Done(result) => {
                             app.input_enabled = true;
@@ -804,9 +767,6 @@ fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> R
                         app.render()?;
                         return result;
                     }
-                    Ok(TurnMessage::Question(_, reply)) => {
-                        let _ = reply.send(None);
-                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         app.input_enabled = true;
@@ -836,60 +796,6 @@ fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> R
     })
 }
 
-fn question_input(
-    cancellation: &crate::process::Cancellation,
-    app: &mut App,
-    question: &crate::hooks::Question,
-) -> Result<Option<String>, String> {
-    app.begin_question(question);
-    app.render()?;
-    let answer = loop {
-        match event::read().map_err(|error| error.to_string())? {
-            InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    cancellation.cancel();
-                    break None;
-                }
-                match key.code {
-                    KeyCode::PageUp => app.scroll = app.scroll.saturating_add(10),
-                    KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
-                    KeyCode::Enter | KeyCode::Esc => break None,
-                    _ => {
-                        if let Some(index) = question_key(key, question.choices.len()) {
-                            break Some(index);
-                        }
-                    }
-                }
-            }
-            InputEvent::Resize(_, _) => {}
-            _ => continue,
-        }
-        app.render()?;
-    };
-    app.scroll = 0;
-    app.status = if cancellation.cancelled() {
-        "cancelling"
-    } else {
-        "working"
-    }
-    .into();
-    let label = answer.map_or("skipped", |index| question.choices[index].label.as_str());
-    app.push(Kind::Notice, format!("answer> {label}"), false);
-    app.render()?;
-    Ok(answer.map(|index| question.choices[index].value.clone()))
-}
-
-fn question_key(key: KeyEvent, count: usize) -> Option<usize> {
-    if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
-        return None;
-    }
-    let KeyCode::Char(value) = key.code else {
-        return None;
-    };
-    let index = value.to_digit(10)?.checked_sub(1)? as usize;
-    (index < count).then_some(index)
-}
-
 struct ChannelObserver {
     sender: mpsc::Sender<TurnMessage>,
 }
@@ -898,30 +804,6 @@ impl Observer for ChannelObserver {
     fn event(&mut self, event: Event) -> Result<(), String> {
         self.sender
             .send(TurnMessage::Event(event))
-            .map_err(|_| "terminal UI closed".to_string())
-    }
-}
-
-struct ChannelResponder {
-    sender: mpsc::Sender<TurnMessage>,
-    interactive: bool,
-}
-
-impl Responder for ChannelResponder {
-    fn attended(&self) -> bool {
-        self.interactive
-    }
-
-    fn answer(&mut self, question: &crate::hooks::Question) -> Result<Option<String>, String> {
-        if !self.interactive {
-            return Ok(None);
-        }
-        let (sender, receiver) = mpsc::channel();
-        self.sender
-            .send(TurnMessage::Question(question.clone(), sender))
-            .map_err(|_| "terminal UI closed".to_string())?;
-        receiver
-            .recv()
             .map_err(|_| "terminal UI closed".to_string())
     }
 }
@@ -949,12 +831,7 @@ fn handle_command(
             ),
             false,
         ),
-        "tools" => app.push(Kind::Notice, super::format_tools(runtime)?, false),
-        "tool" => {
-            let (name, state, global) = super::parse_tool_action(argument)?;
-            runtime.set_tool_state(name, state, global)?;
-            app.push(Kind::Notice, super::format_tools(runtime)?, false);
-        }
+        "tools" => app.push(Kind::Notice, super::format_tools(runtime), false),
         "session" => {
             let session = runtime.summary();
             app.push(
@@ -1164,15 +1041,9 @@ fn handle_command(
             }
         }
         "" => {}
-        other => run_operation(
-            runtime,
-            super::Operation::HookCommand {
-                name: other.into(),
-                argument: argument.into(),
-            },
-            true,
-            app,
-        )?,
+        other => {
+            app.push(Kind::Error, format!("unknown command /{other}"), false);
+        }
     }
     app.refresh(runtime);
     Ok(())
@@ -1182,7 +1053,6 @@ fn show_runtime_notices(runtime: &mut Runtime, app: &mut App) {
     for notice in runtime.take_startup_notices() {
         app.push(Kind::Notice, notice, false);
     }
-    app.hint = runtime.hint().map(str::to_string);
 }
 
 struct AppObserver<'a>(&'a mut App);
@@ -1522,16 +1392,12 @@ mod tests {
         let id = session.id().to_string();
         drop(session);
         let session = store.open(&id).unwrap();
-        let runtime = Runtime::with_options(
+        let runtime = Runtime::new(
             std::sync::Arc::new(NoRequests),
             store,
             session,
             &crate::config::Config::default(),
             "test/model".into(),
-            crate::runtime::Options {
-                tools: Some(crate::tools::Registry::default()),
-                tool_state_directory: Some(root.join("global")),
-            },
         )
         .unwrap();
         (runtime, root)
@@ -1642,7 +1508,6 @@ mod tests {
             editor: Editor::new(),
             scroll: 0,
             status: "working".to_string(),
-            hint: None,
             model: "test/model".to_string(),
             session: SessionSummary {
                 id: "test-session".to_string(),
@@ -1714,76 +1579,6 @@ mod tests {
                 Some(Action::Submit(text)) if text == "one\ntwo"
             ));
         }
-    }
-
-    #[test]
-    fn full_questions_are_scrollable_and_only_listed_number_keys_select_answers() {
-        let question = crate::hooks::Question {
-            id: "q".into(),
-            text: format!("Question start {}", "detail ".repeat(120)),
-            choices: vec![
-                crate::hooks::Choice {
-                    value: "yes".into(),
-                    label: "Publish".into(),
-                },
-                crate::hooks::Choice {
-                    value: "no".into(),
-                    label: format!("Discard {}choice end", "reason ".repeat(25)),
-                },
-            ],
-        };
-        let mut app = app();
-        app.begin_question(&question);
-        assert!(
-            app.transcript
-                .back()
-                .unwrap()
-                .text
-                .starts_with(&question.text)
-        );
-        let rendered = |app: &App| {
-            app.frame(40, 10)
-                .lines
-                .iter()
-                .map(|line| line.0.iter().map(|cell| cell.character).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        assert!(rendered(&app).contains("choice end"));
-        app.scroll = 100;
-        assert!(rendered(&app).contains("Question start"));
-        assert_eq!(
-            question_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE), 2),
-            Some(1)
-        );
-        for key in [
-            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
-        ] {
-            assert_eq!(question_key(key, 2), None);
-        }
-    }
-
-    #[test]
-    fn hook_hint_remains_visible_when_the_turn_ends_and_can_be_cleared() {
-        let mut app = app();
-        app.apply(Event::Hint(Some("Review pending".into())));
-        app.apply(Event::TurnEnd {
-            status: "completed",
-            tool_rounds: 0,
-            last_entry_id: None,
-        });
-        let status = |app: &App| {
-            app.frame(80, 24).lines[23]
-                .0
-                .iter()
-                .map(|cell| cell.character)
-                .collect::<String>()
-        };
-        assert!(status(&app).contains("idle | Review pending"));
-        app.apply(Event::Hint(None));
-        assert!(!status(&app).contains("Review pending"));
     }
 
     #[test]
@@ -1924,7 +1719,10 @@ mod tests {
                 .all(|cell| cell.color == STATUS_COLOR)
         );
 
-        app.input_enabled = false;
+        app.status = "idle".into();
+        app.begin_operation();
+        assert!(!app.input_enabled);
+        assert_eq!(app.status, "working");
         let frame = app.frame(80, 24);
         assert!(
             frame.lines[22].0[..2]

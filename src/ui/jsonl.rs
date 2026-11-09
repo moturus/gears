@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::process::Stream;
 use crate::provider::{Role, UsageMeter};
-use crate::runtime::{Event, Observer, Runtime, Unattended};
+use crate::runtime::{Event, Observer, Runtime};
 
 pub const VERSION: u32 = 1;
 
@@ -23,13 +23,10 @@ pub fn run(runtime: &mut Runtime, prompt: String, writer: impl Write) -> Result<
             "session_format_version": runtime.session().format_version(),
         }))?;
         runtime.set_interactive(false)?;
-        if let Some(hint) = runtime.hint() {
-            output.event(Event::Hint(Some(hint.to_string())))?;
-        }
         for notice in runtime.take_startup_notices() {
             output.event(Event::Notice(notice))?;
         }
-        runtime.turn(prompt, &mut Unattended, &mut output)
+        runtime.turn(prompt, &mut output)
     })();
     for notice in runtime.close() {
         if let Err(error) = output.event(Event::Notice(notice))
@@ -110,7 +107,6 @@ impl<W: Write> Observer for Renderer<W> {
                 "content": content, "is_error": is_error, "outcome": outcome,
             }),
             Event::Notice(text) => json!({"type": "notice", "text": text}),
-            Event::Hint(hint) => json!({"type": "hint", "text": hint}),
             Event::Usage { request, total } => {
                 self.usage.add(&request);
                 json!({"type": "usage", "request": request, "total": usage_value(&total)})

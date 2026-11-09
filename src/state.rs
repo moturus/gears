@@ -85,7 +85,7 @@ impl StateRoot {
         self.replace(relative, bytes, false)
     }
 
-    /// Replace a workspace file, preserving Unix permission bits or the
+    /// Replace a workspace file, preserving the
     /// caller's Motor OS access. Other native roles retain creation defaults.
     pub fn replace_file_preserving_access(
         &self,
@@ -106,12 +106,6 @@ impl StateRoot {
         let result = (|| {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                // A new workspace file gets the usual umask-based permissions.
-                options.mode(if preserve_access { 0o666 } else { 0o600 });
-            }
             let mut file = options
                 .open(&temp)
                 .map_err(|error| format!("{}: {error}", temp.display()))?;
@@ -184,36 +178,24 @@ impl StateRoot {
 }
 
 fn preserve_permissions(source: &Path, temporary: &Path) -> Result<(), String> {
-    let metadata = match std::fs::metadata(source) {
-        Ok(metadata) => metadata,
+    match std::fs::metadata(source) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("{}: {error}", source.display())),
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Replacing contents does not preserve setuid, setgid or sticky bits.
-        let mode = metadata.permissions().mode() & 0o777;
-        std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(mode))
-            .map_err(|error| format!("{}: {error}", temporary.display()))
     }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        use moto_rt::fs::{PERM_EXEC, PERM_READ};
-        let source = source.to_str().ok_or("file path is not UTF-8")?;
-        let temporary = temporary.to_str().ok_or("temporary path is not UTF-8")?;
-        let mode = moto_rt::fs::stat(source)
-            .map_err(|error| format!("{source}: {error:?}"))?
-            .perm;
-        // Native editable executables finalize rw- -> r-x -> rwx. Set access
-        // only after the bytes are durable, before publishing the replacement.
-        if mode & PERM_EXEC != 0 {
-            moto_rt::fs::set_perm(temporary, PERM_READ | PERM_EXEC)
-                .map_err(|error| format!("{temporary}: {error:?}"))?;
-        }
-        moto_rt::fs::set_perm(temporary, mode).map_err(|error| format!("{temporary}: {error:?}"))
+    use moto_rt::fs::{PERM_EXEC, PERM_READ};
+    let source = source.to_str().ok_or("file path is not UTF-8")?;
+    let temporary = temporary.to_str().ok_or("temporary path is not UTF-8")?;
+    let mode = moto_rt::fs::stat(source)
+        .map_err(|error| format!("{source}: {error:?}"))?
+        .perm;
+    // Native editable executables finalize rw- -> r-x -> rwx. Set access
+    // only after the bytes are durable, before publishing the replacement.
+    if mode & PERM_EXEC != 0 {
+        moto_rt::fs::set_perm(temporary, PERM_READ | PERM_EXEC)
+            .map_err(|error| format!("{temporary}: {error:?}"))?;
     }
+    moto_rt::fs::set_perm(temporary, mode).map_err(|error| format!("{temporary}: {error:?}"))
 }
 
 fn cleanup_temporary_files(directory: &Path) -> Result<usize, String> {
@@ -385,7 +367,6 @@ mod tests {
             std::fs::read(state.file(relative).unwrap()).unwrap(),
             b"second"
         );
-
         let settings = root.join("settings");
         std::fs::write(settings.join(".gears-tmp-crashed"), "partial").unwrap();
         std::fs::write(settings.join("keep.txt"), "keep").unwrap();
@@ -399,49 +380,6 @@ mod tests {
             std::fs::read(state.file(relative).unwrap()).unwrap(),
             b"second"
         );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn refuses_symlink_components() {
-        use std::os::unix::fs::symlink;
-
-        let root = temp("link");
-        let outside = temp("outside");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&outside);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        symlink(&outside, root.join("sessions")).unwrap();
-        let state = StateRoot::new(root.clone()).unwrap();
-        assert!(state.file(Path::new("sessions/x")).is_err());
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_dir_all(outside).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn new_workspace_files_get_ordinary_permissions_and_state_stays_private() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = temp("modes");
-        let _ = std::fs::remove_dir_all(&root);
-        let state = StateRoot::new(root.clone()).unwrap();
-        state.directory(Path::new("")).unwrap();
-        std::fs::write(root.join("ordinary"), "x").unwrap();
-        state
-            .replace_file_preserving_access(Path::new("created"), b"x")
-            .unwrap();
-        state.replace_file(Path::new("private"), b"x").unwrap();
-        let mode = |name: &str| {
-            std::fs::metadata(root.join(name))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777
-        };
-        assert_eq!(mode("created"), mode("ordinary"));
-        assert_eq!(mode("private"), 0o600);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

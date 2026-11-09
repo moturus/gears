@@ -13,19 +13,5 @@ pub fn default_root() -> Result<PathBuf, String> {
         crate::state::StateRoot::new(root.clone())?;
         return Ok(root);
     }
-    #[cfg(target_os = "motor")]
-    {
-        Ok(PathBuf::from("/user/cfg/gears"))
-    }
-    #[cfg(all(unix, not(target_os = "motor")))]
-    {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".gears"))
-            .ok_or("HOME is not set; cannot locate Gears directory".into())
-    }
-    #[cfg(not(any(target_os = "motor", unix)))]
-    {
-        Err("this platform has no Gears directory".into())
-    }
+    Ok(PathBuf::from("/user/cfg/gears"))
 }

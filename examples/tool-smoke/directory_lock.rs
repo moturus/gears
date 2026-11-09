@@ -1,4 +1,4 @@
-//! Exercise the directory lock against actual Gears processes on both systems.
+//! Exercise the directory lock against actual Gears processes on Motor OS.
 
 use std::io::{Read, Write};
 use std::path::Path;

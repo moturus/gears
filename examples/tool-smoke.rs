@@ -1,11 +1,11 @@
-//! Hermetic shipped-manifest checks, also installed as a developer-image test.
+//! Hermetic built-in tool checks, also installed as a developer-image test.
 
 use std::path::Path;
 
-use gears::config::Config;
-use gears::mock::{MockServer, Script};
-use gears::process::{Cancellation, Output};
-use gears::tools::{ExecutionContext, Registry};
+use gears::process::{Cancellation, Stream};
+use gears::provider::{Message, ToolOutcome};
+use gears::session::Store;
+use gears::tools::{Context, Registry};
 use serde_json::{Value, json};
 
 #[path = "tool-smoke/directory_lock.rs"]
@@ -25,8 +25,7 @@ fn main() -> Result<(), String> {
         .nth(1)
         .map(std::path::PathBuf::from)
         .ok_or("usage: tool-smoke GEARS_DIRECTORY [GEARS_EXECUTABLE]")?;
-    let config = Config::load_user(Some(&directory.join("config/gears.toml")))?;
-    smoke(&directory, &config)?;
+    smoke(&directory)?;
     let gears = std::env::current_exe()
         .map_err(|error| error.to_string())?
         .parent()
@@ -38,7 +37,7 @@ fn main() -> Result<(), String> {
         .nth(2)
         .map(std::path::PathBuf::from)
         .unwrap_or(gears);
-    owned_work::smoke(&gears, &directory.join("tools/sh"))?;
+    owned_work::smoke(&gears)?;
     directory_lock::smoke(&gears)?;
     fork_entry::smoke(&gears)?;
     file_access::smoke()?;
@@ -47,20 +46,15 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn smoke(directory: &Path, config: &Config) -> Result<(), String> {
-    let mut tools = Registry::load(&config.tools, directory)?;
-    assert_eq!(tools.tools().len(), 14);
-    assert_eq!(tools.enabled_tools().count(), 0);
-    for name in [
-        "sh", "ls", "head", "tail", "wc", "cat", "diff", "find", "sed", "curl",
-    ] {
-        tools.set_enabled(name, true)?;
-    }
-    #[cfg(not(unix))]
-    tools.set_enabled("rg", true)?;
-    let workspace = std::env::temp_dir().join(format!("gears-tools-smoke-{}", std::process::id()));
+fn smoke(directory: &Path) -> Result<(), String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let workspace = directory.join(format!("tool-smoke-{}-{stamp}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&workspace);
     std::fs::create_dir(&workspace).map_err(|error| error.to_string())?;
-    let result = check_tools(&tools, &workspace);
+    let result = check_tools(&workspace);
     if result.is_ok() {
         std::fs::remove_dir_all(&workspace).map_err(|error| error.to_string())?;
     } else {
@@ -70,196 +64,135 @@ fn smoke(directory: &Path, config: &Config) -> Result<(), String> {
 }
 
 fn execute(
-    tools: &Registry,
-    workspace: &Path,
+    registry: &Registry,
+    context: &Context,
     name: &str,
     arguments: Value,
-    code: i32,
-) -> Result<Output, String> {
-    let tool = tools
-        .enabled(name)
-        .ok_or_else(|| format!("{name} unavailable"))?;
-    let state = workspace.join("shell-state");
-    let output = tool
-        .execute(
-            &arguments.to_string(),
-            &ExecutionContext {
-                workspace,
-                session_id: "tool-smoke",
-                session_path: None,
-                shell_state: tool.process.shell_state.then_some(state.as_path()),
-            },
-            &Cancellation::new(),
-            &mut |_, _| {},
-        )
-        .map_err(|error| format!("{name}: {error}"))?;
-    if output.code != Some(code) || output.timed_out || output.cancelled {
-        return Err(format!("{name}: unexpected outcome: {output:?}"));
+) -> Result<String, String> {
+    let tool = registry
+        .get(name)
+        .ok_or_else(|| format!("{name} is not a built-in tool"))?;
+    let (result, outcome) = tool.execute(
+        &arguments.to_string(),
+        context,
+        &Cancellation::new(),
+        &mut |_: Stream, _: &str| {},
+    );
+    if outcome != ToolOutcome::Completed {
+        return Err(format!("{name}: {}: {outcome:?}", result.unwrap_err()));
     }
-    if !tool.process.normal_exit_statuses.contains(&code) {
-        return Err(format!("{name}: {code} is not a declared normal outcome"));
-    }
-    Ok(output)
+    result.map_err(|error| format!("{name}: {error}"))
 }
 
-fn check_tools(tools: &Registry, workspace: &Path) -> Result<(), String> {
-    std::fs::create_dir(workspace.join("shell-state")).map_err(|error| error.to_string())?;
-    let directory = "literal * [x]";
-    let file = "literal * [x]/a * [x].txt";
-    let other = "literal * [x]/b ? [y].txt";
-    std::fs::create_dir(workspace.join(directory)).map_err(|error| error.to_string())?;
-    std::fs::write(workspace.join(file), "first\nlast\n").map_err(|error| error.to_string())?;
-    std::fs::write(workspace.join(other), "first\nchanged\n").map_err(|error| error.to_string())?;
-    let listed = execute(tools, workspace, "ls", json!({"path": directory}), 0)?;
-    assert!(listed.stdout.contains("a * [x].txt"), "{listed:?}");
-    let head = execute(
-        tools,
-        workspace,
-        "head",
-        json!({"path": file, "lines": 1}),
-        0,
-    )?;
-    assert_eq!(head.stdout, "first\n");
-    let tail = execute(
-        tools,
-        workspace,
-        "tail",
-        json!({"path": file, "lines": 1}),
-        0,
-    )?;
-    assert_eq!(tail.stdout, "last\n");
-    let wc = execute(
-        tools,
-        workspace,
-        "wc",
-        json!({"path": file, "mode": "lines"}),
-        0,
-    )?;
-    assert_eq!(wc.stdout.split_whitespace().next(), Some("2"));
-    let cat = execute(tools, workspace, "cat", json!({"path": file}), 0)?;
-    assert_eq!(cat.stdout, "first\nlast\n");
-    let diff = execute(
-        tools,
-        workspace,
-        "diff",
-        json!({"left": file, "right": other}),
-        1,
-    )?;
-    assert!(
-        diff.stdout.contains("last") && diff.stdout.contains("changed"),
-        "{diff:?}"
-    );
-    let found = execute(
-        tools,
-        workspace,
-        "find",
-        json!({"path": directory, "type": "file"}),
-        0,
-    )?;
-    assert!(
-        found.stdout.contains(file) && found.stdout.contains(other),
-        "{found:?}"
-    );
-    let sed = execute(
-        tools,
-        workspace,
-        "sed",
-        json!({"path": file, "script": "s/first/replaced/"}),
-        0,
-    )?;
-    assert_eq!(sed.stdout, "replaced\nlast\n");
+fn check_tools(workspace: &Path) -> Result<(), String> {
+    let state = workspace.join("state");
+    std::fs::create_dir(&state).map_err(|error| error.to_string())?;
+    let shell_state = workspace.join("shell-state");
+    std::fs::create_dir(&shell_state).map_err(|error| error.to_string())?;
+    let registry = Registry::new();
     assert_eq!(
-        std::fs::read_to_string(workspace.join(file)).unwrap(),
-        "first\nlast\n"
+        registry
+            .tools()
+            .iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>(),
+        ["sh", "read_file", "write_file", "patch", "session_search"]
     );
-    #[cfg(not(unix))]
-    {
-        let rg = execute(
-            tools,
-            workspace,
-            "rg",
-            json!({"path": file, "pattern": "first", "fixed_strings": true}),
-            0,
-        )?;
-        assert_eq!(rg.stdout, "first\n");
-        execute(
-            tools,
-            workspace,
-            "rg",
-            json!({"path": file, "pattern": "absent"}),
-            1,
-        )?;
-    }
+    let directory = "literal * [x]";
+    std::fs::create_dir(workspace.join(directory)).map_err(|error| error.to_string())?;
+    let context = Context::new(
+        workspace.to_path_buf(),
+        state.clone(),
+        "tool-smoke".into(),
+        Some(shell_state),
+    )?;
     execute(
-        tools,
-        workspace,
+        &registry,
+        &context,
+        "write_file",
+        json!({"path": "literal * [x]/a * [x].txt", "content": "first\nlast\n"}),
+    )?;
+    let page = execute(
+        &registry,
+        &context,
+        "read_file",
+        json!({"path": "literal * [x]/a * [x].txt"}),
+    )?;
+    let page: Value = serde_json::from_str(&page).map_err(|error| error.to_string())?;
+    assert_eq!(page["content"], "1: first\n2: last\n");
+    assert_eq!(page["all_pages_read"], true);
+    let patched = execute(
+        &registry,
+        &context,
+        "patch",
+        json!({"path": "literal * [x]/a * [x].txt",
+            "old_text": "first\n", "new_text": "changed\n"}),
+    )?;
+    assert!(patched.contains("changed"), "{patched}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("literal * [x]/a * [x].txt")).unwrap(),
+        "changed\nlast\n"
+    );
+    let refused = registry.get("write_file").unwrap().execute(
+        &json!({"path": "state/intruder", "content": "x"}).to_string(),
+        &context,
+        &Cancellation::new(),
+        &mut |_: Stream, _: &str| {},
+    );
+    assert!(
+        refused
+            .0
+            .as_ref()
+            .is_err_and(|error| error.contains("Gears directory")),
+        "{refused:?}"
+    );
+
+    let store = Store::with_root(workspace, state.clone()).map_err(|error| error.to_string())?;
+    let mut session = store
+        .create(false, None)
+        .map_err(|error| error.to_string())?;
+    session
+        .append_message(&Message::user("needle question"))
+        .map_err(|error| error.to_string())?;
+    session
+        .append_message(&Message::assistant("needle answer"))
+        .map_err(|error| error.to_string())?;
+    let found = execute(
+        &registry,
+        &context,
+        "session_search",
+        json!({"query": "needle", "limit": 10}),
+    )?;
+    let found: Value = serde_json::from_str(&found).map_err(|error| error.to_string())?;
+    assert_eq!(found["total_matches"], 2);
+    assert_eq!(found["hits"][0]["session_id"], session.id());
+
+    execute(
+        &registry,
+        &context,
         "sh",
         json!({"command": "[ -z \"${OPENROUTER_API_KEY+x}\" ] && export TOOL_SMOKE_STATE=retained && cd 'literal * [x]'"}),
-        0,
     )?;
     let restored = execute(
-        tools,
-        workspace,
+        &registry,
+        &context,
         "sh",
         json!({"command": "printf '%s\\n' \"$TOOL_SMOKE_STATE\"; pwd"}),
-        0,
     )?;
-    assert_eq!(
-        restored.stdout,
-        format!("retained\n{}\n", workspace.join(directory).display())
-    );
-    check_curl(tools, workspace)
-}
-
-fn check_curl(tools: &Registry, workspace: &Path) -> Result<(), String> {
-    let server = MockServer::start(vec![
-        Script::new().write(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"),
-        Script::new().write(b"HTTP/1.1 302 Found\r\nLocation: /destination\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-    ]).map_err(|error| error.to_string())?;
-    let ok = execute(
-        tools,
-        workspace,
-        "curl",
-        json!({"url": server.url("/ok")}),
-        0,
-    )?;
-    assert!(
-        ok.stdout.contains("HTTP/1.1 200 OK") && ok.stdout.contains("hello"),
-        "{ok:?}"
-    );
-    let redirect = execute(
-        tools,
-        workspace,
-        "curl",
-        json!({"url": server.url("/redirect")}),
-        0,
-    )?;
-    assert!(
-        redirect.stdout.contains("HTTP/1.1 302 Found")
-            && redirect.stdout.contains("Location: /destination"),
-        "{redirect:?}"
-    );
-    let requests = server.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].target, "/ok");
-    assert_eq!(requests[1].target, "/redirect");
+    let expected = format!("retained\n{}\n", workspace.join(directory).display());
+    assert!(restored.ends_with(&expected), "{restored}");
+    assert!(restored.contains("exit status 0"), "{restored}");
     Ok(())
 }
 
 #[test]
-fn shipped_tools_follow_their_manifests() {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let config = Config::load_user(Some(&directory.join("config/gears.toml"))).unwrap();
-    smoke(directory, &config).unwrap();
+fn built_in_tools_follow_their_contracts() {
+    smoke(Path::new(env!("CARGO_TARGET_TMPDIR"))).unwrap();
 }
 
 #[test]
 fn nested_work_stops_its_own_tools_and_parents_stop_everything() {
-    owned_work::smoke(
-        Path::new(env!("CARGO_BIN_EXE_gears")),
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-    )
-    .unwrap();
+    owned_work::smoke(Path::new(env!("CARGO_BIN_EXE_gears"))).unwrap();
 }
 
 #[test]

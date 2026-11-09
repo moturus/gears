@@ -113,7 +113,7 @@ pub fn provider_conformance_corpus() -> Vec<ProviderCase> {
     ];
     let calls = [
         r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"sh","arguments":""}}]}}]}"#,
-        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"hook_tool","arguments":""}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"other_tool","arguments":""}}]}}]}"#,
         r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"printf "}}]}}]}"#,
         r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"value\":"}}]}}]}"#,
         r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ok\"}"}}]}}]}"#,
@@ -148,7 +148,7 @@ pub fn provider_conformance_corpus() -> Vec<ProviderCase> {
             expected: ProviderExpectation::Completion(Completion {
                 tool_calls: vec![
                     ToolCall::new("call_a", "sh", r#"{"command":"printf ok"}"#),
-                    ToolCall::new("call_b", "hook_tool", r#"{"value":1}"#),
+                    ToolCall::new("call_b", "other_tool", r#"{"value":1}"#),
                 ],
                 finish_reason: Some(FinishReason::ToolCalls),
                 ..Completion::default()
@@ -417,7 +417,7 @@ pub const PROVIDER_SCENARIOS: &[&str] = &[
     "fragmented-sse",
     "sh-round",
     "sh-round-twice",
-    "hook-round",
+    "tool-round",
     "compaction",
     "interrupt-stream",
     "usage",
@@ -464,11 +464,11 @@ pub fn provider_scenario(name: &str) -> Option<Vec<Script>> {
                 })
                 .collect(),
         ),
-        "hook-round" => Some(tool_round(
-            "call_hook",
-            "echo_hook",
+        "tool-round" => Some(tool_round(
+            "call_tool",
+            "echo_tool",
             serde_json::json!({"value": "mock"}),
-            "hook complete",
+            "tool complete",
         )),
         "compaction" => Some(vec![
             sse_response(&[&text("answer one"), finish, usage]),

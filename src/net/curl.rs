@@ -1,10 +1,3 @@
-//! The transport engine both HTTP backends share: spawn a curl, feed it the
-//! body, split its stdout into head and chunks, map its exit code to a
-//! cause. The host backend points it at upstream curl(1); the Motor backend
-//! points it at the in-tree `/system/bin/curl`, which implements exactly the
-//! options [`build_argv`] emits — that compatibility is what lets one
-//! audited command line, and this one engine, serve both platforms.
-
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -76,7 +69,6 @@ impl CurlTransport {
     fn spawn(&self, req: &HttpRequest) -> Result<Child, NetError> {
         let mut cmd = Command::new(&self.program);
         // The transport helper must not become Gears' foreground terminal child.
-        #[cfg(not(unix))]
         cmd.env(moto_rt::process::STDIO_NO_TERMINAL_ENV_KEY, "true");
         if self.verbose_child
             && let Some(flag) = verbosity_flag(self.verbosity)

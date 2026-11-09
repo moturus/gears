@@ -101,11 +101,7 @@ fn a_first_run_asks_provider_model_and_key_and_saves_them_in_the_gears_directory
 fn reset_asks_then_keeps_only_the_installation() {
     let root = fixture("reset");
     let workspace = root.join("workspace");
-    for directory in [
-        ".gears/tools/sh",
-        ".gears/sessions/group",
-        "workspace/.gears",
-    ] {
+    for directory in [".gears/sessions/group", "workspace/.gears"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
     for file in [
@@ -140,159 +136,10 @@ fn reset_asks_then_keeps_only_the_installation() {
     assert!(stdout.starts_with("Reset Gears: remove keys"), "{stdout}");
     assert!(!stdout.contains("openrouter.key"), "{stdout}");
     assert!(root.join(".gears/gears.toml").is_file());
-    assert!(root.join(".gears/tools/sh").is_dir());
     assert!(!root.join(".gears/openrouter.key").exists());
     assert!(!root.join(".gears/sessions").exists());
     assert!(!workspace.join(".gears").exists());
     std::fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn batteries_hook_uses_the_gears_sibling_even_when_path_contains_another_program() {
-    // Parallel spawns can inherit a writable copy fd until exec. Prepare and
-    // run these executables in a process with no other process-creating tests.
-    const CHILD: &str = "GEARS_SIBLING_FIXTURE_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .env(CHILD, "1")
-            .args([
-                "--exact",
-                "batteries_hook_uses_the_gears_sibling_even_when_path_contains_another_program",
-                "--nocapture",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    let root = fixture("batteries-sibling");
-    let workspace = root.join("workspace");
-    let binaries = root.join("bin");
-    let other = root.join("other");
-    for path in [&workspace, &binaries, &other] {
-        std::fs::create_dir(path).unwrap();
-    }
-    std::fs::copy(env!("CARGO_BIN_EXE_gears"), binaries.join("gears")).unwrap();
-    for (directory, label) in [(&binaries, "sibling-hook-ran"), (&other, "path-hook-ran")] {
-        let path = directory.join("gears-batteries");
-        support::write(
-            &path,
-            format!("#!/bin/sh\n_input=$(cat)\nprintf '%s' '{{\"notice\":\"{label}\"}}'\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let server = MockServer::start_one(sse_response(&[
-        r#"{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
-    ]))
-    .unwrap();
-    let cfg = config(&root, &server);
-    let mut file = std::fs::OpenOptions::new().append(true).open(&cfg).unwrap();
-    writeln!(file, "\n[[hooks]]\nname = 'batteries'\nevents = ['initialize']\ncommand = ['gears-batteries', 'hook']").unwrap();
-    let output = Command::new(binaries.join("gears"))
-        .env("HOME", &root)
-        .env(gears::directory::ENV, root.join(".gears"))
-        .env("OPENROUTER_API_KEY", "test-key")
-        .env("PATH", format!("{}:/usr/bin:/bin", other.display()))
-        .args(["--ui", "line", "--ephemeral", "--config"])
-        .arg(cfg)
-        .arg("--workspace")
-        .arg(workspace)
-        .args(["-p", "hello"])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("sibling-hook-ran"), "{stderr}");
-    assert!(!stderr.contains("path-hook-ran"), "{stderr}");
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn hook_questions_and_commands_work_in_line_ui_and_never_prompt_in_one_shots() {
-    for mode in ["interactive", "text", "jsonl"] {
-        let root = fixture(&format!("hook-question-{mode}"));
-        let workspace = root.join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let server = MockServer::start_one(sse_response(&[
-            r#"{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
-        ]))
-        .unwrap();
-        let config = config(&root, &server);
-        let log = root.join("answers.jsonl");
-        let hook = root.join("hook.sh");
-        let question = serde_json::json!({"id": "q1", "text": "Publish proposal?", "choices": [
-            {"value": "yes", "label": "Publish"}, {"value": "no", "label": "Discard"}]});
-        let initialize = serde_json::json!({"commands": [{"name": "review", "help": "Review this work"}], "question": question});
-        let ask = serde_json::json!({"question": question});
-        support::write(&hook, format!("event=$(cat)\ncase \"$event\" in\n*'\"event\":\"initialize\"'*) printf '%s' '{initialize}' ;;\n*'\"event\":\"answer\"'*) printf '%s\\n' \"$event\" >> \"$1\"; printf '{{\"hint\":\"decision saved\"}}' ;;\n*) printf '%s' '{ask}' ;;\nesac\n")).unwrap();
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&config)
-            .unwrap();
-        writeln!(file, "\n[[hooks]]\nname = 'question'\ncommand = ['{}', '{}', '{}']\nevents = ['initialize', 'command', 'turn_end', 'answer']", support::SHELL, hook.display(), log.display()).unwrap();
-        let output = if mode == "interactive" {
-            let mut child = gears(&root, &workspace, &config)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(b"2\n/help\n/review literal focus\nyes\nhello\n2\n/quit\n")
-                .unwrap();
-            child.wait_with_output().unwrap()
-        } else {
-            gears(&root, &workspace, &config)
-                .args(["-p", "hello", "--output", mode])
-                .output()
-                .unwrap()
-        };
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{mode}: {stderr}");
-        let answers = std::fs::read_to_string(log)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        if mode == "interactive" {
-            assert!(stderr.contains("/review - Review this work"), "{stderr}");
-            assert!(stderr.contains("1. Publish\n  2. Discard"), "{stderr}");
-            assert!(stderr.contains("decision saved"), "{stderr}");
-            assert_eq!(
-                answers
-                    .iter()
-                    .map(|event| event["payload"]["answer"].as_str().unwrap())
-                    .collect::<Vec<_>>(),
-                ["no", "yes", "no"]
-            );
-        } else {
-            assert!(!stderr.contains("Publish proposal?"), "{stderr}");
-            assert!(!String::from_utf8_lossy(&output.stdout).contains("answer [number"));
-            assert_eq!(answers.len(), 2);
-            assert!(
-                answers
-                    .iter()
-                    .all(|event| event["payload"]["answer"].is_null()
-                        && event["payload"]["attended"] == false)
-            );
-            if mode == "jsonl" {
-                let records = jsonl_records(&output.stdout);
-                assert!(
-                    records.iter().any(
-                        |record| record["type"] == "hint" && record["text"] == "decision saved"
-                    )
-                );
-            }
-        }
-        assert_eq!(server.requests().len(), 1);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }
 
 #[test]
@@ -475,15 +322,6 @@ fn jsonl_tool_records_report_the_call_and_its_output() {
     ])
     .unwrap();
     let cfg = config(&root, &server);
-    let mut text = std::fs::read_to_string(&cfg).unwrap();
-    text.push_str(&format!(
-        "\n[[tools]]\ndirectory = {:?}\nenabled = true\n",
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tools/sh")
-            .to_str()
-            .unwrap()
-    ));
-    support::write(&cfg, text).unwrap();
     let output = gears(&root, &workspace, &cfg)
         .args(["-p", "work", "--output", "jsonl"])
         .output()
@@ -553,19 +391,16 @@ fn jsonl_failed_turn_ends_with_a_final_error_and_nonzero_status() {
 fn owned_nested_gears_stops_only_its_tool_and_parents_stop_everything() {
     use gears::process::{Cancellation, Request, run};
     fn stopped(pid: &str) -> bool {
-        #[cfg(unix)]
-        {
-            std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).map_or(true, |stat| {
-                matches!(
-                    stat.rsplit_once(") ").unwrap().1.split_whitespace().next(),
-                    Some("Z" | "X" | "x")
-                )
-            })
+        let pid: u32 = pid.trim().parse().unwrap();
+        // Death is not instantaneous, so give a killed process a moment to go.
+        for _ in 0..100 {
+            let gone = !gears::platform::process_alive(pid);
+            if gone {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        #[cfg(not(unix))]
-        {
-            !gears::platform::process_alive(pid.trim().parse().unwrap())
-        }
+        false
     }
     fn call(id: &str, command: &str, timeout: u64) -> String {
         let arguments = serde_json::json!({"command": command, "timeout": timeout}).to_string();
@@ -600,15 +435,6 @@ fn owned_nested_gears_stops_only_its_tool_and_parents_stop_everything() {
         };
         let server = MockServer::start(scripts).unwrap();
         let cfg = config(&root, &server);
-        let mut text = std::fs::read_to_string(&cfg).unwrap();
-        text.push_str(&format!(
-            "\n[[tools]]\ndirectory = {:?}\nenabled = true\n",
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tools/sh")
-                .to_str()
-                .unwrap()
-        ));
-        support::write(&cfg, text).unwrap();
         let cancellation = Cancellation::new();
         let mut streamed = String::new();
         let output = run(&Request {
@@ -632,12 +458,6 @@ fn owned_nested_gears_stops_only_its_tool_and_parents_stop_everything() {
         assert!(!output.timed_out, "{mode}: {output:?}");
         if mode == "cancel" {
             assert!(output.cancelled, "{output:?}");
-            #[cfg(unix)]
-            assert!(
-                output.code.is_none(),
-                "nested run was not killed: {output:?}"
-            );
-            #[cfg(not(unix))]
             assert_eq!(
                 output.code,
                 Some(-1),
@@ -666,21 +486,21 @@ fn owned_nested_gears_stops_only_its_tool_and_parents_stop_everything() {
 }
 
 #[test]
-fn configured_tools_are_validated_before_a_provider_request() {
-    let root = fixture("tool-validation");
+fn unknown_configuration_is_refused_before_a_provider_request() {
+    let root = fixture("unknown-config");
     let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let server = MockServer::start_one(sse_response(&[])).unwrap();
     let config = config(&root, &server);
     let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str("\n[[tools]]\ndirectory = 'tools/missing'\nenabled = false\n");
+    text.push_str("\n[runtime]\nsh_timeout_seconds = 5\n");
     support::write(&config, text).unwrap();
     let output = gears(&root, &workspace, &config)
         .args(["-p", "hello"])
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("tools/missing"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown field"));
     assert!(server.requests().is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -705,7 +525,7 @@ fn malformed_line_commands_report_errors_and_keep_the_session_open() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"/tool enable\n/tool enable missing\n/tool disable\nhello\n/quit\n")
+        .write_all(b"/label\n/label missing-id\nhello\n/quit\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -715,9 +535,8 @@ fn malformed_line_commands_report_errors_and_keep_the_session_open() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("still open"));
     let errors = String::from_utf8_lossy(&output.stderr);
-    assert!(errors.contains("usage: /tool"), "{errors}");
-    assert!(errors.contains("unknown directory tool"), "{errors}");
-    assert_eq!(errors.matches("usage: /tool").count(), 2, "{errors}");
+    assert!(errors.contains("usage: /label ENTRY [TEXT]"), "{errors}");
+    assert!(errors.contains("no entry \"missing-id\""), "{errors}");
     assert_eq!(server.requests().len(), 1);
     std::fs::remove_dir_all(root).unwrap();
 }

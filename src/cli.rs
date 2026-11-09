@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 pub const COMMAND_NAMES: &[&str] = &[
-    "quit", "exit", "help", "status", "tools", "tool", "session", "name", "new", "resume", "label",
-    "tree", "fork", "clone", "compact", "model", "provider", "reset", "setup",
+    "quit", "exit", "help", "status", "tools", "session", "name", "new", "resume", "label", "tree",
+    "fork", "clone", "compact", "model", "provider", "reset", "setup",
 ];
 
 pub const USAGE: &str = "\
@@ -36,14 +36,13 @@ Options:
   --help              Print this help
 
 Interactive commands include /new, /resume, /name, /session, /tree, /label,
-/fork, /clone, /compact, /provider, /model, /tools, /tool, /status, /setup,
+/fork, /clone, /compact, /provider, /model, /tools, /status, /setup,
 /reset, /help, and /quit.
 Without a chosen model, an interactive start asks for the provider, model and
 key; /setup asks again at any time.
-`gears reset` and /reset ask, then remove keys, saved settings, memory, skills
-and sessions from the Gears directory, keeping gears.toml, gears-batteries.toml
-and tools/, and remove .gears/ from the current directory.
-Use /tool enable|disable|reset NAME [--global] to change directory tools.
+`gears reset` and /reset ask, then remove keys, saved settings and sessions
+from the Gears directory (keeping gears.toml) and .gears/ from the current
+directory.
 Use /provider NAME --default or /model ID --default to save both defaults.
 ";
 

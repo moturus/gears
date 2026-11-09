@@ -5,7 +5,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::runtime::{Event, Observer, Responder, Runtime};
+use crate::runtime::{Event, Observer, Runtime};
 
 const POLL: Duration = Duration::from_millis(25);
 
@@ -17,27 +17,15 @@ pub fn run(
 ) -> Result<(), String> {
     runtime.set_interactive(interactive)?;
     let mut input = Input::new()?;
-    let mut renderer = Renderer {
-        hint: runtime.hint().map(str::to_string),
-        ..Renderer::default()
-    };
+    let mut renderer = Renderer::default();
     if interactive {
         show_history(runtime)?;
     }
     for notice in runtime.take_startup_notices() {
         renderer.event(Event::Notice(notice))?;
     }
-    if interactive && runtime.pending_hook_questions() {
-        run_operation(
-            runtime,
-            super::Operation::Questions,
-            true,
-            &mut input,
-            &mut renderer,
-        )?;
-    }
     if let Some(prompt) = initial {
-        let result = run_turn(runtime, prompt, interactive, &mut input, &mut renderer);
+        let result = run_turn(runtime, prompt, &mut input, &mut renderer);
         renderer.finish_stream();
         result?;
         if !interactive {
@@ -60,15 +48,6 @@ pub fn run(
         }
         if line.starts_with('/') {
             let result = command(runtime, &line, config, &mut input, &mut renderer);
-            if !matches!(&result, Ok(Command::Quit)) && runtime.pending_hook_questions() {
-                run_operation(
-                    runtime,
-                    super::Operation::Questions,
-                    true,
-                    &mut input,
-                    &mut renderer,
-                )?;
-            }
             show_runtime_notices(runtime, &mut renderer)?;
             match result {
                 Ok(Command::Continue) => continue,
@@ -83,7 +62,7 @@ pub fn run(
                 }
             }
         }
-        if let Err(error) = run_turn(runtime, line, true, &mut input, &mut renderer) {
+        if let Err(error) = run_turn(runtime, line, &mut input, &mut renderer) {
             renderer.finish_stream();
             eprintln!("gears: {error}");
         } else {
@@ -125,13 +104,7 @@ fn command(
             Ok(Command::Continue)
         }
         "tools" => {
-            eprintln!("{}", super::format_tools(runtime)?);
-            Ok(Command::Continue)
-        }
-        "tool" => {
-            let (name, state, global) = super::parse_tool_action(argument)?;
-            runtime.set_tool_state(name, state, global)?;
-            eprintln!("{}", super::format_tools(runtime)?);
+            eprintln!("{}", super::format_tools(runtime));
             Ok(Command::Continue)
         }
         "session" => {
@@ -280,20 +253,7 @@ fn command(
             Ok(Command::Continue)
         }
         "" => Ok(Command::Continue),
-        other => {
-            run_operation(
-                runtime,
-                super::Operation::HookCommand {
-                    name: other.into(),
-                    argument: argument.into(),
-                },
-                true,
-                input,
-                renderer,
-            )?;
-            renderer.finish_turn();
-            Ok(Command::Continue)
-        }
+        other => Err(format!("unknown command /{other}")),
     }
 }
 
@@ -301,7 +261,6 @@ fn show_runtime_notices(runtime: &mut Runtime, renderer: &mut Renderer) -> Resul
     for notice in runtime.take_startup_notices() {
         renderer.event(Event::Notice(notice))?;
     }
-    renderer.hint = runtime.hint().map(str::to_string);
     Ok(())
 }
 
@@ -440,15 +399,11 @@ fn choose_named(
 #[derive(Default)]
 struct Renderer {
     streaming: bool,
-    hint: Option<String>,
 }
 
 impl Renderer {
     fn finish_turn(&mut self) {
         self.finish_stream();
-        if let Some(hint) = &self.hint {
-            eprintln!("gears: {hint}");
-        }
     }
 
     fn finish_stream(&mut self) {
@@ -494,7 +449,6 @@ impl Observer for Renderer {
                 self.finish_stream();
                 eprintln!("gears: {notice}");
             }
-            Event::Hint(hint) => self.hint = hint,
             Event::Usage { .. } => {}
             Event::TurnEnd { .. } => self.finish_turn(),
             Event::ModelChanged(model) => eprintln!("model: {model}"),
@@ -506,8 +460,6 @@ impl Observer for Renderer {
 
 enum TurnMessage {
     Event(Event),
-
-    Question(crate::hooks::Question, mpsc::Sender<Option<String>>),
     Done(Result<(), String>),
 }
 
@@ -523,48 +475,18 @@ impl Observer for ChannelObserver {
     }
 }
 
-struct ChannelResponder {
-    sender: mpsc::Sender<TurnMessage>,
-    interactive: bool,
-}
-
-impl Responder for ChannelResponder {
-    fn attended(&self) -> bool {
-        self.interactive
-    }
-
-    fn answer(&mut self, question: &crate::hooks::Question) -> Result<Option<String>, String> {
-        if !self.interactive {
-            return Ok(None);
-        }
-        let (sender, receiver) = mpsc::channel();
-        self.sender
-            .send(TurnMessage::Question(question.clone(), sender))
-            .map_err(|_| "line UI closed".to_string())?;
-        receiver.recv().map_err(|_| "line UI closed".to_string())
-    }
-}
-
 fn run_turn(
     runtime: &mut Runtime,
     prompt: String,
-    interactive: bool,
     input: &mut Input,
     renderer: &mut Renderer,
 ) -> Result<(), String> {
-    run_operation(
-        runtime,
-        super::Operation::Turn(prompt),
-        interactive,
-        input,
-        renderer,
-    )
+    run_operation(runtime, super::Operation::Turn(prompt), input, renderer)
 }
 
 fn run_operation(
     runtime: &mut Runtime,
     operation: super::Operation,
-    interactive: bool,
     input: &mut Input,
     renderer: &mut Renderer,
 ) -> Result<(), String> {
@@ -576,32 +498,13 @@ fn run_operation(
             let mut observer = ChannelObserver {
                 sender: worker_sender.clone(),
             };
-            let mut responder = ChannelResponder {
-                sender: worker_sender,
-                interactive,
-            };
-            let result = operation.run(runtime, &mut responder, &mut observer);
+            let result = operation.run(runtime, &mut observer);
             let _ = sender.send(TurnMessage::Done(result));
         });
         loop {
             loop {
                 match receiver.try_recv() {
                     Ok(TurnMessage::Event(event)) => renderer.event(event)?,
-                    Ok(TurnMessage::Question(question, reply)) => {
-                        renderer.finish_stream();
-                        eprintln!("{}", question.text);
-                        for (index, choice) in question.choices.iter().enumerate() {
-                            eprintln!("  {}. {}", index + 1, choice.label);
-                        }
-                        let answer = loop {
-                            let text = input.read_line("answer [number or value, Enter skip]> ")?;
-                            match super::question_answer(&question, text.as_deref()) {
-                                Ok(answer) => break answer,
-                                Err(error) => eprintln!("gears: {error}"),
-                            }
-                        };
-                        let _ = reply.send(answer);
-                    }
                     Ok(TurnMessage::Done(result)) => return result,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {

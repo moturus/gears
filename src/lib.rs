@@ -1,12 +1,12 @@
-//! Gears: a small extensible agent harness for Linux and Motor OS, with its
-//! optional batteries (file tools, the check, memory and skills) in `batteries`.
+//! Gears: a small agent harness for Motor OS.
 
-pub mod batteries;
+#[cfg(not(target_os = "motor"))]
+compile_error!("Gears supports Motor OS only");
+
 pub mod cancellation;
 pub mod cli;
 pub mod config;
 pub mod directory;
-pub mod hooks;
 pub mod mock;
 pub mod net;
 pub mod platform;
@@ -23,7 +23,6 @@ pub mod session;
 pub mod setup;
 pub mod shell_state;
 pub mod state;
-pub mod tool_state;
 pub mod tools;
 pub mod trace;
 pub mod ui;

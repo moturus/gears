@@ -116,7 +116,7 @@ pub fn raw_console() -> bool {
 /// process may not read is "alive", the way `EPERM` is on the host — a lock
 /// that cannot be checked must not be broken.
 pub fn process_alive(pid: u32) -> bool {
-    // Pid 0 in a lockfile is junk rather than an owner (see the unix backend).
+    // Pid 0 in a lockfile is junk rather than an owner.
     if pid == 0 {
         return false;
     }
@@ -233,8 +233,6 @@ pub fn cancellation_text(complete: bool) -> &'static str {
     }
 }
 
-/// No signal can kill a process here, so unlike the unix backend there is no
-/// "killed by" case to report (the rush precedent, `sys/motor.rs`).
 pub fn status_text(status: std::process::ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("exit status {code}"),

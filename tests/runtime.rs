@@ -5,20 +5,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gears::config::{Config, ContextConfig, HookConfig, ToolDirectory};
+use gears::config::{Config, ContextConfig};
 use gears::mock::{MockServer, Script, sse_response};
 use gears::net::EgressPolicy;
-#[cfg(unix)]
-use gears::net::host_curl::HostCurl;
-#[cfg(not(unix))]
-use gears::net::motor_curl::MotorCurl as HostCurl;
+use gears::net::motor_curl::MotorCurl;
 use gears::provider::{
     Completion, ContentBlock, Endpoint, EventSink, FinishReason, Message, OpenAiCompat, Provider,
     ProviderError, Quirks, Request, StreamEvent, ToolCall, ToolOutcome,
 };
-use gears::runtime::{Event, Options, Responder, Runtime, Unattended};
-use gears::session::{Store, ToolState};
-use gears::tools::Registry;
+use gears::runtime::{Event, Runtime};
+use gears::session::Store;
 
 struct Scripted {
     responses: Mutex<VecDeque<Result<Completion, ProviderError>>>,
@@ -61,24 +57,6 @@ impl Provider for Scripted {
     }
 }
 
-/// Answers hook questions on the user's behalf and counts how often it was asked.
-struct Questions {
-    answer: Option<String>,
-    attended: bool,
-    asked: usize,
-}
-
-impl Responder for Questions {
-    fn attended(&self) -> bool {
-        self.attended
-    }
-    fn answer(&mut self, _: &gears::hooks::Question) -> Result<Option<String>, String> {
-        assert!(self.attended, "unattended run asked a question");
-        self.asked += 1;
-        Ok(self.answer.clone())
-    }
-}
-
 fn answer(text: &str) -> Result<Completion, ProviderError> {
     Ok(Completion {
         content: text.to_string(),
@@ -111,13 +89,7 @@ fn tool(name: &str, arguments: &str) -> Result<Completion, ProviderError> {
 #[test]
 fn runtime_events_pair_tool_ids_and_report_numeric_usage() {
     let fixture = Fixture::new("structured-events");
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
+    let config = Config::default();
     let provider = Scripted::new(vec![
         tool("sh", r#"{"command":"printf forbidden"}"#),
         priced_answer("denied"),
@@ -125,7 +97,7 @@ fn runtime_events_pair_tool_ids_and_report_numeric_usage() {
     let mut runtime = fixture.runtime(provider, &config);
     let mut events = Vec::new();
     runtime
-        .turn("work".into(), &mut Unattended, &mut |event| {
+        .turn("work".into(), &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -187,9 +159,7 @@ fn compaction_reports_its_usage_as_a_numeric_event() {
     ]);
     let mut runtime = fixture.runtime(provider, &config);
     for prompt in ["one", "two"] {
-        runtime
-            .turn(prompt.into(), &mut Unattended, &mut |_| Ok(()))
-            .unwrap();
+        runtime.turn(prompt.into(), &mut |_| Ok(())).unwrap();
     }
     let mut reported = Vec::new();
     runtime
@@ -204,222 +174,6 @@ fn compaction_reports_its_usage_as_a_numeric_event() {
     assert_eq!(reported[0].0.total(), 12);
     assert_eq!(reported[0].1.completions, 3);
     assert_eq!(reported[0].1.total_tokens(), 36);
-}
-
-struct Fixture {
-    root: PathBuf,
-    workspace: PathBuf,
-}
-
-#[test]
-fn endlessly_repeated_hook_questions_are_reported_and_bounded() {
-    let fixture = Fixture::new("question-bound");
-    let log = fixture.root.join("answers.jsonl");
-    let question = serde_json::json!({"question": {"id": "q", "text": "Again?", "choices": [
-        {"value": "yes", "label": "Yes"}, {"value": "no", "label": "No"}]}});
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "repeated".into(),
-            events: Some(vec!["initialize".into(), "answer".into()]),
-            command: vec![
-                support::SHELL.into(),
-                "-c".into(),
-                format!(
-                    "event=$(cat); case \"$event\" in *'\"event\":\"answer\"'*) printf '%s\\n' \"$event\" >> \"$1\" ;; esac; printf '%s' '{question}'"
-                ),
-                "repeated".into(),
-                log.display().to_string(),
-            ],
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let provider = Scripted::new(vec![answer("done")]);
-    let mut runtime = fixture.runtime(provider.clone(), &config);
-    let mut responder = Questions {
-        answer: Some("yes".into()),
-        attended: true,
-        asked: 0,
-    };
-    let mut notices = Vec::new();
-    runtime
-        .turn("work".into(), &mut responder, &mut |event| {
-            if let Event::Notice(text) = event {
-                notices.push(text);
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(responder.asked, 16);
-    assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 16);
-    assert!(
-        notices
-            .iter()
-            .any(|text| text.contains("operation limit (16)"))
-    );
-    assert!(!runtime.pending_hook_questions());
-    assert_eq!(provider.requests.lock().unwrap().len(), 1);
-}
-
-#[test]
-fn hook_questions_are_answered_before_requests_and_unattended_questions_are_skipped() {
-    for (case, value, attended) in [
-        ("answered", Some("yes"), true),
-        ("unattended", None, false),
-        ("skipped", None, true),
-        ("invalid", Some("other"), true),
-    ] {
-        let fixture = Fixture::new(&format!("question-{case}"));
-        let log = fixture.root.join("answer.json");
-        let question = serde_json::json!({"question": {"id": "q1", "text": "Publish?",
-            "choices": [{"value": "yes", "label": "Publish"}, {"value": "no", "label": "Discard"}]}});
-        let response = serde_json::json!({"state": {"answered": true}, "context": Message::user("decision context")});
-        let script = format!(
-            "event=$(cat); case \"$event\" in *'\"event\":\"initialize\"'*) printf '%s' '{question}' ;; *) printf '%s' \"$event\" > \"$1\"; printf '%s' '{response}' ;; esac"
-        );
-        let config = Config {
-            hooks: vec![HookConfig {
-                name: "question".into(),
-                events: Some(vec!["initialize".into(), "answer".into()]),
-                command: vec![
-                    support::SHELL.into(),
-                    "-c".into(),
-                    script,
-                    "question".into(),
-                    log.display().to_string(),
-                ],
-                timeout: Duration::from_secs(2),
-                max_output_bytes: 4096,
-            }],
-            ..Config::default()
-        };
-        let provider = Scripted::new(vec![answer("done")]);
-        let mut runtime = fixture.runtime(provider.clone(), &config);
-        let mut responder = Questions {
-            answer: value.map(str::to_string),
-            attended,
-            asked: 0,
-        };
-        let mut notices = Vec::new();
-        runtime
-            .turn("work".into(), &mut responder, &mut |event| {
-                if let Event::Notice(text) = event {
-                    notices.push(text);
-                }
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(responder.asked, usize::from(attended));
-        let event: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
-        assert_eq!(event["payload"]["attended"], attended);
-        assert_eq!(
-            event["payload"]["answer"],
-            serde_json::json!(value.filter(|v| *v != "other"))
-        );
-        assert!(!runtime.pending_hook_questions());
-        assert!(
-            provider.requests.lock().unwrap()[0]
-                .messages
-                .iter()
-                .any(|message| message.text_content() == "decision context")
-        );
-        assert_eq!(
-            runtime.session().hook_state("question").unwrap()["answered"],
-            true
-        );
-        if case == "invalid" {
-            assert!(notices.iter().any(|text| text.contains("invalid choice")));
-        }
-    }
-}
-
-#[test]
-fn hook_hints_follow_setup_turn_end_and_command_responses() {
-    let fixture = Fixture::new("hook-hints");
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "hint".into(),
-            events: Some(vec!["initialize".into(), "turn_end".into(), "command".into()]),
-            command: vec![support::SHELL.into(), "-c".into(),
-                "event=$(cat); case \"$event\" in *'\"event\":\"initialize\"'*) printf '{\"hint\":\"Ready\",\"commands\":[{\"name\":\"clear-hint\",\"help\":\"Clear hint\"}]}' ;; *'\"event\":\"turn_end\"'*) printf '{\"hint\":\"Review pending\"}' ;; *) printf '{\"hint\":\"\"}' ;; esac".into()],
-            timeout: Duration::from_secs(2), max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let mut runtime = fixture.runtime(Scripted::new(vec![answer("done")]), &config);
-    assert_eq!(runtime.hint(), Some("Ready"));
-    let mut hints = Vec::new();
-    let mut observer = |event| {
-        if let Event::Hint(hint) = event {
-            hints.push(hint);
-        }
-        Ok(())
-    };
-    runtime
-        .turn("work".into(), &mut Unattended, &mut observer)
-        .unwrap();
-    assert_eq!(runtime.hint(), Some("Review pending"));
-    runtime
-        .hook_command("clear-hint", "", &mut observer)
-        .unwrap();
-    assert_eq!(runtime.hint(), None);
-    assert_eq!(hints, [Some("Review pending".into()), None]);
-    runtime.new_session(false, None).unwrap();
-    runtime.take_startup_notices();
-    assert_eq!(runtime.hint(), Some("Ready"));
-}
-
-#[test]
-fn hook_commands_dispatch_to_the_owner_without_a_model_turn() {
-    let fixture = Fixture::new("hook-command");
-    let log = fixture.root.join("command.json");
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "owner".into(), events: Some(vec!["initialize".into(), "command".into()]),
-            command: vec![support::SHELL.into(), "-c".into(),
-                "event=$(cat); case \"$event\" in *'\"event\":\"initialize\"'*) printf '{\"commands\":[{\"name\":\"tasks\",\"help\":\"Show the task list\"}]}' ;; *) printf '%s' \"$event\" > \"$1\"; printf '{\"notice\":\"handled\",\"state\":{\"handled\":true}}' ;; esac".into(),
-                "owner".into(), log.display().to_string()],
-            timeout: Duration::from_secs(2), max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let provider = Scripted::new(vec![]);
-    let mut runtime = fixture.runtime(provider.clone(), &config);
-    assert_eq!(runtime.hook_commands()[0].name, "tasks");
-    assert_eq!(runtime.hook_commands()[0].help, "Show the task list");
-    runtime.set_interactive(true).unwrap();
-    let argument = "literal 'focus' $HOME\nsecond line";
-    let mut notices = Vec::new();
-    runtime
-        .hook_command("tasks", argument, &mut |event| {
-            if let Event::Notice(text) = event {
-                notices.push(text);
-            }
-            Ok(())
-        })
-        .unwrap();
-    let event: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
-    assert_eq!(event["event"], "command");
-    assert_eq!(event["payload"]["name"], "tasks");
-    assert_eq!(event["payload"]["argument"], argument);
-    assert_eq!(
-        runtime.session().hook_state("owner").unwrap()["handled"],
-        true
-    );
-    assert!(notices.iter().any(|text| text.contains("handled")));
-    runtime.new_session(false, None).unwrap();
-    assert_eq!(runtime.hook_commands().len(), 1);
-    assert!(
-        runtime
-            .hook_command("missing", "", &mut |_: Event| Ok(()))
-            .unwrap_err()
-            .contains("unknown command")
-    );
-    assert!(provider.requests.lock().unwrap().is_empty());
-    assert!(runtime.session().context_messages().unwrap().is_empty());
 }
 
 #[test]
@@ -465,36 +219,15 @@ fn turn_end_metadata_counts_rounds_and_identifies_the_last_entry_on_all_exits() 
         ),
     ] {
         let fixture = Fixture::new(&format!("turn-end-{case}"));
-        let log = fixture.root.join("event.json");
         let config = Config {
-            hooks: vec![HookConfig {
-                name: "end".into(),
-                events: Some(vec!["turn_end".into()]),
-                command: vec![
-                    support::SHELL.into(),
-                    "-c".into(),
-                    format!("cat > '{}'; printf '{{}}'", log.display()),
-                ],
-                timeout: Duration::from_secs(2),
-                max_output_bytes: 4096,
-            }],
             max_tool_rounds: limit.unwrap_or(Config::default().max_tool_rounds),
             ..Config::default()
         };
         let mut runtime = fixture.runtime(Scripted::new(responses), &config);
         // The round budget applies to unattended runs only.
-        let mut attended = Questions {
-            answer: None,
-            attended: true,
-            asked: 0,
-        };
-        let mut unattended = Unattended;
-        let responder: &mut dyn Responder = match limit {
-            Some(_) => &mut unattended,
-            None => &mut attended,
-        };
+        runtime.set_interactive(limit.is_none()).unwrap();
         let mut end = None;
-        let result = runtime.turn("work".into(), responder, &mut |event| {
+        let result = runtime.turn("work".into(), &mut |event| {
             if let Event::TurnEnd {
                 status,
                 tool_rounds,
@@ -508,176 +241,13 @@ fn turn_end_metadata_counts_rounds_and_identifies_the_last_entry_on_all_exits() 
         assert_eq!(result.is_ok(), status == "completed", "{case}: {result:?}");
         let id = runtime.session().active_leaf().unwrap();
         assert_eq!(end, Some((status, rounds, Some(id.to_string()))));
-        let event: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
-        assert_eq!(event["payload"]["status"], status);
-        assert_eq!(event["payload"]["tool_rounds"], rounds);
-        assert_eq!(event["payload"]["last_entry_id"], id);
         assert!(runtime.session().entry(id).is_some());
     }
 }
 
-#[test]
-fn entry_hooks_identify_saved_outcomes_and_read_only_tools() {
-    let fixture = Fixture::new("tool-entry");
-    let log = fixture.root.join("events.jsonl");
-    support::write(fixture.workspace.join("source"), "fixture text").unwrap();
-    let config = Config {
-        tools: ["sh", "cat"]
-            .into_iter()
-            .map(|name| ToolDirectory {
-                directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tools")
-                    .join(name),
-                enabled: true,
-            })
-            .collect(),
-        hooks: vec![HookConfig {
-            name: "record".into(),
-            events: Some(vec!["entry".into()]),
-            command: vec![
-                support::SHELL.into(),
-                "-c".into(),
-                format!(
-                    "cat >> '{}'; printf '\\n' >> '{}'; printf '{{}}'",
-                    log.display(),
-                    log.display()
-                ),
-            ],
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let calls = vec![
-        ToolCall::new("write", "sh", r#"{"command":"printf output"}"#),
-        ToolCall::new("read", "cat", r#"{"path":"source"}"#),
-        ToolCall::new("unknown", "missing", "{}"),
-    ];
-    let provider = Scripted::new(vec![
-        Ok(Completion {
-            tool_calls: calls.clone(),
-            ..Completion::default()
-        }),
-        answer("done"),
-    ]);
-    let mut runtime = fixture.runtime(provider, &config);
-    runtime
-        .turn("work".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let entries: Vec<_> = events
-        .iter()
-        .filter(|event| event["event"] == "entry" && event["payload"]["role"] == "tool")
-        .collect();
-    assert_eq!(entries.len(), calls.len());
-    let shell = PathBuf::from(
-        entries[0]["payload"]["tool"]["shell_state_directory"]
-            .as_str()
-            .unwrap(),
-    );
-    assert_eq!(
-        shell,
-        runtime.session().path().unwrap().with_extension("sh-state")
-    );
-    assert_eq!(
-        std::fs::read_to_string(shell.join("cwd"))
-            .unwrap()
-            .trim_end(),
-        fixture.workspace.to_str().unwrap()
-    );
-    assert!(entries[1]["payload"]["tool"]["shell_state_directory"].is_null());
-    for (index, event) in entries.iter().enumerate() {
-        let payload = &event["payload"];
-        assert_eq!(
-            payload["tool_call"],
-            serde_json::to_value(&calls[index]).unwrap()
-        );
-        assert_eq!(payload["tool"]["read_only"], index == 1);
-        assert_eq!(
-            payload["outcome"],
-            if index < 2 {
-                "completed"
-            } else {
-                "not_started"
-            }
-        );
-        let entry = runtime
-            .session()
-            .entry(payload["id"].as_str().unwrap())
-            .unwrap();
-        let message: Message = serde_json::from_value(entry.data.clone()).unwrap();
-        assert_eq!(payload["tool_result"]["content"], message.text_content());
-        assert_eq!(payload["tool_result_truncated"], false);
-    }
-}
-
-#[test]
-fn entry_hooks_bound_unicode_text_without_truncating_the_saved_result() {
-    let fixture = Fixture::new("bounded-tool-entry");
-    let log = fixture.root.join("event.json");
-    let result = fixture.root.join("result.json");
-    let text = format!("x{}", "🦀".repeat(20_000));
-    support::write(
-        &result,
-        serde_json::json!({"tool_result": {
-            "content": text, "is_error": false,
-        }})
-        .to_string(),
-    )
-    .unwrap();
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "record".into(),
-            events: Some(vec![
-                "initialize".into(),
-                "tool_execute".into(),
-                "entry".into(),
-            ]),
-            command: vec![
-                support::SHELL.into(),
-                "-c".into(),
-                format!(
-                    r#"body=$(cat)
-case "$body" in
-  *'"event":"initialize"'*) printf '%s' '{{"tools":[{{"name":"large","description":"fixture","parameters":{{"type":"object"}}}}]}}';;
-  *'"event":"tool_execute"'*) cat '{}';;
-  *'"role":"tool"'*) printf '%s' "$body" > '{}'; printf '{{}}';;
-  *) printf '{{}}';;
-esac"#,
-                    result.display(),
-                    log.display()
-                ),
-            ],
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 128 * 1024,
-        }],
-        ..Config::default()
-    };
-    let mut runtime = fixture.runtime(
-        Scripted::new(vec![tool("large", "{}"), answer("done")]),
-        &config,
-    );
-    runtime
-        .turn("work".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    let event: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
-    let payload = &event["payload"];
-    let clipped = payload["tool_result"]["content"].as_str().unwrap();
-    assert!(clipped.len() <= 64 * 1024);
-    assert_eq!(payload["tool_result_truncated"], true);
-    assert!(text.starts_with(clipped));
-    let entry = runtime
-        .session()
-        .entry(payload["id"].as_str().unwrap())
-        .unwrap();
-    let saved: Message = serde_json::from_value(entry.data.clone()).unwrap();
-    assert_eq!(saved.text_content(), text);
+struct Fixture {
+    root: PathBuf,
+    workspace: PathBuf,
 }
 
 impl Fixture {
@@ -693,14 +263,7 @@ impl Fixture {
     fn runtime(&self, provider: Arc<dyn Provider>, config: &Config) -> Runtime {
         let store = Store::with_root(&self.workspace, self.root.join("state")).unwrap();
         let session = store.create(false, None).unwrap();
-        let mut config = config.clone();
-        if config.tools.is_empty() {
-            config.tools.push(ToolDirectory {
-                directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-                enabled: true,
-            });
-        }
-        Runtime::new(provider, store, session, &config, "test/model".to_string()).unwrap()
+        Runtime::new(provider, store, session, config, "test/model".to_string()).unwrap()
     }
 }
 
@@ -711,258 +274,38 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn reset_removes_what_the_user_added_and_continues_with_the_configured_tools() {
+fn reset_removes_what_the_user_added_and_keeps_the_built_in_tools() {
     let fixture = Fixture::new("reset");
-    let global = fixture.root.join("global");
-    let store = Store::with_root(&fixture.workspace, global.join("sessions")).unwrap();
+    let directory = fixture.root.join("global");
+    let store = Store::with_root(&fixture.workspace, directory.clone()).unwrap();
     let session = store.create(false, None).unwrap();
     let old = session.path().unwrap().to_path_buf();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: false,
-        }],
-        ..Config::default()
-    };
-    let mut runtime = Runtime::with_options(
+    assert!(old.starts_with(directory.join("sessions")));
+    let mut runtime = Runtime::new(
         Scripted::new(vec![]),
         store,
         session,
-        &config,
+        &Config::default(),
         "test/model".into(),
-        Options {
-            tools: Some(Registry::load_config(&config).unwrap()),
-            tool_state_directory: Some(global.clone()),
-        },
     )
     .unwrap();
-    runtime
-        .set_tool_state("sh", ToolState::Enabled, true)
-        .unwrap();
-    assert!(runtime.tool_statuses().unwrap()[0].enabled);
-    support::write(global.join("gears.toml"), "version = 1\n").unwrap();
-    support::write(global.join("local.key"), "key").unwrap();
+    support::write(directory.join("gears.toml"), "version = 1\n").unwrap();
+    support::write(directory.join("local.key"), "key").unwrap();
     std::fs::create_dir_all(fixture.workspace.join(".gears")).unwrap();
     support::write(fixture.workspace.join(".gears/MEMORY.md"), "fact").unwrap();
     runtime.reset().unwrap();
-    assert!(global.join("gears.toml").is_file());
-    assert!(!global.join("local.key").exists());
-    assert!(!global.join("tools.toml").exists());
+    assert!(directory.join("gears.toml").is_file());
+    assert!(!directory.join("local.key").exists());
     assert!(!old.exists());
     assert!(!fixture.workspace.join(".gears").exists());
     assert!(runtime.session().path().unwrap().is_file());
-    assert!(!runtime.tool_statuses().unwrap()[0].enabled);
-}
-
-#[test]
-fn tool_toggles_update_the_next_request_and_preserve_scope_precedence() {
-    let fixture = Fixture::new("tool-toggles");
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let session = store.create(false, None).unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let registry = Registry::load_config(&config).unwrap();
-    let provider = Scripted::new(vec![answer("one"), answer("two"), answer("three")]);
-    let mut runtime = Runtime::with_options(
-        provider.clone(),
-        store,
-        session,
-        &config,
-        "test/model".into(),
-        Options {
-            tools: Some(registry),
-            tool_state_directory: Some(fixture.root.join("global")),
-        },
-    )
-    .unwrap();
-    runtime
-        .turn("first".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    let enabled_identity = runtime.session().latest_runtime_identity().unwrap();
-    runtime
-        .set_tool_state("sh", ToolState::Disabled, false)
-        .unwrap();
-    runtime
-        .turn("second".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    let disabled_identity = runtime.session().latest_runtime_identity().unwrap();
-    runtime
-        .set_tool_state("sh", ToolState::Enabled, true)
-        .unwrap();
-    assert_eq!(runtime.tool_statuses().unwrap()[0].source, "session");
-    assert!(!runtime.tool_statuses().unwrap()[0].enabled);
-    runtime
-        .set_tool_state("sh", ToolState::Inherit, false)
-        .unwrap();
-    assert_eq!(runtime.tool_statuses().unwrap()[0].source, "global");
-    runtime
-        .turn("third".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[0].tools.iter().any(|spec| spec.name == "sh"));
-    assert!(!requests[1].tools.iter().any(|spec| spec.name == "sh"));
-    assert!(requests[2].tools.iter().any(|spec| spec.name == "sh"));
-    assert_ne!(
-        enabled_identity.manifest_hash,
-        disabled_identity.manifest_hash
-    );
-    assert_eq!(
-        enabled_identity.manifest_hash,
-        runtime
-            .session()
-            .latest_runtime_identity()
-            .unwrap()
-            .manifest_hash
-    );
-}
-
-#[test]
-fn empty_tool_configuration_is_chat_only() {
-    let fixture = Fixture::new("chat-only");
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let session = store.create(false, None).unwrap();
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":": > must-not-exist"}"#),
-        answer("done"),
-    ]);
-    let mut runtime = Runtime::new(
-        provider.clone(),
-        store,
-        session,
-        &Config::default(),
-        "test/model".to_string(),
-    )
-    .unwrap();
-    runtime
-        .turn("hello".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    let requests = provider.requests.lock().unwrap();
-    assert!(requests[0].tools.is_empty());
-    assert!(
-        requests[1]
-            .messages
-            .iter()
-            .any(|message| message.text_content().contains("unknown or disabled tool"))
-    );
-    assert!(!fixture.workspace.join("must-not-exist").exists());
-}
-
-#[test]
-fn configured_directory_tool_is_advertised_and_executed() {
-    let fixture = Fixture::new("directory-tool");
-    let directory = fixture.root.join("print-tool");
-    std::fs::create_dir_all(&directory).unwrap();
-    support::write(
-        directory.join("parameters.json"),
-        r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#,
-    )
-    .unwrap();
-    support::write(
-        directory.join("tool.toml"),
-        r#"
-version = 1
-kind = "process"
-name = "print"
-description = "Print one string"
-parameters = "parameters.json"
-display = "{text}"
-read_only = true
-[process]
-output = "stdout"
-[process.command]
-linux = ["/bin/sh", "-c", "shift; printf '%s' \"$@\"", "fixture"]
-motor = ["/system/bin/rush", "-c", "shift; printf '%s' \"$@\"", "fixture"]
-[process.arguments]
-after_double_dash = ["text"]
-[process.arguments.text]
-type = "string"
-"#,
-    )
-    .unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: directory.clone(),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let provider = Scripted::new(vec![
-        tool("print", r#"{"text":"two words"}"#),
-        answer("done"),
-    ]);
-    let mut runtime = fixture.runtime(provider.clone(), &config);
-    let mut output = String::new();
-    let mut detail = String::new();
-    runtime
-        .turn("print".to_string(), &mut Unattended, &mut |event| {
-            match event {
-                Event::ToolOutput { name, text, .. } => {
-                    assert_eq!(name, "print");
-                    output.push_str(&text);
-                }
-                Event::ToolStart { detail: shown, .. } => detail = shown,
-                _ => {}
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(output, "two words");
-    assert_eq!(detail, "\"two words\"");
-    let requests = provider.requests.lock().unwrap();
-    assert!(requests[0].tools.iter().any(|spec| spec.name == "print"));
-    assert!(
-        requests[1]
-            .messages
-            .iter()
-            .any(|message| message.text_content() == "two words")
-    );
-    drop(requests);
-
-    let provider = Scripted::new(vec![tool("print", "{}"), answer("done")]);
-    let mut runtime = fixture.runtime(provider.clone(), &config);
-    runtime
-        .turn("print".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    assert!(
-        provider.requests.lock().unwrap()[1]
-            .messages
-            .iter()
-            .any(|message| message.text_content().contains("display needs argument"))
-    );
-
-    let mut disabled = config;
-    disabled.tools[0].enabled = false;
-    let provider = Scripted::new(vec![tool("print", r#"{"text":"not run"}"#), answer("done")]);
-    let mut runtime = fixture.runtime(provider.clone(), &disabled);
-    runtime
-        .turn("print".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    let requests = provider.requests.lock().unwrap();
-    assert!(!requests[0].tools.iter().any(|spec| spec.name == "print"));
-    assert!(
-        requests[1]
-            .messages
-            .iter()
-            .any(|message| message.text_content().contains("unknown or disabled tool"))
-    );
+    assert!(runtime.tools().get("sh").is_some());
 }
 
 #[test]
 fn shipped_sh_tool_runs_from_its_directory() {
     let fixture = Fixture::new("shipped-sh");
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
+    let config = Config::default();
     let provider = Scripted::new(vec![
         tool(
             "sh",
@@ -972,7 +315,7 @@ fn shipped_sh_tool_runs_from_its_directory() {
     ]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
     runtime
-        .turn("make it".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("make it".to_string(), &mut |_| Ok(()))
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("result.txt")).unwrap(),
@@ -1001,13 +344,7 @@ fn shipped_sh_tool_runs_from_its_directory() {
 fn shipped_sh_restores_directory_and_exports_after_resume() {
     let fixture = Fixture::new("sh-state-resume");
     std::fs::create_dir(fixture.workspace.join("nested")).unwrap();
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
+    let config = Config::default();
     let provider = Scripted::new(vec![
         tool(
             "sh",
@@ -1021,7 +358,7 @@ fn shipped_sh_restores_directory_and_exports_after_resume() {
     ]);
     let mut runtime = fixture.runtime(provider, &config);
     runtime
-        .turn("set state".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("set state".to_string(), &mut |_| Ok(()))
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("nested/first.txt")).unwrap(),
@@ -1046,7 +383,7 @@ fn shipped_sh_restores_directory_and_exports_after_resume() {
     let mut resumed =
         Runtime::new(provider, store, session, &config, "test/model".to_string()).unwrap();
     resumed
-        .turn("use state".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("use state".to_string(), &mut |_| Ok(()))
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("nested/resumed.txt")).unwrap(),
@@ -1057,13 +394,7 @@ fn shipped_sh_restores_directory_and_exports_after_resume() {
 #[test]
 fn shipped_sh_uses_a_bounded_per_call_timeout() {
     let fixture = Fixture::new("sh-call-timeout");
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/sh"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
+    let config = Config::default();
     let provider = Scripted::new(vec![
         tool("sh", r#"{"command":"export SH_TEST_VALUE=kept"}"#),
         tool(
@@ -1081,9 +412,7 @@ fn shipped_sh_uses_a_bounded_per_call_timeout() {
         answer("done"),
     ]);
     let mut runtime = fixture.runtime(provider, &config);
-    runtime
-        .turn("run".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
+    runtime.turn("run".to_string(), &mut |_| Ok(())).unwrap();
     assert!(!fixture.workspace.join("unstarted.txt").exists());
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("state.txt")).unwrap(),
@@ -1103,7 +432,7 @@ fn shipped_sh_uses_a_bounded_per_call_timeout() {
     assert!(
         results
             .iter()
-            .any(|result| result.contains("between 1 and 120 seconds"))
+            .any(|result| result.contains("from 1 to 120 seconds"))
     );
     assert!(
         results
@@ -1111,211 +440,6 @@ fn shipped_sh_uses_a_bounded_per_call_timeout() {
             .any(|result| result.contains("timed out after 1s"))
     );
 }
-
-/// Run shipped tool `name` once per argument object in one turn, collecting its output.
-fn run_shipped(fixture: &Fixture, name: &str, calls: &[&str]) -> (String, Runtime) {
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tools")
-                .join(name),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let mut script: Vec<_> = calls.iter().map(|call| tool(name, call)).collect();
-    script.push(answer("done"));
-    let mut runtime = fixture.runtime(Scripted::new(script), &config);
-    let mut output = String::new();
-    runtime
-        .turn("use it".into(), &mut Unattended, &mut |event| {
-            if let Event::ToolOutput { text, .. } = event {
-                output.push_str(&text);
-            }
-            Ok(())
-        })
-        .unwrap();
-    (output, runtime)
-}
-
-#[test]
-fn shipped_read_tools_pass_spaces_globs_and_leading_dashes_literally() {
-    // Tool, workspace files, argument objects, and what the output must show.
-    type Case<'a> = (
-        &'a str,
-        &'a [(&'a str, &'a str)],
-        &'a [&'a str],
-        fn(&str) -> bool,
-    );
-    let lines = [("-input [glob].txt", "first\nsecond\nthird\n")];
-    let limited = [r#"{"lines":2,"path":"-input [glob].txt"}"#];
-    let cases: [Case; 6] = [
-        (
-            "ls",
-            &[
-                ("dir with spaces/literal[?].txt", "data"),
-                ("-lh/marker.txt", "data"),
-            ],
-            &[r#"{"path":"dir with spaces"}"#, r#"{"path":"-lh"}"#],
-            |out| out.contains("literal[?].txt") && out.contains("marker.txt"),
-        ),
-        ("head", &lines, &limited, |out| out == "first\nsecond\n"),
-        ("tail", &lines, &limited, |out| out == "second\nthird\n"),
-        (
-            "wc",
-            &[("-count [glob].txt", "one\ntwo\n")],
-            &[r#"{"mode":"lines","path":"-count [glob].txt"}"#],
-            |out| out.trim_start().starts_with("2 ") && out.contains("-count [glob].txt"),
-        ),
-        (
-            "cat",
-            &[("-read [glob].txt", "literal contents\n")],
-            &[if cfg!(unix) {
-                r#"{"path":"-read [glob].txt"}"#
-            } else {
-                r#"{"path":"./-read [glob].txt"}"#
-            }],
-            |out| out == "literal contents\n",
-        ),
-        (
-            "find",
-            &[
-                ("dir [glob]/wanted file.txt", "yes"),
-                ("dir [glob]/other.txt", "no"),
-            ],
-            &[r#"{"path":"dir [glob]","name":"wanted*","type":"file"}"#],
-            |out| out.contains("dir [glob]/wanted file.txt") && !out.contains("other.txt"),
-        ),
-    ];
-    for (name, files, calls, check) in cases {
-        let fixture = Fixture::new(&format!("shipped-{name}"));
-        for (path, text) in files {
-            let path = fixture.workspace.join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            support::write(path, text).unwrap();
-        }
-        let (output, _) = run_shipped(&fixture, name, calls);
-        assert!(check(&output), "{name}: {output}");
-    }
-}
-
-#[test]
-fn shipped_curl_returns_headers_without_following_redirects() {
-    let server = MockServer::start(vec![
-        Script::new().write(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"),
-        Script::new().write(b"HTTP/1.1 302 Found\r\nLocation: /destination\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-    ])
-    .unwrap();
-    let fixture = Fixture::new("shipped-curl");
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/curl"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let provider = Scripted::new(vec![
-        tool(
-            "curl",
-            &serde_json::json!({"url": server.url("/ok")}).to_string(),
-        ),
-        tool(
-            "curl",
-            &serde_json::json!({"url": server.url("/redirect")}).to_string(),
-        ),
-        answer("done"),
-    ]);
-    let mut runtime = fixture.runtime(provider, &config);
-    let mut output = String::new();
-    runtime
-        .turn("fetch".to_string(), &mut Unattended, &mut |event| {
-            if let Event::ToolOutput { name, text, .. } = event {
-                assert_eq!(name, "curl");
-                output.push_str(&text);
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert!(
-        output.contains("HTTP/1.1 200 OK") && output.contains("hello"),
-        "{output}"
-    );
-    assert!(
-        output.contains("HTTP/1.1 302 Found") && output.contains("Location: /destination"),
-        "{output}"
-    );
-    let requests = server.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].target, "/ok");
-    assert_eq!(requests[1].target, "/redirect");
-}
-
-#[test]
-fn shipped_diff_treats_differences_as_a_normal_result() {
-    let fixture = Fixture::new("shipped-diff");
-    support::write(fixture.workspace.join("old [file].txt"), "old\n").unwrap();
-    support::write(fixture.workspace.join("new [file].txt"), "new\n").unwrap();
-    let (_, runtime) = run_shipped(
-        &fixture,
-        "diff",
-        &[
-            r#"{"left":"old [file].txt","right":"new [file].txt"}"#,
-            r#"{"left":"old [file].txt","right":"missing"}"#,
-        ],
-    );
-    let results = runtime
-        .session()
-        .context_messages()
-        .unwrap()
-        .into_iter()
-        .flat_map(|message| message.content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_name,
-                content,
-                is_error,
-                ..
-            } if tool_name == "diff" => Some((content, is_error)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(results.len(), 2);
-    assert!(!results[0].1, "{}", results[0].0);
-    assert!(results[0].0.contains("old") && results[0].0.contains("new"));
-    assert!(results[1].1);
-    assert!(results[1].0.contains("exit status 2"), "{}", results[1].0);
-}
-
-#[test]
-fn shipped_sed_maps_script_and_literal_path_without_a_shell() {
-    let fixture = Fixture::new("shipped-sed");
-    let path = fixture.workspace.join("a * b.txt");
-    support::write(&path, "first line\n").unwrap();
-    let (output, _) = run_shipped(
-        &fixture,
-        "sed",
-        &[r#"{"script":"s/first/second/","path":"a * b.txt"}"#],
-    );
-    assert!(output.contains("second line"), "{output}");
-    assert_eq!(std::fs::read_to_string(path).unwrap(), "first line\n");
-}
-
-#[cfg(unix)]
-#[test]
-fn shipped_lorry_is_listed_but_unavailable_on_linux() {
-    let config = Config {
-        tools: vec![ToolDirectory {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/lorry"),
-            enabled: true,
-        }],
-        ..Config::default()
-    };
-    let registry = Registry::load_config(&config).unwrap();
-    assert_eq!(registry.tools()[0].name, "lorry");
-    assert!(!registry.tools()[0].read_only);
-    assert!(registry.enabled("lorry").is_none());
-}
-
 #[test]
 fn text_only_turn_streams_and_is_durable() {
     let fixture = Fixture::new("text");
@@ -1323,7 +447,7 @@ fn text_only_turn_streams_and_is_durable() {
     let mut runtime = fixture.runtime(provider, &Config::default());
     let mut events = Vec::new();
     runtime
-        .turn("question".to_string(), &mut Unattended, &mut |event| {
+        .turn("question".to_string(), &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -1348,7 +472,7 @@ fn reasoning_only_reply_is_an_error_without_an_empty_assistant_message() {
     })]);
     let mut runtime = fixture.runtime(provider, &Config::default());
     let error = runtime
-        .turn("question".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("question".to_string(), &mut |_| Ok(()))
         .unwrap_err();
     assert!(error.contains("empty reply"), "{error}");
     let messages = runtime.session().context_messages().unwrap();
@@ -1366,7 +490,7 @@ fn zero_tool_round_budget_reports_an_error_instead_of_panicking() {
     let provider = Scripted::new(Vec::new());
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let error = runtime
-        .turn("question".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("question".to_string(), &mut |_| Ok(()))
         .unwrap_err();
     assert!(error.contains("tool round limit (0) reached"), "{error}");
     assert!(provider.requests.lock().unwrap().is_empty());
@@ -1389,7 +513,7 @@ fn tool_round_limit_stops_after_the_last_result() {
     let provider = Scripted::new(vec![tool("sh", r#"{"command":": > no-file"}"#)]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
     let error = runtime
-        .turn("question".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("question".to_string(), &mut |_| Ok(()))
         .unwrap_err();
     assert!(error.contains("tool round limit (1) reached"), "{error}");
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
@@ -1400,7 +524,7 @@ fn tool_round_limit_stops_after_the_last_result() {
 }
 
 #[test]
-fn an_attended_turn_runs_past_the_round_budget() {
+fn an_interactive_turn_runs_past_the_round_budget() {
     let fixture = Fixture::new("attended-rounds");
     let config = Config {
         max_tool_rounds: 1,
@@ -1412,27 +536,19 @@ fn an_attended_turn_runs_past_the_round_budget() {
         answer("done"),
     ]);
     let mut runtime = fixture.runtime(provider.clone(), &config);
+    runtime.set_interactive(true).unwrap();
     let mut rounds = None;
     runtime
-        .turn(
-            "question".to_string(),
-            &mut Questions {
-                answer: None,
-                attended: true,
-                asked: 0,
-            },
-            &mut |event| {
-                if let Event::TurnEnd { tool_rounds, .. } = event {
-                    rounds = Some(tool_rounds);
-                }
-                Ok(())
-            },
-        )
+        .turn("question".to_string(), &mut |event| {
+            if let Event::TurnEnd { tool_rounds, .. } = event {
+                rounds = Some(tool_rounds);
+            }
+            Ok(())
+        })
         .unwrap();
     assert_eq!(provider.requests.lock().unwrap().len(), 3);
     assert_eq!(rounds, Some(2));
 }
-
 #[test]
 fn an_unattended_sh_call_runs_in_the_workspace() {
     let fixture = Fixture::new("sh");
@@ -1442,115 +558,11 @@ fn an_unattended_sh_call_runs_in_the_workspace() {
     ]);
     let mut runtime = fixture.runtime(provider, &Config::default());
     runtime
-        .turn("make it".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("make it".to_string(), &mut |_| Ok(()))
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("result.txt")).unwrap(),
         "made"
-    );
-}
-
-#[test]
-fn a_hook_can_register_and_execute_a_tool() {
-    let fixture = Fixture::new("hook");
-    let hook = fixture.root.join("hook.sh");
-    support::write(
-        &hook,
-        r#"#!/bin/sh
-test -z "$OPENROUTER_API_KEY" || exit 9
-event=$(cat)
-case "$event" in
-  *'"event":"initialize"'*)
-    printf '%s' '{"tools":[{"name":"echo_hook","description":"fixture","parameters":{"type":"object"}}],"state":{"ready":true}}'
-    ;;
-  *'"event":"tool_execute"'*)
-    printf '%s' '{"tool_result":{"content":"hook executed","is_error":false}}'
-    ;;
-  *)
-    printf '%s' '{}'
-    ;;
-esac
-"#,
-    )
-    .unwrap();
-    let mut config = Config::default();
-    config.hooks.push(HookConfig {
-        events: None,
-        name: "fixture".to_string(),
-        command: vec![support::SHELL.to_string(), hook.display().to_string()],
-        timeout: Duration::from_secs(2),
-        max_output_bytes: 64 * 1024,
-    });
-    let provider = Scripted::new(vec![tool("echo_hook", "{}"), answer("done")]);
-    let mut runtime = fixture.runtime(provider, &config);
-    runtime
-        .turn("use hook".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    assert!(
-        runtime
-            .session()
-            .context_messages()
-            .unwrap()
-            .iter()
-            .any(|message| message.text_content() == "hook executed")
-    );
-    assert_eq!(
-        runtime.session().hook_state("fixture").unwrap()["ready"],
-        true
-    );
-}
-
-#[test]
-fn failed_tool_notice_keeps_the_executed_hook_result() {
-    let fixture = Fixture::new("hook-notice-error");
-    let hook = fixture.root.join("hook.sh");
-    support::write(
-        &hook,
-        r#"#!/bin/sh
-event=$(cat)
-case "$event" in
-  *'"event":"initialize"'*)
-    printf '%s' '{"tools":[{"name":"echo_hook","description":"fixture","parameters":{"type":"object"}}]}'
-    ;;
-  *'"event":"tool_execute"'*)
-    printf '%s' '{"tool_result":{"content":"executed once","is_error":false},"notice":"finished"}'
-    ;;
-  *) printf '%s' '{}';;
-esac
-"#,
-    )
-    .unwrap();
-    let mut config = Config::default();
-    config.hooks.push(HookConfig {
-        events: None,
-        name: "fixture".to_string(),
-        command: vec![support::SHELL.to_string(), hook.display().to_string()],
-        timeout: Duration::from_secs(2),
-        max_output_bytes: 4096,
-    });
-    let mut runtime = fixture.runtime(Scripted::new(vec![tool("echo_hook", "{}")]), &config);
-    let error = runtime
-        .turn("go".to_string(), &mut Unattended, &mut |event| {
-            if matches!(event, Event::Notice(ref message) if message.contains("finished")) {
-                Err("notice display failed".to_string())
-            } else {
-                Ok(())
-            }
-        })
-        .unwrap_err();
-    assert!(error.contains("notice display failed"));
-    let context = runtime.session().context_messages().unwrap();
-    assert!(
-        context
-            .iter()
-            .any(|message| message.text_content() == "executed once")
-    );
-    assert_eq!(
-        context
-            .iter()
-            .filter(|message| message.role == gears::provider::Role::Tool)
-            .count(),
-        1
     );
 }
 
@@ -1573,9 +585,7 @@ fn manual_compaction_appends_a_checkpoint_without_deleting_history() {
     };
     let mut runtime = fixture.runtime(provider.clone(), &config);
     for prompt in ["one", "two", "three"] {
-        runtime
-            .turn(prompt.to_string(), &mut Unattended, &mut |_| Ok(()))
-            .unwrap();
+        runtime.turn(prompt.to_string(), &mut |_| Ok(())).unwrap();
     }
     let entries_before = runtime.session().entries().len();
     runtime.compact(None, &mut |_| Ok(())).unwrap();
@@ -1614,7 +624,7 @@ fn compaction_bounds_a_large_tool_result_sent_to_the_summarizer() {
     let provider = Scripted::new(vec![answer("summary")]);
     let config = Config {
         context: ContextConfig {
-            window_tokens: 800,
+            window_tokens: 2000,
             output_reserve_tokens: 200,
             recent_tail_tokens: 50,
         },
@@ -1632,7 +642,7 @@ fn compaction_bounds_a_large_tool_result_sent_to_the_summarizer() {
     let requests = provider.requests.lock().unwrap();
     let request = requests.last().unwrap();
     let bytes = serde_json::to_vec(&(&request.system, &request.messages)).unwrap();
-    assert!(bytes.len() < 800 * 4, "summarizer input is too large");
+    assert!(bytes.len() < 2000 * 4, "summarizer input is too large");
     assert!(request.messages[0].text_content().contains("[truncated]"));
 }
 
@@ -1645,7 +655,7 @@ fn provider_failures_are_recorded() {
     let mut runtime = fixture.runtime(provider, &Config::default());
     assert!(
         runtime
-            .turn("question".to_string(), &mut Unattended, &mut |_| Ok(()),)
+            .turn("question".to_string(), &mut |_| Ok(()),)
             .is_err()
     );
     assert!(
@@ -1662,7 +672,7 @@ fn an_oversized_first_turn_records_its_error() {
     let fixture = Fixture::new("oversized-first-turn");
     let config = Config {
         context: ContextConfig {
-            window_tokens: 800,
+            window_tokens: 2000,
             output_reserve_tokens: 200,
             recent_tail_tokens: 50,
         },
@@ -1670,9 +680,7 @@ fn an_oversized_first_turn_records_its_error() {
     };
     let mut runtime = fixture.runtime(Scripted::new(Vec::new()), &config);
     let error = runtime
-        .turn("large input ".repeat(10_000), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("large input ".repeat(10_000), &mut |_| Ok(()))
         .unwrap_err();
     assert!(error.contains("limit"), "{error}");
     assert!(runtime.session().entries().iter().any(|entry| {
@@ -1695,9 +703,7 @@ fn resume_restores_context_model_and_cumulative_usage() {
     )
     .unwrap();
     runtime
-        .turn("first question".to_string(), &mut Unattended, &mut |_| {
-            Ok(())
-        })
+        .turn("first question".to_string(), &mut |_| Ok(()))
         .unwrap();
     let id = runtime.summary().id;
     drop(runtime);
@@ -1716,7 +722,7 @@ fn resume_restores_context_model_and_cumulative_usage() {
     assert_eq!(resumed.model(), "test/one");
     assert_eq!(resumed.usage().total_tokens(), 12);
     resumed
-        .turn("follow up".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("follow up".to_string(), &mut |_| Ok(()))
         .unwrap();
     let requests = second.requests.lock().unwrap();
     assert!(
@@ -1762,9 +768,7 @@ fn resume_reports_discarded_crash_tail_and_completes_a_new_turn() {
             .iter()
             .any(|notice| notice.contains("discarded 2 incomplete session records"))
     );
-    runtime
-        .turn("next".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
+    runtime.turn("next".to_string(), &mut |_| Ok(())).unwrap();
     assert_eq!(runtime.session().context_messages().unwrap().len(), 3);
 }
 
@@ -1782,15 +786,11 @@ fn a_provider_switch_is_recorded_and_used_on_the_next_turn() {
             Err(format!("unknown provider {name}"))
         }
     }));
-    runtime
-        .turn("one".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
+    runtime.turn("one".to_string(), &mut |_| Ok(())).unwrap();
     runtime.set_provider("second", &mut |_| Ok(())).unwrap();
     assert_eq!(runtime.provider_name(), "second");
     assert_eq!(runtime.session().provider().as_deref(), Some("second"));
-    runtime
-        .turn("two".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
+    runtime.turn("two".to_string(), &mut |_| Ok(())).unwrap();
     assert_eq!(first.requests.lock().unwrap().len(), 1);
     assert_eq!(second.requests.lock().unwrap().len(), 1);
     assert!(
@@ -1825,7 +825,7 @@ fn switched_provider_sees_reasoning_cache_markers_and_retry_notice() {
             .unwrap()
             .with_quirks(Quirks::for_host("openrouter.ai"));
         Arc::new(
-            OpenAiCompat::new(HostCurl::new(policy).unwrap(), endpoint)
+            OpenAiCompat::new(MotorCurl::new(policy).unwrap(), endpoint)
                 .without_key()
                 .with_cache_identity(name),
         )
@@ -1842,13 +842,11 @@ fn switched_provider_sees_reasoning_cache_markers_and_retry_notice() {
             Err(format!("unknown provider {name}"))
         }
     }));
-    runtime
-        .turn("one".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
+    runtime.turn("one".into(), &mut |_| Ok(())).unwrap();
     runtime.set_provider("second", &mut |_| Ok(())).unwrap();
     let mut events = Vec::new();
     runtime
-        .turn("two".into(), &mut Unattended, &mut |event| {
+        .turn("two".into(), &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -1918,9 +916,7 @@ fn resuming_another_session_restores_its_provider() {
     }));
     runtime.resume(&second_id).unwrap();
     assert_eq!(runtime.provider_name(), "second");
-    runtime
-        .turn("hello".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
+    runtime.turn("hello".to_string(), &mut |_| Ok(())).unwrap();
     assert!(first.requests.lock().unwrap().is_empty());
     assert_eq!(second.requests.lock().unwrap().len(), 1);
 }
@@ -1948,7 +944,7 @@ fn cancellation_stops_a_streaming_turn_and_records_it() {
     let cancellation = runtime.cancellation();
     let mut saw_text = false;
     let error = runtime
-        .turn("keep going".to_string(), &mut Unattended, &mut |event| {
+        .turn("keep going".to_string(), &mut |event| {
             if matches!(event, Event::Text(_)) {
                 saw_text = true;
                 cancellation.cancel();
@@ -1968,52 +964,6 @@ fn cancellation_stops_a_streaming_turn_and_records_it() {
 }
 
 #[test]
-fn lifecycle_hooks_run_after_a_cancelled_turn() {
-    let fixture = Fixture::new("cancel-hooks");
-    let log = fixture.root.join("events.jsonl");
-    let hook = fixture.root.join("hook.sh");
-    support::write(
-        &hook,
-        format!(
-            "#!/bin/sh\ncat >> '{}'\nprintf '\\n' >> '{}'\nprintf '{{}}'\n",
-            log.display(),
-            log.display()
-        ),
-    )
-    .unwrap();
-    let mut config = Config::default();
-    config.hooks.push(HookConfig {
-        events: None,
-        name: "log".to_string(),
-        command: vec![support::SHELL.to_string(), hook.display().to_string()],
-        timeout: Duration::from_secs(2),
-        max_output_bytes: 4096,
-    });
-    let mut runtime = fixture.runtime(Arc::new(UntilCancelled), &config);
-    let cancellation = runtime.cancellation();
-    let mut saw_text = false;
-    let error = runtime
-        .turn("interrupt".to_string(), &mut Unattended, &mut |event| {
-            if matches!(event, Event::Text(_)) {
-                saw_text = true;
-                cancellation.cancel();
-            }
-            Ok(())
-        })
-        .unwrap_err();
-    assert!(saw_text);
-    assert!(error.contains("cancelled"), "{error}");
-    runtime.new_session(false, None).unwrap();
-    runtime.close();
-    let events = std::fs::read_to_string(log).unwrap();
-    assert!(events.contains("\"event\":\"turn_end\""), "{events}");
-    assert!(events.contains("\"status\":\"cancelled\""), "{events}");
-    assert!(events.contains("\"type\":\"turn_error\""), "{events}");
-    assert_eq!(events.matches("\"event\":\"session_start\"").count(), 2);
-    assert_eq!(events.matches("\"event\":\"session_end\"").count(), 2);
-}
-
-#[test]
 fn cancellation_pairs_every_call_in_a_tool_round() {
     let fixture = Fixture::new("cancel-round");
     let provider = Scripted::new(vec![Ok(Completion {
@@ -2028,7 +978,7 @@ fn cancellation_pairs_every_call_in_a_tool_round() {
     let cancellation = runtime.cancellation();
     let mut saw_output = false;
     let error = runtime
-        .turn("go".to_string(), &mut Unattended, &mut |event| {
+        .turn("go".to_string(), &mut |event| {
             if matches!(event, Event::ToolOutput { .. }) {
                 saw_output = true;
                 cancellation.cancel();
@@ -2062,379 +1012,6 @@ fn cancellation_pairs_every_call_in_a_tool_round() {
 }
 
 #[test]
-fn before_stop_reminders_are_saved_as_user_notes_and_bounded_per_turn() {
-    let fixture = Fixture::new("before-stop");
-    let hook = fixture.root.join("hook.sh");
-    support::write(
-        &hook,
-        "#!/bin/sh\n_input=$(cat)\nprintf '%s' '{\"message\":\"Run the declared check.\"}'\n",
-    )
-    .unwrap();
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "check".into(),
-            command: vec![support::SHELL.into(), hook.display().to_string()],
-            events: Some(vec!["before_stop".into()]),
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":"printf checked"}"#),
-        answer("one"),
-        answer("two"),
-        answer("three"),
-        answer("four"),
-        answer("chat only"),
-    ]);
-    let mut runtime = fixture.runtime(provider.clone(), &config);
-    let mut reminders = 0;
-    runtime
-        .turn("work".into(), &mut Unattended, &mut |event| {
-            if matches!(event, Event::Notice(ref text) if text.starts_with("before_stop:")) {
-                reminders += 1;
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(reminders, 3);
-    let context = runtime.session().context_messages().unwrap();
-    let notes = context
-        .iter()
-        .filter(|message| {
-            message.role == gears::provider::Role::User
-                && message.text_content() == "Run the declared check."
-        })
-        .count();
-    assert_eq!(notes, 3);
-    assert_eq!(context.last().unwrap().text_content(), "four");
-    let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 5);
-    assert_eq!(
-        requests[2].messages.last().unwrap().text_content(),
-        "Run the declared check."
-    );
-    drop(requests);
-    runtime
-        .turn("hello".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    assert_eq!(provider.requests.lock().unwrap().len(), 6);
-}
-
-#[test]
-fn hook_setup_receives_startup_provider_model_and_subscriptions() {
-    let fixture = Fixture::new("setup-payload");
-    let log = fixture.root.join("setup.json");
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "setup".into(),
-            events: Some(vec!["initialize".into()]),
-            command: vec![
-                support::SHELL.into(),
-                "-c".into(),
-                format!("cat > '{}'; printf '{{}}'", log.display()),
-            ],
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let runtime = fixture.runtime(Scripted::new(Vec::new()), &config);
-    let event: serde_json::Value = serde_json::from_slice(&std::fs::read(log).unwrap()).unwrap();
-    assert_eq!(
-        event["payload"],
-        serde_json::json!({"reason":"startup","provider":"default","model":"test/model",
-            "subscribed_events": ["initialize"]})
-    );
-    assert_eq!(event["session"]["id"], runtime.session().id());
-}
-
-#[test]
-fn session_changes_repeat_setup_and_replace_prompt_fragments() {
-    let fixture = Fixture::new("session-setup");
-    let log = fixture.root.join("setups.jsonl");
-    let response = fixture.root.join("response.json");
-    support::write(&response, r#"{"prompt_fragments":["setup prompt one"]}"#).unwrap();
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "setup".into(),
-            events: Some(vec!["initialize".into()]),
-            command: vec![
-                support::SHELL.into(),
-                "-c".into(),
-                format!(
-                    "cat >> '{}'; printf '\\n' >> '{}'; cat '{}'",
-                    log.display(),
-                    log.display(),
-                    response.display()
-                ),
-            ],
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let provider = Scripted::new(vec![answer("new answer"), answer("still usable")]);
-    let mut runtime = fixture.runtime(provider.clone(), &config);
-    let original = runtime.session().id().to_string();
-    support::write(&response, r#"{"prompt_fragments":["setup prompt two"]}"#).unwrap();
-    runtime.new_session(false, None).unwrap();
-    runtime
-        .turn("hello".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    runtime.clone_session().unwrap();
-    let user = runtime
-        .session()
-        .entries()
-        .iter()
-        .find(|entry| entry.kind == "message" && entry.data["role"] == "user")
-        .unwrap()
-        .id
-        .clone();
-    runtime.fork_at(&user).unwrap();
-    runtime.resume(&original).unwrap();
-    runtime.resume(&original).unwrap();
-    let events = std::fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        events
-            .iter()
-            .map(|event| event["payload"]["reason"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["startup", "new", "clone", "fork", "resume", "resume"]
-    );
-    assert!(
-        events
-            .iter()
-            .all(|event| event["payload"]["model"] == "test/model"
-                && event["payload"]["provider"] == "default")
-    );
-    let requests = provider.requests.lock().unwrap();
-    assert!(
-        requests[0]
-            .system
-            .iter()
-            .any(|text| text.contains("setup prompt two"))
-    );
-    assert!(
-        !requests[0]
-            .system
-            .iter()
-            .any(|text| text.contains("setup prompt one"))
-    );
-    drop(requests);
-    support::write(&response, "invalid").unwrap();
-    assert!(runtime.new_session(false, None).is_err());
-    assert_eq!(runtime.session().id(), original);
-    runtime
-        .turn(
-            "after failed setup".into(),
-            &mut Unattended,
-            &mut |_| Ok(()),
-        )
-        .unwrap();
-    assert!(
-        provider.requests.lock().unwrap()[1]
-            .system
-            .iter()
-            .any(|text| text.contains("setup prompt two"))
-    );
-}
-
-#[test]
-fn selection_changes_and_compaction_repeat_setup_with_current_metadata() {
-    let fixture = Fixture::new("selection-setup");
-    let log = fixture.root.join("setups.jsonl");
-    let response = fixture.root.join("response.json");
-    support::write(&response, r#"{"prompt_fragments":["setup original"]}"#).unwrap();
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "setup".into(),
-            events: Some(vec!["initialize".into()]),
-            command: vec![
-                support::SHELL.into(),
-                "-c".into(),
-                format!(
-                    "cat >> '{}'; printf '\\n' >> '{}'; cat '{}'",
-                    log.display(),
-                    log.display(),
-                    response.display()
-                ),
-            ],
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        context: ContextConfig {
-            window_tokens: 10_000,
-            output_reserve_tokens: 2_000,
-            recent_tail_tokens: 50,
-        },
-        ..Config::default()
-    };
-    let remote = Scripted::new(vec![
-        answer(&"a".repeat(300)),
-        answer(&"b".repeat(300)),
-        answer("compact summary"),
-        answer("after compact"),
-    ]);
-    let mut runtime = fixture.runtime(Scripted::new(Vec::new()), &config);
-    let next = remote.clone();
-    runtime.install_provider_factory(Arc::new(move |_| Ok(next.clone() as Arc<dyn Provider>)));
-    support::write(&response, r#"{"prompt_fragments":["setup selected"]}"#).unwrap();
-    runtime
-        .set_model("test/next".into(), &mut |_| Ok(()))
-        .unwrap();
-    runtime.set_provider("remote", &mut |_| Ok(())).unwrap();
-    for prompt in ["one", "two"] {
-        runtime
-            .turn(prompt.into(), &mut Unattended, &mut |_| Ok(()))
-            .unwrap();
-    }
-    support::write(&response, r#"{"prompt_fragments":["setup compacted"]}"#).unwrap();
-    runtime.compact(None, &mut |_| Ok(())).unwrap();
-    runtime
-        .turn("three".into(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    let events = std::fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        events
-            .iter()
-            .map(|event| event["payload"]["reason"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["startup", "model_change", "provider_change", "compaction"]
-    );
-    assert_eq!(events[1]["payload"]["provider"], "default");
-    assert_eq!(events[1]["payload"]["model"], "test/next");
-    for event in &events[2..] {
-        assert_eq!(event["payload"]["provider"], "remote");
-        assert_eq!(event["payload"]["model"], "test/next");
-    }
-    let requests = remote.requests.lock().unwrap();
-    assert!(
-        requests[3]
-            .system
-            .iter()
-            .any(|text| text.contains("setup compacted"))
-    );
-    assert!(
-        !requests[3]
-            .system
-            .iter()
-            .any(|text| text.contains("setup selected"))
-    );
-    drop(requests);
-    support::write(&response, "invalid").unwrap();
-    assert!(
-        runtime
-            .set_model("test/failing".into(), &mut |_| Ok(()))
-            .is_err()
-    );
-    assert_eq!(runtime.model(), "test/next");
-    assert!(runtime.set_provider("other", &mut |_| Ok(())).is_err());
-    assert_eq!(runtime.provider_name(), "remote");
-}
-
-#[test]
-fn a_failed_before_stop_hook_is_reported_without_repeating_the_answer() {
-    let fixture = Fixture::new("before-stop-failure");
-    let config = Config {
-        hooks: vec![HookConfig {
-            name: "broken".into(),
-            command: vec![support::SHELL.into(), "-c".into(), "printf invalid".into()],
-            events: Some(vec!["before_stop".into()]),
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 4096,
-        }],
-        ..Config::default()
-    };
-    let provider = Scripted::new(vec![
-        tool("sh", r#"{"command":"printf checked"}"#),
-        answer("done"),
-    ]);
-    let mut runtime = fixture.runtime(provider.clone(), &config);
-    let mut notices = Vec::new();
-    runtime
-        .turn("work".into(), &mut Unattended, &mut |event| {
-            if let Event::Notice(text) = event {
-                notices.push(text);
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert!(
-        notices
-            .iter()
-            .any(|text| text.contains("before_stop hook broken failed"))
-    );
-    assert_eq!(provider.requests.lock().unwrap().len(), 2);
-    assert_eq!(
-        runtime
-            .session()
-            .context_messages()
-            .unwrap()
-            .last()
-            .unwrap()
-            .text_content(),
-        "done"
-    );
-}
-
-#[test]
-fn cancellation_keeps_the_tool_result_when_a_result_hook_cannot_run() {
-    let fixture = Fixture::new("cancel-result-hook");
-    let hook = fixture.root.join("hook.sh");
-    support::write(&hook, "#!/bin/sh\n_input=$(cat)\nprintf '{}'\n").unwrap();
-    let mut config = Config::default();
-    config.hooks.push(HookConfig {
-        events: None,
-        name: "fixture".to_string(),
-        command: vec![support::SHELL.to_string(), hook.display().to_string()],
-        timeout: Duration::from_secs(2),
-        max_output_bytes: 4096,
-    });
-    let provider = Scripted::new(vec![Ok(Completion {
-        tool_calls: vec![
-            ToolCall::new("call_1", "sh", r#"{"command":"printf started; sleep 2"}"#),
-            ToolCall::new("call_2", "sh", r#"{"command":": > never"}"#),
-        ],
-        finish_reason: Some(FinishReason::ToolCalls),
-        ..Completion::default()
-    })]);
-    let mut runtime = fixture.runtime(provider, &config);
-    let cancellation = runtime.cancellation();
-    let mut saw_output = false;
-    let error = runtime
-        .turn("go".to_string(), &mut Unattended, &mut |event| {
-            if matches!(event, Event::ToolOutput { .. }) {
-                saw_output = true;
-                cancellation.cancel();
-            }
-            Ok(())
-        })
-        .unwrap_err();
-    assert!(saw_output);
-    assert!(error.contains("cancelled"), "{error}");
-    let results = runtime
-        .session()
-        .context_messages()
-        .unwrap()
-        .into_iter()
-        .flat_map(|message| message.content)
-        .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
-        .count();
-    assert_eq!(results, 2);
-    assert!(!fixture.workspace.join("never").exists());
-}
-
-#[test]
 fn an_observer_error_pairs_calls_that_never_started() {
     let fixture = Fixture::new("observer-before-tools");
     let provider = Scripted::new(vec![Ok(Completion {
@@ -2447,7 +1024,7 @@ fn an_observer_error_pairs_calls_that_never_started() {
     })]);
     let mut runtime = fixture.runtime(provider, &Config::default());
     let error = runtime
-        .turn("go".to_string(), &mut Unattended, &mut |event| {
+        .turn("go".to_string(), &mut |event| {
             if matches!(event, Event::ToolStart { .. }) {
                 Err("observer refused tool start event".to_string())
             } else {
@@ -2481,52 +1058,6 @@ fn an_observer_error_pairs_calls_that_never_started() {
 }
 
 #[test]
-fn a_failed_result_hook_preserves_the_completed_call() {
-    let fixture = Fixture::new("result-hook-error");
-    let hook = fixture.root.join("hook.sh");
-    support::write(
-        &hook,
-        "#!/bin/sh\nevent=$(cat)\ncase \"$event\" in\n  *'\"event\":\"tool_result\"'*) exit 7 ;;\n  *) printf '{}' ;;\nesac\n",
-    )
-    .unwrap();
-    let mut config = Config::default();
-    config.hooks.push(HookConfig {
-        events: None,
-        name: "fixture".to_string(),
-        command: vec![support::SHELL.to_string(), hook.display().to_string()],
-        timeout: Duration::from_secs(2),
-        max_output_bytes: 4096,
-    });
-    let provider = Scripted::new(vec![Ok(Completion {
-        tool_calls: vec![
-            ToolCall::new("call_1", "sh", r#"{"command":": > done"}"#),
-            ToolCall::new("call_2", "sh", r#"{"command":": > never"}"#),
-        ],
-        finish_reason: Some(FinishReason::ToolCalls),
-        ..Completion::default()
-    })]);
-    let mut runtime = fixture.runtime(provider, &config);
-    let error = runtime
-        .turn("go".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap_err();
-    assert!(error.contains("exited unsuccessfully"), "{error}");
-    assert!(fixture.workspace.join("done").exists());
-    assert!(!fixture.workspace.join("never").exists());
-    let outcomes = runtime
-        .session()
-        .context_messages()
-        .unwrap()
-        .into_iter()
-        .flat_map(|message| message.content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult { outcome, .. } => Some(outcome),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(outcomes, [ToolOutcome::Completed, ToolOutcome::NotStarted]);
-}
-
-#[test]
 fn automatic_compaction_runs_before_an_oversized_follow_up() {
     let fixture = Fixture::new("automatic-compact");
     let provider = Scripted::new(vec![
@@ -2536,18 +1067,16 @@ fn automatic_compaction_runs_before_an_oversized_follow_up() {
     ]);
     let config = Config {
         context: ContextConfig {
-            window_tokens: 800,
+            window_tokens: 2000,
             output_reserve_tokens: 200,
             recent_tail_tokens: 50,
         },
         ..Config::default()
     };
     let mut runtime = fixture.runtime(provider.clone(), &config);
+    runtime.turn("first".to_string(), &mut |_| Ok(())).unwrap();
     runtime
-        .turn("first".to_string(), &mut Unattended, &mut |_| Ok(()))
-        .unwrap();
-    runtime
-        .turn("follow up".to_string(), &mut Unattended, &mut |_| Ok(()))
+        .turn("follow up".to_string(), &mut |_| Ok(()))
         .unwrap();
     assert!(
         runtime
@@ -2560,46 +1089,39 @@ fn automatic_compaction_runs_before_an_oversized_follow_up() {
 }
 
 #[test]
-fn changed_hook_manifest_is_noticed_on_resume() {
-    let fixture = Fixture::new("identity");
-    let store = Store::with_root(&fixture.workspace, fixture.root.join("state")).unwrap();
-    let session = store.create(false, None).unwrap();
-    let runtime = Runtime::new(
-        Scripted::new(Vec::new()),
-        store.clone(),
-        session,
-        &Config::default(),
-        "test/model".to_string(),
-    )
-    .unwrap();
-    let id = runtime.summary().id;
-    drop(runtime);
-
-    let mut config = Config::default();
-    config.hooks.push(HookConfig {
-        events: None,
-        name: "new_hook".to_string(),
-        command: vec![
-            support::SHELL.to_string(),
-            "-c".to_string(),
-            "_input=$(cat); printf '%s' '{}'".to_string(),
-        ],
-        timeout: Duration::from_secs(2),
-        max_output_bytes: 4096,
-    });
-    let session = store.open(&id).unwrap();
-    let mut resumed = Runtime::new(
-        Scripted::new(Vec::new()),
-        store,
-        session,
-        &config,
-        "test/model".to_string(),
-    )
-    .unwrap();
-    assert!(
-        resumed
-            .take_startup_notices()
-            .iter()
-            .any(|notice| notice.contains("resources changed"))
-    );
+fn file_tools_protect_keys_and_settings_beside_the_session_store() {
+    let fixture = Fixture::new("gears-directory-boundary");
+    let directory = fixture.root.join("state");
+    std::fs::create_dir_all(&directory).unwrap();
+    for name in ["local.key", "gears.toml"] {
+        let path = directory.join(name);
+        support::write(&path, "private contents").unwrap();
+        for (name, arguments) in [
+            ("read_file", serde_json::json!({"path": path})),
+            (
+                "write_file",
+                serde_json::json!({"path": path, "content": "bad"}),
+            ),
+            (
+                "patch",
+                serde_json::json!({"path": path, "old_text": "private", "new_text": "bad"}),
+            ),
+        ] {
+            let provider = Scripted::new(vec![tool(name, &arguments.to_string()), answer("done")]);
+            let mut runtime = fixture.runtime(provider.clone(), &Config::default());
+            runtime
+                .turn("try the file tool".into(), &mut |_| Ok(()))
+                .unwrap();
+            let requests = provider.requests.lock().unwrap();
+            assert!(
+                requests[1]
+                    .messages
+                    .iter()
+                    .any(|message| { message.text_content().contains("Gears directory") }),
+                "{name}: {:?}",
+                requests[1].messages
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "private contents");
+        }
+    }
 }

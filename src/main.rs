@@ -6,18 +6,14 @@ use gears::cancellation::Cancellation;
 use gears::cli::{Action, Args, Output, SessionStart};
 use gears::config::{Config, Found, NamedProvider};
 use gears::net::EgressPolicy;
-#[cfg(unix)]
-use gears::net::host_curl::HostCurl as HttpBackend;
-#[cfg(not(unix))]
 use gears::net::motor_curl::MotorCurl as HttpBackend;
 use gears::provider::{
     ApiKey, Endpoint, EventSink, KEY_ENV, Message, OpenAiCompat, Provider, Request, StreamEvent,
 };
 use gears::provider_choice::ProviderChoice;
 use gears::run_lock::DirectoryLock;
-use gears::runtime::{Options, ProviderFactory, Runtime};
+use gears::runtime::{ProviderFactory, Runtime};
 use gears::session::{Session, Store};
-use gears::tools::Registry;
 
 fn main() -> ExitCode {
     let key_from_env = std::env::var(KEY_ENV).ok();
@@ -118,13 +114,7 @@ fn run(args: Args, key_from_env: Option<String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let tools = match Registry::load_config(&config) {
-        Ok(tools) => tools,
-        Err(error) => {
-            diagnostic(&format!("tools: {error}"));
-            return ExitCode::FAILURE;
-        }
-    };
+
     let directory_lock = match DirectoryLock::acquire_default() {
         Ok(lock) => lock,
         Err(error) => {
@@ -179,14 +169,7 @@ fn run(args: Args, key_from_env: Option<String>) -> ExitCode {
     }
     let result = match args.action {
         Action::Ask => ask(&args, &config, choice.as_ref(), key_from_env),
-        Action::Run => agent(
-            &args,
-            &config,
-            choice.as_ref(),
-            key_from_env,
-            tools,
-            setup_ui,
-        ),
+        Action::Run => agent(&args, &config, choice.as_ref(), key_from_env, setup_ui),
         Action::Version | Action::Help | Action::Reset => unreachable!(),
     };
     match result {
@@ -234,7 +217,6 @@ fn agent(
     config: &Config,
     choice: Option<&ProviderChoice>,
     key_from_env: Option<String>,
-    tools: Registry,
     setup_ui: Option<gears::ui::select::Selected>,
 ) -> Result<(), String> {
     let mut config = config.clone();
@@ -290,11 +272,7 @@ fn agent(
     if session.provider().as_deref() != Some(&provider_name) {
         session.set_provider(&provider_name)?;
     }
-    let options = Options {
-        tools: Some(tools),
-        ..Options::default()
-    };
-    let mut runtime = Runtime::with_options(provider, store, session, config, model, options)?;
+    let mut runtime = Runtime::new(provider, store, session, config, model)?;
     let factory_config = config.clone();
     let verbosity = args.verbosity;
     let factory: ProviderFactory = Arc::new(move |name| {

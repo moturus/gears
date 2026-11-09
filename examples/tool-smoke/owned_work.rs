@@ -1,4 +1,4 @@
-//! The same owned nested-run regression on Linux and Motor OS.
+//! Owned nested-run cleanup on Motor OS.
 
 use std::path::Path;
 use std::time::Duration;
@@ -7,7 +7,7 @@ use gears::mock::{MockServer, sse_response};
 use gears::process::{Cancellation, Request, Stream, run};
 use serde_json::{Value, json};
 
-pub fn smoke(gears: &Path, sh_directory: &Path) -> Result<(), String> {
+pub fn smoke(gears: &Path) -> Result<(), String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?
@@ -15,7 +15,7 @@ pub fn smoke(gears: &Path, sh_directory: &Path) -> Result<(), String> {
     let root =
         std::env::temp_dir().join(format!("gears-owned-work-{}-{stamp}", std::process::id()));
     std::fs::create_dir(&root).map_err(|error| error.to_string())?;
-    let result = check(gears, sh_directory, &root);
+    let result = check(gears, &root);
     if result.is_ok() {
         std::fs::remove_dir_all(&root).map_err(|error| error.to_string())?;
     } else {
@@ -24,21 +24,10 @@ pub fn smoke(gears: &Path, sh_directory: &Path) -> Result<(), String> {
     result
 }
 
-fn check(gears: &Path, sh_directory: &Path, root: &Path) -> Result<(), String> {
+fn check(gears: &Path, root: &Path) -> Result<(), String> {
     for mode in ["normal", "cancel", "timeout"] {
         let workspace = root.join(mode);
         std::fs::create_dir(&workspace).map_err(|error| error.to_string())?;
-        let tools = workspace.join("tool");
-        std::fs::create_dir(&tools).map_err(|error| error.to_string())?;
-        for file in ["tool.toml", "parameters.json", "run.sh"] {
-            let text = std::fs::read_to_string(sh_directory.join(file))
-                .map_err(|error| error.to_string())?;
-            std::fs::write(
-                tools.join(file),
-                text.replace("name = \"sh\"", "name = \"owned_tree\""),
-            )
-            .map_err(|error| error.to_string())?;
-        }
         let tree = "printf '%s' $$ > child.pid; sleep 30 & printf '%s' $! > grandchild.pid; printf nested-ready; wait";
         let done = sse_response(&[
             r#"{"choices":[{"index":0,"delta":{"content":"nested done"},"finish_reason":"stop"}]}"#,
@@ -63,8 +52,8 @@ fn check(gears: &Path, sh_directory: &Path, root: &Path) -> Result<(), String> {
         std::fs::write(&key, "fixture-owned-key").map_err(|error| error.to_string())?;
         let config = workspace.join("gears.toml");
         std::fs::write(&config, format!(
-            "version = 1\n[provider]\nbase_url = {:?}\nmodel = 'test/model'\napi_key_file = {:?}\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[[tools]]\ndirectory = {:?}\nenabled = true\n",
-            server.url("/v1"), key, tools,
+            "version = 1\n[provider]\nbase_url = {:?}\nmodel = 'test/model'\napi_key_file = {:?}\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n",
+            server.url("/v1"), key,
         )).map_err(|error| error.to_string())?;
         let cancellation = Cancellation::new();
         let mut streamed = String::new();
@@ -120,7 +109,6 @@ fn check(gears: &Path, sh_directory: &Path, root: &Path) -> Result<(), String> {
             return Err(format!("{mode}: owning runner timed out: {output:?}"));
         }
         if mode == "cancel" {
-            // A killed child has no exit code on Linux and -1 on Motor OS.
             if !output.cancelled || output.stdout.contains("\"type\":\"final\"") {
                 return Err(format!("cancel: nested run was not killed: {output:?}"));
             }
@@ -147,17 +135,7 @@ fn check(gears: &Path, sh_directory: &Path, root: &Path) -> Result<(), String> {
                 .map_err(|error| error.to_string())?
                 .parse::<u32>()
                 .map_err(|error| error.to_string())?;
-            #[cfg(unix)]
-            let stopped =
-                std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-                    matches!(
-                        stat.rsplit_once(") ").unwrap().1.split_whitespace().next(),
-                        Some("Z" | "X" | "x")
-                    )
-                });
-            #[cfg(not(unix))]
-            let stopped = !gears::platform::process_alive(pid);
-            if !stopped {
+            if !stopped(pid) {
                 return Err(format!("{mode}: descendant {pid} still running"));
             }
         }
@@ -165,9 +143,23 @@ fn check(gears: &Path, sh_directory: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Death is not instantaneous, so give a killed descendant a moment to go.
+fn stopped(pid: u32) -> bool {
+    fn gone(pid: u32) -> bool {
+        !gears::platform::process_alive(pid)
+    }
+    for _ in 0..100 {
+        if gone(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 fn call(id: &str, command: &str, timeout: u64) -> String {
     json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
-        "index": 0, "id": id, "function": {"name": "owned_tree",
+        "index": 0, "id": id, "function": {"name": "sh",
         "arguments": json!({"command": command, "timeout": timeout}).to_string()}
     }]}, "finish_reason": "tool_calls"}]})
     .to_string()

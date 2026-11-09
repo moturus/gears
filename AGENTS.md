@@ -3,7 +3,7 @@
 ## What is Gears and Motor OS
 
 Gears (the current repo) is a (coding) agent harness that compiles natively
-for Motor OS and Linux (and can be cross-compiled from Linux for Motor OS).
+for Motor OS only.
 
 To determine which OS you are running, run `uname`.
 

@@ -143,7 +143,7 @@ fn ask_url(
 ) -> Result<Option<String>, String> {
     let mut suggestions = vec![provider.base_url.clone()];
     // From a Motor OS VM the host machine is 192.168.4.1.
-    if cfg!(target_os = "motor") {
+    {
         let host = provider
             .base_url
             .replacen("://127.0.0.1", "://192.168.4.1", 1);
@@ -180,11 +180,6 @@ fn save_key(path: &Path, key: &str) -> Result<(), String> {
     }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     let mut file = options.open(path).map_err(error)?;
     std::io::Write::write_all(&mut file, format!("{key}\n").as_bytes()).map_err(error)?;
     file.sync_data().map_err(error)
@@ -260,15 +255,6 @@ mod tests {
             std::fs::read_to_string(root.join("openrouter.key")).unwrap(),
             "sk-typed\n"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(root.join("openrouter.key"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
         let saved = ProviderChoice::load_at(&root).unwrap().unwrap();
         assert_eq!(
             (saved.provider.as_str(), saved.model.as_str()),
@@ -288,7 +274,7 @@ mod tests {
         let index = 1;
         let mut ask = script(vec![
             Answer::Pick(index),
-            Answer::Pick(usize::from(cfg!(target_os = "motor")) + 1),
+            Answer::Pick(2),
             Answer::Type("not a url"),
             Answer::Type("http://10.0.0.5:8080/v1"),
             Answer::Pick(1),
@@ -338,10 +324,10 @@ mod tests {
         let mut ask = script(vec![Answer::Pick(1)]);
         let package = Path::new("/src/gears");
         assert_eq!(
-            ask_settings(&mut ask, Path::new("/home/u/.gears/gears.toml"), package).unwrap(),
+            ask_settings(&mut ask, Path::new("/user/cfg/gears/gears.toml"), package).unwrap(),
             Some(true)
         );
-        assert!(ask.asked[0].contains("/home/u/.gears/gears.toml"));
+        assert!(ask.asked[0].contains("/user/cfg/gears/gears.toml"));
         assert!(ask.asked[0].contains("/src/gears/config/gears.toml"));
         std::fs::remove_dir_all(root).unwrap();
     }

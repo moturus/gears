@@ -4,21 +4,17 @@ use std::time::{Duration, Instant};
 
 use gears::cancellation::Cancellation;
 use gears::mock::{MockServer, Script, plain_response, provider_conformance_corpus, sse_response};
-#[cfg(unix)]
-use gears::net::host_curl::HostCurl;
-#[cfg(not(unix))]
-use gears::net::motor_curl::MotorCurl as HostCurl;
 use gears::net::motor_curl::MotorCurl;
 use gears::net::{EgressPolicy, Timeouts};
 use gears::provider::{
     Endpoint, EventSink, Message, OpenAiCompat, Provider, Request, StreamEvent, ToolSpec,
 };
 
-fn provider(server: &MockServer) -> OpenAiCompat<HostCurl> {
+fn provider(server: &MockServer) -> OpenAiCompat<MotorCurl> {
     let policy = EgressPolicy::new(&["127.0.0.1".to_string()])
         .with_plain_http_allowlist(&["127.0.0.1".to_string()]);
     OpenAiCompat::new(
-        HostCurl::new(policy).unwrap(),
+        MotorCurl::new(policy).unwrap(),
         Endpoint::new(&server.url("/v1")).unwrap(),
     )
     .without_key()
@@ -169,11 +165,7 @@ fn client_errors_are_not_retried() {
 /// Exercise the transport with the local platform's curl binary.
 #[test]
 fn provider_streams_through_the_motor_curl_transport() {
-    let program = if cfg!(unix) {
-        "curl"
-    } else {
-        "/system/bin/curl"
-    };
+    let program = "/system/bin/curl";
     let server = MockServer::start_one(sse_response(&[
         r#"{"choices":[{"index":0,"delta":{"content":"hello "}}]}"#,
         r#"{"choices":[{"index":0,"delta":{"content":"motor"},"finish_reason":"stop"}]}"#,

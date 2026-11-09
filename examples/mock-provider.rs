@@ -15,13 +15,11 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 
-#[cfg(target_os = "motor")]
 fn motor_getrandom(destination: &mut [u8]) -> Result<(), getrandom::Error> {
     moto_rt::fill_random_bytes(destination);
     Ok(())
 }
 
-#[cfg(target_os = "motor")]
 getrandom::register_custom_getrandom!(motor_getrandom);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -452,18 +450,14 @@ mod tests {
         let server =
             std::thread::spawn(move || serve(listener, scripts, Some(config), &args).unwrap());
 
-        let output = Command::new(if cfg!(unix) {
-            "curl"
-        } else {
-            "/system/bin/curl"
-        })
-        .args(["--silent", "--show-error", "--http1.1", "--noproxy", "*"])
-        .arg("--cacert")
-        .arg(fixture("TEST_ONLY_CA.pem"))
-        .args(["--data-binary", r#"{"messages":[]}"#, "--url"])
-        .arg(format!("https://{addr}/v1/chat/completions"))
-        .output()
-        .unwrap();
+        let output = Command::new("/system/bin/curl")
+            .args(["--silent", "--show-error", "--http1.1", "--noproxy", "*"])
+            .arg("--cacert")
+            .arg(fixture("TEST_ONLY_CA.pem"))
+            .args(["--data-binary", r#"{"messages":[]}"#, "--url"])
+            .arg(format!("https://{addr}/v1/chat/completions"))
+            .output()
+            .unwrap();
         server.join().unwrap();
         assert!(
             output.status.success(),

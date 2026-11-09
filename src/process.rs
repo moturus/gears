@@ -1,4 +1,4 @@
-//! Bounded, cancellable child-process execution shared by sh and hooks.
+//! Bounded, cancellable child-process execution used by the built-in `sh` tool.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -117,14 +117,12 @@ pub fn sh(
     )
 }
 
-/// Manifests and hooks name `gears-batteries` bare; it is installed beside Gears.
+/// Resolves the program to run; names are used as given on `PATH`.
 pub fn program_path(program: &str) -> Result<PathBuf, String> {
-    if program != "gears-batteries" {
-        return Ok(PathBuf::from(program));
+    if program.is_empty() {
+        return Err("program must not be empty".to_string());
     }
-    std::env::current_exe()
-        .map(|gears| gears.with_file_name(program))
-        .map_err(|error| format!("cannot locate Gears executable: {error}"))
+    Ok(PathBuf::from(program))
 }
 
 pub fn run(
@@ -320,14 +318,7 @@ pub fn run(
 }
 
 fn shell_program() -> &'static str {
-    #[cfg(unix)]
-    {
-        "sh"
-    }
-    #[cfg(not(unix))]
-    {
-        "/system/bin/rush"
-    }
+    "/system/bin/rush"
 }
 
 fn drain<R: Read + Send + 'static>(
@@ -484,156 +475,5 @@ mod tests {
         assert!(!error.started);
         assert!(error.detail.contains("cancelled before starting"));
         assert!(!marker.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sh_keeps_streams_and_status_separate() {
-        let cancellation = Cancellation::new();
-        let mut seen = Vec::new();
-        let output = sh(
-            std::env::temp_dir(),
-            "printf out; printf err >&2; exit 7",
-            Duration::from_secs(2),
-            4096,
-            &cancellation,
-            &mut |stream, text| seen.push((stream, text.to_string())),
-        )
-        .unwrap();
-        assert_eq!(output.code, Some(7));
-        assert_eq!(output.stdout, "out");
-        assert_eq!(output.stderr, "err");
-        assert!(seen.iter().any(|(stream, _)| *stream == Stream::Stdout));
-        assert!(seen.iter().any(|(stream, _)| *stream == Stream::Stderr));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cancellation_kills_the_process_group() {
-        let cancellation = Cancellation::new();
-        let mut saw_output = false;
-        let output = sh(
-            std::env::temp_dir(),
-            "printf started; sleep 5",
-            Duration::from_secs(10),
-            4096,
-            &cancellation,
-            &mut |_, _| {
-                saw_output = true;
-                cancellation.cancel();
-            },
-        )
-        .unwrap();
-        assert!(saw_output);
-        assert!(output.cancelled);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cancellation_does_not_report_the_killed_childs_broken_stdin() {
-        let cancellation = Cancellation::new();
-        let mut saw_output = false;
-        let output = run(
-            &Request {
-                program: "sh".into(),
-                args: vec!["-c".into(), "printf started; sleep 5".into()],
-                cwd: std::env::temp_dir(),
-                stdin: Some(vec![b'x'; 1024 * 1024]),
-                timeout: Duration::from_secs(10),
-                max_output_bytes: 4096,
-                env: Vec::new(),
-                remove_env: Vec::new(),
-            },
-            &cancellation,
-            &mut |_, _| {
-                saw_output = true;
-                cancellation.cancel();
-            },
-        )
-        .unwrap();
-        assert!(saw_output);
-        assert!(output.cancelled);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn timeout_kills_the_process_group() {
-        let output = sh(
-            std::env::temp_dir(),
-            "sleep 5",
-            Duration::from_millis(30),
-            4096,
-            &Cancellation::new(),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        assert!(output.timed_out);
-        assert!(output.status.contains("timed out"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn normal_exit_stops_background_descendants() {
-        let output = sh(
-            std::env::temp_dir(),
-            "sleep 10 & echo $!",
-            Duration::from_secs(3),
-            4096,
-            &Cancellation::new(),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        assert_eq!(output.code, Some(0));
-        let pid: u32 = output.stdout.trim().parse().unwrap();
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
-        if let Ok(stat) = stat {
-            let state = stat.rsplit_once(") ").unwrap().1.chars().next().unwrap();
-            assert_eq!(state, 'Z', "background child {pid} is still running");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn capture_keeps_bounded_head_and_tail() {
-        let output = sh(
-            std::env::temp_dir(),
-            "printf 0123456789abcdef",
-            Duration::from_secs(2),
-            8,
-            &Cancellation::new(),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        assert_eq!(output.stdout_dropped, 8);
-        assert!(output.stdout.starts_with("0123"));
-        assert!(output.stdout.ends_with("cdef"));
-        assert!(output.stdout.contains("bytes elided"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn provider_key_is_removed_from_children() {
-        let output = run(
-            &Request {
-                program: "sh".to_string(),
-                args: vec![
-                    "-c".to_string(),
-                    "test -z \"$OPENROUTER_API_KEY\"".to_string(),
-                ],
-                cwd: std::env::temp_dir(),
-                stdin: None,
-                timeout: Duration::from_secs(2),
-                max_output_bytes: 4096,
-                env: vec![(
-                    crate::provider::KEY_ENV.to_string(),
-                    "must-not-leak".to_string(),
-                )],
-                remove_env: vec![crate::provider::KEY_ENV.to_string()],
-            },
-            &Cancellation::new(),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        assert!(output.success(), "{}", output.model_text(4096));
     }
 }

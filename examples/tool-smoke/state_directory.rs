@@ -20,7 +20,16 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
     let key = selected.join("key");
     std::fs::write(&key, "fixture").map_err(|e| e.to_string())?;
     let config = selected.join("gears.toml");
-    std::fs::write(&config, format!("version=1\n[provider]\nbase_url={:?}\napi_key_file={:?}\nmodel='config-model'\n[net]\negress_allowlist=['127.0.0.1']\nplain_http_allowlist=['127.0.0.1']\n", server.url("/v1"), key)).map_err(|e| e.to_string())?;
+    let settings = format!(
+        "version=1\n[provider]\nbase_url={:?}\napi_key_file={:?}\nmodel='config-model'\n[net]\negress_allowlist=['127.0.0.1']\nplain_http_allowlist=['127.0.0.1']\n",
+        server.url("/v1"),
+        key
+    );
+    std::fs::write(
+        &config,
+        format!("{settings}[runtime]\nsh_timeout_seconds = 5\n"),
+    )
+    .map_err(|e| e.to_string())?;
     std::fs::write(
         selected.join("provider.toml"),
         "version=1\nprovider='default'\nmodel='isolated-model'\n",
@@ -45,22 +54,19 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
         env: vec![(gears::directory::ENV.into(), selected.display().to_string())],
         remove_env: vec!["GEARS_LOCK_OWNER".into(), gears::provider::KEY_ENV.into()],
     };
-    std::fs::write(selected.join("tools.toml"), "invalid overrides").map_err(|e| e.to_string())?;
     let output = run(&request, &Cancellation::new(), &mut |_, _| {}).map_err(|e| e.to_string())?;
     assert!(!output.success());
-    assert!(output.stderr.contains("tools.toml"), "{output:?}");
+    assert!(output.stderr.contains("unknown field"), "{output:?}");
     assert!(server.requests().is_empty());
-    assert!(!marker.exists());
-    // The lock file stays; the next run starting shows the lock was released.
-    assert!(selected.join("gears.lock").is_file());
-    std::fs::remove_file(selected.join("tools.toml")).map_err(|e| e.to_string())?;
+    std::fs::write(&config, &settings).map_err(|e| e.to_string())?;
     let output = run(&request, &Cancellation::new(), &mut |_, _| {}).map_err(|e| e.to_string())?;
     assert!(output.success(), "{output:?}");
-    assert!(output.stdout.contains("Isolated response."));
+    // Abandoned temporary state in the selected directory is cleaned at startup.
+    assert!(!marker.exists());
     let body: Value =
         serde_json::from_slice(&server.requests()[0].body).map_err(|e| e.to_string())?;
     assert_eq!(body["model"], "isolated-model");
-    let store = Store::with_root(&workspace, selected.join("sessions"))?;
+    let store = Store::with_root(&workspace, selected.clone())?;
     assert!(!store.list()?.is_empty());
     assert!(selected.join("gears.lock").is_file());
     // Bad directory selections fail before any provider request or state creation.

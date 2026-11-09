@@ -1,4 +1,4 @@
-//! A turn-wide cancellation signal shared by providers, hooks, and tools.
+//! A turn-wide cancellation signal shared by providers and tools.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -143,7 +143,6 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "getrandom",
- "libc",
  "moto-rt",
  "moto-sys",
  "rustls",

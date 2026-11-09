@@ -1,6 +1,6 @@
 //! Versioned append-only session trees.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ const VERSION: u32 = 1;
 /// Ephemeral sessions keep shell state here, inside the session store.
 const EPHEMERAL_SHELL_STATE: &str = "ephemeral";
 /// Every entry kind Gears writes; a session holding any other is refused.
-const ENTRY_KINDS: [&str; 12] = [
+const ENTRY_KINDS: [&str; 11] = [
     "message",
     "turn_error",
     "usage",
@@ -26,10 +26,8 @@ const ENTRY_KINDS: [&str; 12] = [
     "provider_change",
     "session_name",
     "compaction",
+    // No longer written; accepted so that older sessions still load.
     "hook_state",
-    "tool_state",
-    // No longer written; accepted so that sessions from before permissions
-    // were removed still load.
     "permission_grant",
     "runtime_identity",
     "label",
@@ -74,28 +72,6 @@ pub struct RuntimeIdentity {
     pub manifest_hash: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct HookState {
-    pub hook: String,
-    pub state: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<Message>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolState {
-    Enabled,
-    Disabled,
-    Inherit,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ToolStateEntry {
-    pub name: String,
-    pub state: ToolState,
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub id: String,
@@ -118,6 +94,7 @@ pub struct TreeItem {
 
 #[derive(Debug, Clone)]
 pub struct Store {
+    directory: StateRoot,
     state: StateRoot,
     workspace: PathBuf,
     group: PathBuf,
@@ -125,9 +102,10 @@ pub struct Store {
 
 impl Store {
     pub fn new(workspace: &Path) -> Result<Self, String> {
-        Self::with_root(workspace, default_root()?)
+        Self::with_root(workspace, crate::directory::default_root()?)
     }
 
+    /// Open a store beneath the given Gears directory (`root/sessions`).
     pub fn with_root(workspace: &Path, root: PathBuf) -> Result<Self, String> {
         let workspace = workspace
             .canonicalize()
@@ -140,7 +118,8 @@ impl Store {
         }
         let group = PathBuf::from(workspace_key(&workspace));
         Ok(Self {
-            state: StateRoot::new(root)?,
+            state: StateRoot::new(root.join("sessions"))?,
+            directory: StateRoot::new(root)?,
             workspace,
             group,
         })
@@ -148,6 +127,10 @@ impl Store {
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    pub fn directory(&self) -> &Path {
+        self.directory.path()
     }
 
     pub fn create(&self, ephemeral: bool, name: Option<&str>) -> Result<Session, String> {
@@ -731,40 +714,6 @@ impl Session {
         self.append("compaction", compaction)
     }
 
-    pub fn append_hook_state(&mut self, state: &HookState) -> Result<String, String> {
-        self.append("hook_state", state)
-    }
-
-    pub fn set_tool_state(&mut self, name: &str, state: ToolState) -> Result<String, String> {
-        self.append(
-            "tool_state",
-            &ToolStateEntry {
-                name: name.to_string(),
-                state,
-            },
-        )
-    }
-
-    pub fn tool_states(&self) -> Result<BTreeMap<String, ToolState>, String> {
-        let mut states = BTreeMap::new();
-        for entry in self.active_entries()? {
-            if entry.kind != "tool_state" {
-                continue;
-            }
-            let change: ToolStateEntry = serde_json::from_value(entry.data)
-                .map_err(|error| format!("entry {}: bad tool state: {error}", entry.id))?;
-            if change.name.is_empty() {
-                return Err(format!("entry {}: empty tool name", entry.id));
-            }
-            if change.state == ToolState::Inherit {
-                states.remove(&change.name);
-            } else {
-                states.insert(change.name, change.state);
-            }
-        }
-        Ok(states)
-    }
-
     pub fn append_runtime_identity(
         &mut self,
         identity: &RuntimeIdentity,
@@ -779,17 +728,6 @@ impl Session {
             .rev()
             .find(|entry| entry.kind == "runtime_identity")
             .and_then(|entry| serde_json::from_value(entry.data.clone()).ok())
-    }
-
-    pub fn hook_state(&self, hook: &str) -> Option<Value> {
-        self.active_entries()
-            .ok()?
-            .iter()
-            .rev()
-            .filter(|entry| entry.kind == "hook_state")
-            .filter_map(|entry| serde_json::from_value::<HookState>(entry.data.clone()).ok())
-            .find(|state| state.hook == hook)
-            .map(|state| state.state)
     }
 
     pub fn context_messages(&self) -> Result<Vec<Message>, String> {
@@ -810,13 +748,6 @@ impl Session {
                         compact.summary
                     )));
                     messages.extend(compact.retained_tail);
-                }
-                "hook_state" => {
-                    let state: HookState = serde_json::from_value(entry.data)
-                        .map_err(|error| format!("entry {}: bad hook state: {error}", entry.id))?;
-                    if let Some(context) = state.context {
-                        messages.push(context);
-                    }
                 }
                 "turn_error" => {
                     let ended_at_tool = messages.last().is_some_and(|message| {
@@ -950,13 +881,6 @@ fn private_directory(path: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
-                    return Err(format!("{}: shell state is not private", path.display()));
-                }
-            }
             Ok(())
         }
         Err(error) => Err(format!("{}: {error}", path.display())),
@@ -964,17 +888,7 @@ fn private_directory(path: &Path) -> Result<(), String> {
 }
 
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(path)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::DirBuilder::new().create(path)
-    }
+    std::fs::DirBuilder::new().create(path)
 }
 
 struct Parsed {
@@ -1193,10 +1107,6 @@ fn clipped(text: &str, limit: usize) -> String {
     }
 }
 
-fn default_root() -> Result<PathBuf, String> {
-    Ok(crate::directory::default_root()?.join("sessions"))
-}
-
 /// Removes shell state that ephemeral sessions of a killed Gears left behind.
 /// Call only while holding the Gears directory lock, before any session starts.
 pub fn remove_abandoned_shell_state(directory: &StateRoot) -> Result<usize, String> {
@@ -1320,13 +1230,6 @@ mod tests {
         let result = writer
             .append_message(&Message::tool_result("call", "sh", "done", false))
             .unwrap();
-        writer
-            .append_hook_state(&HookState {
-                hook: "batteries".into(),
-                state: serde_json::json!({"prompt_snapshot": "original"}),
-                context: None,
-            })
-            .unwrap();
         let anchor = writer
             .append_message(&Message::assistant("original result"))
             .unwrap();
@@ -1339,13 +1242,6 @@ mod tests {
             })
             .unwrap();
         writer.append_message(&Message::user("next task")).unwrap();
-        writer
-            .append_hook_state(&HookState {
-                hook: "batteries".into(),
-                state: serde_json::json!({"prompt_snapshot": "refreshed"}),
-                context: None,
-            })
-            .unwrap();
         let source = writer.path().unwrap();
         let before = std::fs::read(source).unwrap();
         let snapshot = store.read(writer.id()).unwrap();
@@ -1354,10 +1250,6 @@ mod tests {
         assert_eq!(selected.context_messages().unwrap(), original);
         assert_eq!(selected.active_leaf(), Some(anchor.as_str()));
         assert_eq!(selected.path(), Some(source));
-        assert_eq!(
-            selected.hook_state("batteries").unwrap()["prompt_snapshot"],
-            "original"
-        );
         assert!(selected.entry(snapshot.active_leaf().unwrap()).is_none());
         assert!(snapshot.at(&start).err().unwrap().contains("unfinished"));
         assert!(snapshot.at("missing").is_err());
@@ -1487,18 +1379,6 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn saved_shell_state_rejects_a_symlink() {
-        let (base, _, store) = fixture("shell-state-symlink");
-        let mut session = store.create(false, None).unwrap();
-        let state = session.path().unwrap().with_extension("sh-state");
-        std::os::unix::fs::symlink(&base, &state).unwrap();
-        assert!(session.shell_state_directory().is_err());
-        drop(session);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
     fn fixture(name: &str) -> (PathBuf, PathBuf, Store) {
         let base =
             std::env::temp_dir().join(format!("gears-session-{name}-{}", std::process::id()));
@@ -1507,7 +1387,7 @@ mod tests {
         let state = base.join("state");
         std::fs::create_dir_all(&workspace).unwrap();
         let store = Store::with_root(&workspace, state.clone()).unwrap();
-        (base, state, store)
+        (base, state.join("sessions"), store)
     }
 
     #[test]
@@ -1537,32 +1417,6 @@ mod tests {
             "other"
         );
         drop(session);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn tool_state_follows_branch_and_survives_clone_and_resume() {
-        let (base, _, store) = fixture("tool-state");
-        let mut session = store.create(false, None).unwrap();
-        let branch_point = session.append_message(&Message::user("first")).unwrap();
-        session.set_tool_state("sh", ToolState::Disabled).unwrap();
-        let disabled_leaf = session.active_leaf().unwrap().to_string();
-        session.set_tool_state("sh", ToolState::Inherit).unwrap();
-        assert!(session.tool_states().unwrap().is_empty());
-        session.select(&disabled_leaf).unwrap();
-        assert_eq!(session.tool_states().unwrap()["sh"], ToolState::Disabled);
-        let cloned = store.clone_active(&session).unwrap();
-        assert_eq!(cloned.tool_states().unwrap()["sh"], ToolState::Disabled);
-        drop(cloned);
-        session.select(&branch_point).unwrap();
-        assert!(session.tool_states().unwrap().is_empty());
-        session.set_tool_state("ls", ToolState::Enabled).unwrap();
-        let path = session.path().unwrap().to_path_buf();
-        drop(session);
-        let resumed = store.open_path(&path).unwrap();
-        assert_eq!(resumed.tool_states().unwrap()["ls"], ToolState::Enabled);
-        assert!(!resumed.tool_states().unwrap().contains_key("sh"));
-        drop(resumed);
         std::fs::remove_dir_all(base).unwrap();
     }
 

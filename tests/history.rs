@@ -20,7 +20,7 @@ fn interactive_resume_displays_history_without_a_provider_request() {
     std::fs::write(&config, format!(
         "version = 1\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[provider]\nbase_url = '{}'\nmodel = 'test/model'\n", server.url("/v1")
     )).unwrap();
-    let store = Store::with_root(&root, root.join(".gears/sessions")).unwrap();
+    let store = Store::with_root(&root, root.join(".gears")).unwrap();
     let mut session = store.create(false, None).unwrap();
     session
         .append_message(&Message::user("saved question\x1b"))
@@ -74,9 +74,9 @@ fn interactive_resume_displays_history_without_a_provider_request() {
             .spawn()
             .unwrap();
         let input = if mode == "command" {
-            format!("/resume {id}\n/quit\n")
+            format!("/resume {id}\n/session\n/quit\n")
         } else {
-            "/quit\n".into()
+            "/session\n/quit\n".into()
         };
         child
             .stdin
@@ -90,6 +90,9 @@ fn interactive_resume_displays_history_without_a_provider_request() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert!(!diagnostics.contains("unknown command"), "{diagnostics}");
+        assert!(diagnostics.matches(&id).count() >= 2, "{diagnostics}");
         let visible = String::from_utf8(output.stdout).unwrap();
         for text in ["saved question", "saved answer", "saved result"] {
             assert!(visible.contains(text), "{mode} missing {text:?}: {visible}");

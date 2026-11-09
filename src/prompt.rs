@@ -16,16 +16,11 @@ pub struct Effective {
 }
 
 impl Effective {
-    pub fn new(workspace: &Path, hook_fragments: Vec<String>, manifest: &Value) -> Self {
-        let mut fragments = vec![
+    pub fn new(workspace: &Path, manifest: &Value) -> Self {
+        let fragments = vec![
             DEFAULT_SYSTEM.trim().to_string(),
             format!("Current working directory: {}", workspace.display()),
         ];
-        fragments.extend(
-            hook_fragments
-                .into_iter()
-                .filter(|fragment| !fragment.trim().is_empty()),
-        );
         let prompt_hash = hash_json(&fragments);
         let manifest_hash = hash_json(manifest);
         Self {
@@ -62,25 +57,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn order_and_manifest_affect_identity() {
-        let workspace = Path::new("/work");
-        let first = Effective::new(
-            workspace,
-            vec!["one".into(), "two".into()],
+    fn workspace_and_manifest_affect_identity() {
+        let first = Effective::new(Path::new("/work"), &serde_json::json!({"tools": ["sh"]}));
+        let moved = Effective::new(
+            Path::new("/elsewhere"),
             &serde_json::json!({"tools": ["sh"]}),
         );
-        let reordered = Effective::new(
-            workspace,
-            vec!["two".into(), "one".into()],
-            &serde_json::json!({"tools": ["sh"]}),
-        );
-        assert_ne!(
-            first.identity().prompt_hash,
-            reordered.identity().prompt_hash
-        );
+        assert_ne!(first.identity().prompt_hash, moved.identity().prompt_hash);
         let changed = Effective::new(
-            workspace,
-            vec!["one".into(), "two".into()],
+            Path::new("/work"),
             &serde_json::json!({"tools": ["sh", "extra"]}),
         );
         assert_ne!(
@@ -91,7 +76,7 @@ mod tests {
 
     #[test]
     fn working_directory_is_explicit() {
-        let prompt = Effective::new(Path::new("/chosen"), Vec::new(), &Value::Null);
+        let prompt = Effective::new(Path::new("/chosen"), &Value::Null);
         assert!(
             prompt
                 .fragments()

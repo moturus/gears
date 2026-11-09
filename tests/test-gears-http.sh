@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/system/bin/rush
 # Unit, integration and shipped-tool checks against local loopback providers.
 set -eu
 . "${0%/*}/native.sh"

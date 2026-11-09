@@ -1,27 +1,32 @@
-mod support;
+//! The built-in `session_search` pages saved sessions.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-
+use gears::cancellation::Cancellation;
+use gears::process::Stream;
 use gears::provider::Message;
 use gears::session::Store;
+use gears::tools::{Context, Registry};
 use serde_json::{Value, json};
 
+fn run(context: &Context, arguments: Value) -> Result<Value, String> {
+    let registry = Registry::new();
+    let tool = registry.get("session_search").unwrap();
+    assert!(tool.read_only);
+    let (result, _) = tool.execute(
+        &arguments.to_string(),
+        context,
+        &Cancellation::new(),
+        &mut |_: Stream, _: &str| {},
+    );
+    let result = result?;
+    serde_json::from_str(&result).map_err(|error| error.to_string())
+}
+
 #[test]
-fn real_tool_command_pages_saved_sessions_and_loads_every_shipped_manifest() {
-    let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools");
-    let directories: Vec<_> = std::fs::read_dir(&tools)
-        .unwrap()
-        .map(|entry| gears::config::ToolDirectory {
-            directory: entry.unwrap().path(),
-            enabled: true,
-        })
-        .collect();
-    let registry = gears::tools::Registry::load(&directories, &tools).unwrap();
-    assert_eq!(registry.tools().len(), directories.len());
-    let root = std::env::temp_dir().join(format!("batteries-search-cli-{}", std::process::id()));
+fn pages_saved_sessions_from_the_state_directory() {
+    let root = std::env::temp_dir().join(format!("gears-session-search-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("workspace")).unwrap();
-    let store = Store::with_root(&root.join("workspace"), root.join(".gears")).unwrap();
+    let store = Store::with_root(&root.join("workspace"), root.join("state")).unwrap();
     let mut session = store.create(false, None).unwrap();
     session
         .append_message(&Message::user("needle question"))
@@ -29,30 +34,14 @@ fn real_tool_command_pages_saved_sessions_and_loads_every_shipped_manifest() {
     session
         .append_message(&Message::assistant("needle answer"))
         .unwrap();
-    let invoke = |arguments: Value| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_gears-batteries"))
-            .args(["tool", "session_search"])
-            .env("HOME", &root)
-            .env(gears::directory::ENV, root.join(".gears"))
-            .env("GEARS_WORKSPACE", root.join("workspace"))
-            .env("GEARS_SESSION_ID", session.id())
-            .env("GEARS_SESSION_PATH", session.path().unwrap())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(arguments.to_string().as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
-    };
-    let result = invoke(json!({"query": "needle", "limit": 1}));
-    assert!(result.status.success(), "{result:?}");
-    let page: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let context = Context::new(
+        root.join("workspace"),
+        root.join("state"),
+        session.id().to_string(),
+        None,
+    )
+    .unwrap();
+    let page = run(&context, json!({"query": "needle", "limit": 1})).unwrap();
     assert_eq!(page["total_matches"], 2);
     assert_eq!(page["next_offset"], 1);
     assert_eq!(page["hits"][0]["session_id"], session.id());
@@ -62,9 +51,7 @@ fn real_tool_command_pages_saved_sessions_and_loads_every_shipped_manifest() {
         json!({"query": "needle", "limit": 0}),
         json!({"query": "needle", "unknown": true}),
     ] {
-        let refused = invoke(invalid);
-        assert!(!refused.status.success());
-        assert!(refused.stdout.is_empty());
+        assert!(run(&context, invalid).is_err());
     }
     drop(session);
     std::fs::remove_dir_all(root).unwrap();

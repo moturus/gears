@@ -151,7 +151,7 @@ impl<P: Provider + ?Sized> Provider for Box<P> {
 }
 
 /// And so that several agents can share one. A completion takes `&self` and
-/// carries its own connection — the host backend spawns a curl of its own per
+/// carries its own connection — the native transport spawns a curl of its own per
 /// request — so sharing one provider is not sharing a conversation.
 impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     fn complete(

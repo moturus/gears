@@ -1,23 +1,24 @@
-//! One provider loop with sessions, hooks, authorization, and compaction.
+//! One provider loop with sessions, authorization, and compaction.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde_json::Value;
-
 use crate::config::{Config, ContextConfig};
-use crate::hooks::{Manager as Hooks, ToolResult};
 use crate::process::{Cancellation, Stream};
 use crate::prompt::Effective;
 use crate::provider::{
     ContentBlock, EventSink, Message, Provider, ProviderError, Request, StreamEvent, ToolCall,
     ToolOutcome, ToolSpec, Usage, UsageMeter,
 };
-use crate::session::{Compaction, Session, SessionInfo, Store, ToolState, TreeItem};
-use crate::tool_state::Overrides;
-use crate::tools::{ExecutionContext, Registry};
+use crate::session::{Compaction, Session, SessionInfo, Store, TreeItem};
+use crate::tools::{Context, Registry};
 
-const MODEL_STREAM_BYTES: usize = 32 * 1024;
+/// What a tool call returned to the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub content: String,
+    pub is_error: bool,
+}
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -41,7 +42,6 @@ pub enum Event {
         outcome: ToolOutcome,
     },
     Notice(String),
-    Hint(Option<String>),
     Usage {
         request: Usage,
         total: UsageMeter,
@@ -64,14 +64,6 @@ pub struct SessionSummary {
     pub ephemeral: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolStatus {
-    pub name: String,
-    pub enabled: bool,
-    pub available: bool,
-    pub source: &'static str,
-}
-
 pub trait Observer {
     fn event(&mut self, event: Event) -> Result<(), String>;
 }
@@ -85,39 +77,15 @@ where
     }
 }
 
-/// How an interface answers hook questions; unattended runs answer none.
-pub trait Responder {
-    fn answer(&mut self, _question: &crate::hooks::Question) -> Result<Option<String>, String> {
-        Ok(None)
-    }
-
-    fn attended(&self) -> bool {
-        true
-    }
-}
-
 pub type ProviderFactory = Arc<dyn Fn(&str) -> Result<Arc<dyn Provider>, String> + Send + Sync>;
-
-/// Answers every question with a skip, for runs nobody is watching.
-pub struct Unattended;
-
-impl Responder for Unattended {
-    fn attended(&self) -> bool {
-        false
-    }
-}
 
 pub struct Runtime {
     provider: Arc<dyn Provider>,
     provider_name: String,
+    tools: Registry,
     provider_factory: Option<ProviderFactory>,
     store: Store,
     session: Session,
-    hooks: Hooks,
-    tools: Registry,
-    /// The tools as configured, before saved enablement; `/reset` returns to them.
-    configured_tools: Registry,
-    tool_state_directory: PathBuf,
     prompt: Effective,
     model: String,
     max_tool_rounds: usize,
@@ -126,117 +94,50 @@ pub struct Runtime {
     usage: UsageMeter,
     startup_notices: Vec<String>,
     interactive: bool,
-    hint: Option<String>,
-    questions_answered: usize,
-}
-
-/// Choices beyond the configuration; the defaults suit an ordinary run.
-#[derive(Default)]
-pub struct Options {
-    /// Tools to use instead of the configured ones.
-    pub tools: Option<Registry>,
-    /// Where tool enablement is saved, instead of the Gears directory.
-    pub tool_state_directory: Option<PathBuf>,
 }
 
 impl Runtime {
     pub fn new(
         provider: Arc<dyn Provider>,
         store: Store,
-        session: Session,
-        config: &Config,
-        model: String,
-    ) -> Result<Self, String> {
-        Self::with_options(provider, store, session, config, model, Options::default())
-    }
-
-    pub fn with_options(
-        provider: Arc<dyn Provider>,
-        store: Store,
         mut session: Session,
         config: &Config,
         model: String,
-        options: Options,
     ) -> Result<Self, String> {
-        let Options {
-            tools,
-            tool_state_directory,
-        } = options;
-        let mut tools = match tools {
-            Some(tools) => tools,
-            None => Registry::load_config(config)?,
-        };
-        let configured_tools = tools.clone();
-        let tool_state_directory = match tool_state_directory {
-            Some(directory) => directory,
-            None => crate::directory::default_root()?,
-        };
+        let tools = Registry::new();
         crate::process::ensure_cleanup()?;
         let cancellation = Cancellation::new();
         let previous_identity = session.latest_runtime_identity();
         let mut startup_notices = Vec::new();
-        startup_notices.extend(apply_tool_states(
-            &mut tools,
-            &Overrides::load(&tool_state_directory)?,
-            &session,
-        )?);
         if session.recovered_entries() > 0 {
             startup_notices.push(format!(
                 "discarded {} incomplete session records after a crash",
                 session.recovered_entries()
             ));
         }
-        let reserved_names = tools
-            .tools()
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect::<Vec<_>>();
         let provider_name = session.provider().unwrap_or_else(|| "default".to_string());
-        let payload =
-            serde_json::json!({"reason": "startup", "provider": provider_name, "model": model});
-        let hooks = Hooks::initialize(
-            config.hooks.clone(),
-            store.workspace().to_path_buf(),
-            &reserved_names,
-            payload,
-            &mut session,
-            &cancellation,
-            &mut |notice| startup_notices.push(notice),
-        )?;
-        let prompt = effective_prompt(store.workspace(), &tools, &hooks);
+        let prompt = effective_prompt(store.workspace(), &tools);
         let identity = prompt.identity();
         if previous_identity
             .as_ref()
             .is_some_and(|previous| previous != &identity)
         {
             startup_notices.push(
-                "prompt or hook/tool resources changed since this session was last opened"
-                    .to_string(),
+                "prompt or tool resources changed since this session was last opened".to_string(),
             );
         }
         session.append_runtime_identity(&identity)?;
         if session.model().as_deref() != Some(model.as_str()) {
             session.set_model(&model)?;
         }
-        hooks.notify(
-            "session_start",
-            serde_json::json!({"session_id": session.id()}),
-            &mut session,
-            &cancellation,
-            &mut |notice| startup_notices.push(notice),
-        );
         let usage = session.usage();
-        let hint = hooks.take_hint().flatten();
         Ok(Self {
             provider,
             provider_name,
             provider_factory: None,
             store,
             session,
-            hooks,
             tools,
-            configured_tools,
-            tool_state_directory,
             prompt,
             model,
             max_tool_rounds: config.max_tool_rounds,
@@ -245,8 +146,6 @@ impl Runtime {
             usage,
             startup_notices,
             interactive: false,
-            hint,
-            questions_answered: 0,
         })
     }
 
@@ -258,211 +157,8 @@ impl Runtime {
         &self.tools
     }
 
-    pub fn tool_statuses(&self) -> Result<Vec<ToolStatus>, String> {
-        let global = Overrides::load(&self.tool_state_directory)?;
-        let session = self.session.tool_states()?;
-        Ok(self
-            .tools
-            .tools()
-            .iter()
-            .map(|tool| {
-                let source = if session.contains_key(&tool.name) {
-                    "session"
-                } else if global.tools.contains_key(&tool.name) {
-                    "global"
-                } else {
-                    "config"
-                };
-                ToolStatus {
-                    name: tool.name.clone(),
-                    enabled: tool.enabled,
-                    available: tool.process.command.is_some(),
-                    source,
-                }
-            })
-            .collect())
-    }
-
-    pub fn set_tool_state(
-        &mut self,
-        name: &str,
-        state: ToolState,
-        global_scope: bool,
-    ) -> Result<(), String> {
-        self.prepare_write()?;
-        if !self.tools.tools().iter().any(|tool| tool.name == name) {
-            return Err(format!("unknown directory tool {name:?}"));
-        }
-        let mut global = Overrides::load(&self.tool_state_directory)?;
-        if global_scope {
-            match state {
-                ToolState::Enabled => {
-                    global.tools.insert(name.to_string(), true);
-                }
-                ToolState::Disabled => {
-                    global.tools.insert(name.to_string(), false);
-                }
-                ToolState::Inherit => {
-                    global.tools.remove(name);
-                }
-            }
-            global.save(&self.tool_state_directory)?;
-        } else {
-            self.session.set_tool_state(name, state)?;
-        }
-        self.refresh_tools(&global)
-    }
-
-    fn refresh_tools(&mut self, global: &Overrides) -> Result<(), String> {
-        let mut tools = self.tools.clone();
-        let notices = apply_tool_states(&mut tools, global, &self.session)?;
-        let prompt = effective_prompt(self.store.workspace(), &tools, &self.hooks);
-        self.session.append_runtime_identity(&prompt.identity())?;
-        self.tools = tools;
-        self.prompt = prompt;
-        self.startup_notices.extend(notices);
-        Ok(())
-    }
-
     pub fn take_startup_notices(&mut self) -> Vec<String> {
-        if let Some(hint) = self.hooks.take_hint() {
-            self.hint = hint;
-        }
         std::mem::take(&mut self.startup_notices)
-    }
-
-    pub fn hook_commands(&self) -> &[crate::hooks::CommandSpec] {
-        self.hooks.commands()
-    }
-
-    pub fn hint(&self) -> Option<&str> {
-        self.hint.as_deref()
-    }
-
-    fn emit_hook_hint(&mut self, observer: &mut dyn Observer) -> Result<(), String> {
-        if let Some(hint) = self.hooks.take_hint() {
-            self.hint = hint.clone();
-            observer.event(Event::Hint(hint))?;
-        }
-        Ok(())
-    }
-
-    pub fn hook_command(
-        &mut self,
-        name: &str,
-        argument: &str,
-        observer: &mut dyn Observer,
-    ) -> Result<(), String> {
-        self.hook_command_with(name, argument, &mut Unattended, observer)
-    }
-
-    pub fn hook_command_with(
-        &mut self,
-        name: &str,
-        argument: &str,
-        responder: &mut dyn Responder,
-        observer: &mut dyn Observer,
-    ) -> Result<(), String> {
-        self.prepare_write()?;
-        self.cancellation.reset();
-        self.questions_answered = 0;
-        self.handle_hook_questions(responder, observer)?;
-        emit_notices(observer, self.take_startup_notices())?;
-        let mut notices = Vec::new();
-        let result = self.hooks.command(
-            name,
-            argument,
-            &mut self.session,
-            &self.cancellation,
-            &mut |notice| notices.push(notice),
-        );
-        emit_notices(observer, notices)?;
-        self.emit_hook_hint(observer)?;
-        result?;
-        self.handle_hook_questions(responder, observer)?;
-        if self.cancellation.cancelled() {
-            return Err("command cancelled".into());
-        }
-        Ok(())
-    }
-
-    pub fn pending_hook_questions(&self) -> bool {
-        self.hooks.has_questions()
-    }
-
-    pub fn resolve_hook_questions(
-        &mut self,
-        responder: &mut dyn Responder,
-        observer: &mut dyn Observer,
-    ) -> Result<(), String> {
-        self.prepare_write()?;
-        self.questions_answered = 0;
-        self.handle_hook_questions(responder, observer).map(|_| ())
-    }
-
-    fn handle_hook_questions(
-        &mut self,
-        responder: &mut dyn Responder,
-        observer: &mut dyn Observer,
-    ) -> Result<bool, String> {
-        let mut handled = false;
-        while let Some(pending) = self.hooks.take_question() {
-            handled = true;
-            if self.questions_answered >= 16 {
-                self.hooks.discard_questions();
-                observer.event(Event::Notice(
-                    "hook questions exceed the operation limit (16); skipped".into(),
-                ))?;
-                break;
-            }
-            self.questions_answered += 1;
-            let attended = responder.attended();
-            let mut answer = if attended && !self.cancellation.cancelled() {
-                match responder.answer(&pending.question) {
-                    Ok(answer) => answer,
-                    Err(error) => {
-                        observer.event(Event::Notice(format!(
-                            "hook {} question failed: {error}",
-                            pending.hook
-                        )))?;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            if self.cancellation.cancelled() {
-                answer = None;
-            }
-            if answer.as_ref().is_some_and(|value| {
-                !pending
-                    .question
-                    .choices
-                    .iter()
-                    .any(|choice| &choice.value == value)
-            }) {
-                observer.event(Event::Notice(format!(
-                    "hook {} question received an invalid choice; skipped",
-                    pending.hook
-                )))?;
-                answer = None;
-            }
-            let mut notices = Vec::new();
-            if let Err(error) = self.hooks.answer(
-                &pending,
-                answer.as_deref(),
-                attended,
-                &mut self.session,
-                &self.cancellation,
-                &mut |notice| notices.push(notice),
-            ) {
-                notices.push(format!("hook {} answer failed: {error}", pending.hook));
-            }
-            emit_notices(observer, notices)?;
-            self.emit_hook_hint(observer)?;
-            crate::process::ensure_cleanup()?;
-        }
-        Ok(handled)
     }
 
     /// Interfaces opt in explicitly; library and one-shot runs are unattended.
@@ -506,108 +202,67 @@ impl Runtime {
         }
     }
 
-    pub fn turn(
-        &mut self,
-        input: String,
-        responder: &mut dyn Responder,
-        observer: &mut dyn Observer,
-    ) -> Result<(), String> {
+    pub fn turn(&mut self, input: String, observer: &mut dyn Observer) -> Result<(), String> {
         self.prepare_write()?;
         emit_notices(observer, self.take_startup_notices())?;
         self.cancellation.reset();
-        self.questions_answered = 0;
-        self.handle_hook_questions(responder, observer)?;
-        let mut notices = Vec::new();
-        let input = self.hooks.transform_input(
-            input,
-            &mut self.session,
-            &self.cancellation,
-            &mut |notice| notices.push(notice),
-        )?;
-        emit_notices(observer, notices)?;
-        self.handle_hook_questions(responder, observer)?;
         if input.trim().is_empty() {
             return Err("prompt must not be empty".to_string());
         }
-        let entry = self.session.append_message(&Message::user(input.clone()))?;
-        self.notify(
-            "entry",
-            serde_json::json!({"id": entry, "type": "message", "role": "user"}),
-            observer,
-        )?;
-        self.notify("turn_start", serde_json::json!({"input": input}), observer)?;
+        self.session.append_message(&Message::user(input.clone()))?;
 
         let entries_before = self.session.entries().len();
         let mut tool_rounds = 0;
-        let result = self
-            .run_turn(responder, observer, &mut tool_rounds)
-            .or_else(|error| {
-                let recorded = self.session.entries()[entries_before..]
-                    .iter()
-                    .any(|entry| entry.kind == "turn_error");
-                if recorded {
-                    Err(error)
-                } else {
-                    self.fail_turn(error, self.cancellation.cancelled(), observer)
-                }
-            });
+        let result = self.run_turn(observer, &mut tool_rounds).or_else(|error| {
+            let recorded = self.session.entries()[entries_before..]
+                .iter()
+                .any(|entry| entry.kind == "turn_error");
+            if recorded {
+                Err(error)
+            } else {
+                self.fail_turn(error, self.cancellation.cancelled(), observer)
+            }
+        });
         let status = match &result {
             Ok(()) => "completed",
-            Err(_) if self.cancellation.cancelled() => "cancelled",
+            Err(_) if self.turn_was_cancelled(entries_before) => "cancelled",
             Err(_) => "error",
         };
         let last_entry_id = self.session.active_leaf().map(str::to_string);
-        let payload = serde_json::json!({
-            "status": status, "error": result.as_ref().err(),
-            "tool_rounds": tool_rounds, "last_entry_id": last_entry_id,
+        let turn_end = observer.event(Event::TurnEnd {
+            status,
+            tool_rounds,
+            last_entry_id,
         });
-        let end_result = self
-            .after_cancellation(status == "cancelled", |runtime| {
-                runtime.notify("turn_end", payload, observer)
-            })
-            .and_then(|()| self.handle_hook_questions(responder, observer).map(|_| ()))
-            .and_then(|()| {
-                observer.event(Event::TurnEnd {
-                    status,
-                    tool_rounds,
-                    last_entry_id,
-                })
-            });
-        result.and(end_result)
+        result.and(turn_end)
+    }
+
+    /// Whether the turn recorded since `entries_before` ended in cancellation.
+    fn turn_was_cancelled(&self, entries_before: usize) -> bool {
+        self.session.entries()[entries_before..]
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == "turn_error")
+            .and_then(|entry| entry.data.get("cancelled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| self.cancellation.cancelled())
     }
 
     fn run_turn(
         &mut self,
-        responder: &mut dyn Responder,
         observer: &mut dyn Observer,
         tool_rounds: &mut usize,
     ) -> Result<(), String> {
-        let mut stop_reminders = 0;
         // An attended turn runs until the model stops or the user cancels it;
         // the round budget protects runs nobody is watching.
-        let budget = (!responder.attended()).then_some(self.max_tool_rounds);
+        let budget = (!self.interactive).then_some(self.max_tool_rounds);
         loop {
             if budget.is_some_and(|budget| *tool_rounds >= budget) {
                 let error = format!("tool round limit ({}) reached", self.max_tool_rounds);
                 return self.fail_turn(error, false, observer);
             }
             self.maybe_compact(false, None, observer)?;
-            let messages = loop {
-                self.handle_hook_questions(responder, observer)?;
-                let messages = self.session.context_messages()?;
-                let mut notices = Vec::new();
-                let messages = self.hooks.transform_context(
-                    messages,
-                    &mut self.session,
-                    &self.cancellation,
-                    &mut |notice| notices.push(notice),
-                )?;
-                emit_notices(observer, notices)?;
-                let changed = self.handle_hook_questions(responder, observer)?;
-                if !changed || self.questions_answered >= 16 {
-                    break messages;
-                }
-            };
+            let messages = self.session.context_messages()?;
             self.ensure_fits(&messages)?;
             let request = self.request(messages, true);
             let completion = {
@@ -639,46 +294,19 @@ impl Runtime {
                 );
             }
             let assistant = completion.message();
-            let entry = self.session.append_message(&assistant)?;
-            self.notify(
-                "entry",
-                serde_json::json!({"id": entry, "type": "message", "role": "assistant"}),
-                observer,
-            )?;
+            self.session.append_message(&assistant)?;
             self.session.append_usage(&completion.usage)?;
             observer.event(Event::Usage {
                 request: completion.usage,
                 total: self.usage,
             })?;
             if completion.tool_calls.is_empty() {
-                if *tool_rounds > 0 && stop_reminders < 3 {
-                    let mut notices = Vec::new();
-                    let reminder = self.hooks.before_stop(
-                        serde_json::json!({"tool_rounds": tool_rounds, "last_entry_id": entry}),
-                        &mut self.session,
-                        &self.cancellation,
-                        &mut |notice| notices.push(notice),
-                    );
-                    emit_notices(observer, notices)?;
-                    if self.cancellation.cancelled() {
-                        return self.fail_turn("turn cancelled".into(), true, observer);
-                    }
-                    if let Some(reminder) = reminder {
-                        stop_reminders += 1;
-                        let note = self
-                            .session
-                            .append_message(&Message::user(reminder.clone()))?;
-                        self.notify("entry", serde_json::json!({"id": note, "type": "message", "role": "user", "source": "before_stop"}), observer)?;
-                        observer.event(Event::Notice(format!("before_stop: {reminder}")))?;
-                        continue;
-                    }
-                }
                 return Ok(());
             }
             *tool_rounds += 1;
             let calls = completion.tool_calls;
             for (index, call) in calls.iter().cloned().enumerate() {
-                if let Err(error) = self.execute_call(call, responder, observer) {
+                if let Err(error) = self.execute_call(call, observer) {
                     self.record_unstarted_calls(
                         &calls[index + 1..],
                         "an earlier call ended the round",
@@ -694,18 +322,6 @@ impl Runtime {
         }
     }
 
-    /// Lifecycle hooks still observe a cancelled turn: they run with a fresh
-    /// token, and the cancellation is restored for whatever follows.
-    fn after_cancellation<T>(&mut self, cancelled: bool, run: impl FnOnce(&mut Self) -> T) -> T {
-        if !cancelled {
-            return run(self);
-        }
-        self.cancellation.reset();
-        let result = run(self);
-        self.cancellation.cancel();
-        result
-    }
-
     fn fail_turn(
         &mut self,
         error: String,
@@ -713,16 +329,8 @@ impl Runtime {
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
         let cancelled = cancelled || self.cancellation.cancelled();
-        let entry = self.session.append_error(&error, cancelled)?;
-        let notification = self.after_cancellation(cancelled, |runtime| {
-            runtime.notify(
-                "entry",
-                serde_json::json!({"id": entry, "type": "turn_error"}),
-                observer,
-            )
-        });
-        // An observer failure must not replace the recorded turn error.
-        let _ = notification;
+        self.session.append_error(&error, cancelled)?;
+        let _ = observer;
         Err(error)
     }
 
@@ -746,19 +354,12 @@ impl Runtime {
             return Err("model id must not be empty".to_string());
         }
         self.cancellation.reset();
-        let prepared = self.prepare_hook_setup("model_change", &self.provider_name.clone(), &model);
+        let prompt = self.refresh_prompt()?;
         emit_notices(observer, self.take_startup_notices())?;
-        let (hooks, prompt) = prepared?;
-        let entry = self.session.set_model(&model)?;
+        self.session.set_model(&model)?;
         self.session.append_runtime_identity(&prompt.identity())?;
         self.model = model.clone();
-        self.hooks = hooks;
         self.prompt = prompt;
-        self.notify(
-            "model_change",
-            serde_json::json!({"id": entry, "model": model}),
-            observer,
-        )?;
         observer.event(Event::ModelChanged(model))
     }
 
@@ -773,20 +374,13 @@ impl Runtime {
             .ok_or("provider switching is not configured")?;
         let provider = factory(name)?;
         self.cancellation.reset();
-        let prepared = self.prepare_hook_setup("provider_change", name, &self.model.clone());
+        let prompt = self.refresh_prompt()?;
         emit_notices(observer, self.take_startup_notices())?;
-        let (hooks, prompt) = prepared?;
-        let entry = self.session.set_provider(name)?;
+        self.session.set_provider(name)?;
         self.session.append_runtime_identity(&prompt.identity())?;
         self.provider = provider;
         self.provider_name = name.to_string();
-        self.hooks = hooks;
         self.prompt = prompt;
-        self.notify(
-            "provider_change",
-            serde_json::json!({"id": entry, "provider": name}),
-            observer,
-        )?;
         observer.event(Event::Notice(format!("provider: {name}")))
     }
 
@@ -839,7 +433,7 @@ impl Runtime {
     pub fn select_entry(&mut self, id: &str) -> Result<Option<String>, String> {
         self.prepare_write()?;
         let draft = self.session.select(id)?;
-        self.refresh_tools(&Overrides::load(&self.tool_state_directory)?)?;
+
         Ok(draft)
     }
 
@@ -854,8 +448,7 @@ impl Runtime {
     pub fn reset(&mut self) -> Result<usize, String> {
         // Leave the saved session first, so nothing writes into removed files.
         self.new_session(true, None)?;
-        let removed = crate::reset::reset(&self.tool_state_directory, self.store.workspace())?;
-        self.tools = self.configured_tools.clone();
+        let removed = crate::reset::reset(self.store.directory(), self.store.workspace())?;
         self.new_session(false, None)?;
         Ok(removed)
     }
@@ -864,7 +457,7 @@ impl Runtime {
         self.prepare_write()?;
         self.cancellation.reset();
         if self.session.id() == selector {
-            return self.refresh_hooks("resume");
+            return Ok(());
         }
         let session = self.store.open(selector)?;
         self.install_session(session, "resume")
@@ -888,61 +481,26 @@ impl Runtime {
             self.startup_notices.push(error);
             return std::mem::take(&mut self.startup_notices);
         }
-        let mut notices = self.take_startup_notices();
+        let notices = self.take_startup_notices();
         self.cancellation.reset();
-        self.hooks.notify(
-            "session_end",
-            serde_json::json!({"session_id": self.session.id()}),
-            &mut self.session,
-            &self.cancellation,
-            &mut |notice| notices.push(notice),
-        );
-        self.questions_answered = 0;
-        if let Err(error) = self.handle_hook_questions(&mut Unattended, &mut |event| {
-            if let Event::Notice(text) = event {
-                notices.push(text);
-            }
-            Ok(())
-        }) {
-            notices.push(error);
-        }
         notices
     }
 
-    fn refresh_hooks(&mut self, reason: &str) -> Result<(), String> {
-        let (hooks, prompt) =
-            self.prepare_hook_setup(reason, &self.provider_name.clone(), &self.model.clone())?;
-        self.session.append_runtime_identity(&prompt.identity())?;
-        self.hooks = hooks;
-        self.prompt = prompt;
-        Ok(())
+    fn refresh_prompt(&mut self) -> Result<Effective, String> {
+        let prompt = effective_prompt(self.store.workspace(), &self.tools);
+        if self
+            .session
+            .latest_runtime_identity()
+            .is_none_or(|previous| previous != prompt.identity())
+        {
+            self.startup_notices.push(
+                "prompt or tool resources changed since this session was last opened".to_string(),
+            );
+        }
+        Ok(prompt)
     }
 
-    fn prepare_hook_setup(
-        &mut self,
-        reason: &str,
-        provider: &str,
-        model: &str,
-    ) -> Result<(Hooks, Effective), String> {
-        let reserved = self
-            .tools
-            .tools()
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect::<Vec<_>>();
-        let payload = serde_json::json!({"reason": reason, "provider": provider, "model": model});
-        let hooks = self.hooks.setup_again(
-            &reserved,
-            payload,
-            &mut self.session,
-            &self.cancellation,
-            &mut |notice| self.startup_notices.push(notice),
-        )?;
-        let prompt = effective_prompt(self.store.workspace(), &self.tools, &hooks);
-        Ok((hooks, prompt))
-    }
-
-    fn install_session(&mut self, mut session: Session, reason: &str) -> Result<(), String> {
+    fn install_session(&mut self, mut session: Session, _reason: &str) -> Result<(), String> {
         self.cancellation.reset();
         let provider_name = session
             .provider()
@@ -965,29 +523,11 @@ impl Runtime {
                 session.recovered_entries()
             ));
         }
-        let mut tools = self.tools.clone();
-        self.startup_notices.extend(apply_tool_states(
-            &mut tools,
-            &Overrides::load(&self.tool_state_directory)?,
-            &session,
-        )?);
         let model = session.model().unwrap_or_else(|| self.model.clone());
         if session.model().is_none() {
             session.set_model(&model)?;
         }
-        let reserved = tools
-            .tools()
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect::<Vec<_>>();
-        let hooks = self.hooks.setup_again(
-            &reserved,
-            serde_json::json!({"reason": reason, "provider": provider_name, "model": model}),
-            &mut session,
-            &self.cancellation,
-            &mut |notice| self.startup_notices.push(notice),
-        )?;
-        let prompt = effective_prompt(self.store.workspace(), &tools, &hooks);
+        let prompt = effective_prompt(self.store.workspace(), &self.tools);
         let identity = prompt.identity();
         if session
             .latest_runtime_identity()
@@ -995,67 +535,32 @@ impl Runtime {
             .is_some_and(|previous| previous != &identity)
         {
             self.startup_notices.push(
-                "prompt or hook/tool resources changed since this session was last opened"
-                    .to_string(),
+                "prompt or tool resources changed since this session was last opened".to_string(),
             );
         }
         session.append_runtime_identity(&identity)?;
-        self.hooks.notify(
-            "session_end",
-            serde_json::json!({"session_id": self.session.id()}),
-            &mut self.session,
-            &self.cancellation,
-            &mut |notice| self.startup_notices.push(notice),
-        );
         if let Some(provider) = provider {
             self.provider = provider;
             self.provider_name = provider_name;
         }
         self.session = session;
         self.model = model;
-        self.tools = tools;
-        self.hooks = hooks;
         self.prompt = prompt;
         self.usage = self.session.usage();
-        self.hooks.notify(
-            "session_start",
-            serde_json::json!({"session_id": self.session.id()}),
-            &mut self.session,
-            &self.cancellation,
-            &mut |notice| self.startup_notices.push(notice),
-        );
         Ok(())
     }
 
-    fn execute_call(
-        &mut self,
-        call: ToolCall,
-        responder: &mut dyn Responder,
-        observer: &mut dyn Observer,
-    ) -> Result<(), String> {
-        if self.tools.enabled(&call.name).is_none() && !self.hooks.owns_tool(&call.name) {
-            let reason = format!("unknown or disabled tool {:?}", call.name);
+    fn execute_call(&mut self, call: ToolCall, observer: &mut dyn Observer) -> Result<(), String> {
+        let Some(tool) = self.tools.get(&call.name).cloned() else {
+            let reason = format!("unknown tool {:?}", call.name);
             return self.record_unstarted_calls(std::slice::from_ref(&call), &reason, observer);
-        }
-        let detail = if let Some(tool) = self.tools.enabled(&call.name) {
-            match tool.display_detail(&call.arguments) {
-                Ok(Some(detail)) => detail,
-                Ok(None) => call_detail(&call),
-                Err(error) => {
-                    return self.record_unstarted_calls(
-                        std::slice::from_ref(&call),
-                        &error,
-                        observer,
-                    );
-                }
-            }
-        } else {
-            call_detail(&call)
         };
-        if let Err(error) = self.handle_hook_questions(responder, observer) {
-            self.record_unstarted_calls(std::slice::from_ref(&call), &error, observer)?;
-            return Err(error);
-        }
+        let detail = match tool.display_detail(&call.arguments, self.session.path()) {
+            Ok(detail) => detail,
+            Err(error) => {
+                return self.record_unstarted_calls(std::slice::from_ref(&call), &error, observer);
+            }
+        };
         if let Err(error) = observer.event(Event::ToolStart {
             call_id: call.id.clone(),
             name: call.name.clone(),
@@ -1072,79 +577,24 @@ impl Runtime {
             self.record_unstarted_calls(std::slice::from_ref(&call), "turn cancelled", observer)?;
             return Err("turn cancelled".into());
         }
-        let mut post_error = None;
-        let (result, outcome) = if let Some(tool) = self.tools.enabled(&call.name) {
-            let shell_state = tool
-                .process
-                .shell_state
-                .then(|| self.session.shell_state_directory())
-                .transpose();
-            match shell_state {
-                Ok(path) => self.execute_directory_tool(tool, &call, path.as_deref(), observer),
-                Err(error) => (
-                    ToolResult {
-                        content: error,
-                        is_error: true,
-                    },
-                    ToolOutcome::NotStarted,
-                ),
-            }
-        } else if self.hooks.owns_tool(&call.name) {
-            let mut notices = Vec::new();
-            let result = self.hooks.execute_tool(
-                &call,
-                &mut self.session,
-                &self.cancellation,
-                &mut |notice| notices.push(notice),
-            );
-            if let Err(error) = emit_notices(observer, notices) {
-                post_error.get_or_insert(error);
-            }
-            let outcome = if self.cancellation.cancelled() {
-                ToolOutcome::InterruptedUnknown
-            } else {
-                ToolOutcome::Completed
-            };
-            (
-                result.unwrap_or_else(|error| ToolResult {
-                    content: error,
-                    is_error: true,
-                }),
-                outcome,
-            )
-        } else {
-            (
+        let (result, outcome) = match self.execute_tool(&tool, &call, observer) {
+            Ok(result) => result,
+            Err(error) => (
                 ToolResult {
-                    content: format!("unknown tool {:?}", call.name),
+                    content: error,
                     is_error: true,
                 },
                 ToolOutcome::NotStarted,
-            )
+            ),
         };
-        let result = if self.cancellation.cancelled() {
-            result
-        } else {
-            let mut notices = Vec::new();
-            let transformed = self.hooks.transform_tool_result(
-                &call,
-                result.clone(),
-                &mut self.session,
-                &self.cancellation,
-                &mut |notice| notices.push(notice),
-            );
-            if let Err(error) = emit_notices(observer, notices) {
-                post_error.get_or_insert(error);
-            }
-            match transformed {
-                Ok(transformed) => transformed,
-                Err(error) => {
-                    post_error.get_or_insert(error);
-                    result
-                }
-            }
-        };
-        let entry = self
-            .session
+        let end = observer.event(Event::ToolEnd {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            content: result.content.clone(),
+            is_error: result.is_error,
+            outcome,
+        });
+        self.session
             .append_message(&Message::tool_result_with_outcome(
                 &call.id,
                 &call.name,
@@ -1152,29 +602,8 @@ impl Runtime {
                 result.is_error,
                 outcome,
             ))?;
-        let notification = self.notify(
-            "entry",
-            self.tool_entry(&entry, &call, &result, outcome),
-            observer,
-        );
-        let end = observer.event(Event::ToolEnd {
-            call_id: call.id,
-            name: call.name,
-            content: result.content,
-            is_error: result.is_error,
-            outcome,
-        });
-        if let Err(error) = self.handle_hook_questions(responder, observer) {
-            post_error.get_or_insert(error);
-        }
-        match post_error
-            .or_else(|| crate::process::ensure_cleanup().err())
-            .or(notification.err())
-            .or(end.err())
-        {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        end?;
+        crate::process::ensure_cleanup()
     }
 
     fn record_unstarted_calls(
@@ -1183,11 +612,9 @@ impl Runtime {
         reason: &str,
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
-        let cancelled = self.cancellation.cancelled();
         for call in calls {
             let content = format!("tool call not started: {reason}");
-            let entry = self
-                .session
+            self.session
                 .append_message(&Message::tool_result_with_outcome(
                     &call.id,
                     &call.name,
@@ -1195,19 +622,6 @@ impl Runtime {
                     true,
                     ToolOutcome::NotStarted,
                 ))?;
-            let notification = self.after_cancellation(cancelled, |runtime| {
-                let payload = runtime.tool_entry(
-                    &entry,
-                    call,
-                    &ToolResult {
-                        content: content.clone(),
-                        is_error: true,
-                    },
-                    ToolOutcome::NotStarted,
-                );
-                runtime.notify("entry", payload, observer)
-            });
-            let _ = notification;
             let _ = observer.event(Event::ToolEnd {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -1219,48 +633,25 @@ impl Runtime {
         Ok(())
     }
 
-    fn tool_metadata(&self, name: &str) -> serde_json::Value {
-        let tool = self.tools.enabled(name);
-        let shell_state = tool
-            .is_some_and(|tool| tool.process.shell_state)
-            .then(|| self.session.shell_state_path())
-            .flatten();
-        serde_json::json!({"read_only": tool.is_some_and(|tool| tool.read_only),
-            "shell_state_directory": shell_state})
-    }
-
-    fn tool_entry(
-        &self,
-        id: &str,
-        call: &ToolCall,
-        result: &ToolResult,
-        outcome: ToolOutcome,
-    ) -> serde_json::Value {
-        let mut end = result.content.len().min(64 * 1024);
-        while !result.content.is_char_boundary(end) {
-            end -= 1;
-        }
-        serde_json::json!({"id": id, "type": "message", "role": "tool",
-            "tool_call": call, "tool": self.tool_metadata(&call.name), "outcome": outcome,
-            "tool_result": {"content": &result.content[..end], "is_error": result.is_error},
-            "tool_result_truncated": end < result.content.len()})
-    }
-
-    fn execute_directory_tool(
-        &self,
+    fn execute_tool(
+        &mut self,
         tool: &crate::tools::Tool,
         call: &ToolCall,
-        shell_state: Option<&std::path::Path>,
         observer: &mut dyn Observer,
-    ) -> (ToolResult, ToolOutcome) {
-        let mut observer_error = None;
-        let context = ExecutionContext {
-            workspace: self.store.workspace(),
-            session_id: self.session.id(),
-            session_path: self.session.path(),
-            shell_state,
+    ) -> Result<(ToolResult, ToolOutcome), String> {
+        let shell_state = if tool.name == "sh" {
+            Some(self.session.shell_state_directory()?)
+        } else {
+            None
         };
-        let output = tool.execute(
+        let context = Context::new(
+            self.store.workspace().to_path_buf(),
+            self.store.directory().to_path_buf(),
+            self.session.id().to_string(),
+            shell_state,
+        )?;
+        let mut observer_error = None;
+        let (result, outcome) = tool.execute(
             &call.arguments,
             &context,
             &self.cancellation,
@@ -1276,50 +667,24 @@ impl Runtime {
             },
         );
         if let Some(error) = observer_error {
-            return (
+            return Ok((
                 ToolResult {
                     content: error,
                     is_error: true,
                 },
                 ToolOutcome::InterruptedUnknown,
-            );
+            ));
         }
-        match output {
-            Ok(output) => {
-                let interrupted = output.cancelled || output.timed_out;
-                let failed = interrupted
-                    || !output
-                        .code
-                        .is_some_and(|code| tool.process.normal_exit_statuses.contains(&code));
-                let content = if tool.process.stdout_only && !failed {
-                    output.model_stdout(MODEL_STREAM_BYTES)
-                } else {
-                    output.model_text(MODEL_STREAM_BYTES)
-                };
-                (
-                    ToolResult {
-                        content,
-                        is_error: failed,
-                    },
-                    if interrupted {
-                        ToolOutcome::InterruptedUnknown
-                    } else {
-                        ToolOutcome::Completed
-                    },
-                )
-            }
-            Err(error) => (
-                ToolResult {
-                    content: error.to_string(),
-                    is_error: true,
+        Ok((
+            ToolResult {
+                is_error: result.is_err(),
+                content: match result {
+                    Ok(content) => content,
+                    Err(error) => error,
                 },
-                if error.started {
-                    ToolOutcome::InterruptedUnknown
-                } else {
-                    ToolOutcome::NotStarted
-                },
-            ),
-        }
+            },
+            outcome,
+        ))
     }
 
     fn request(&self, messages: Vec<Message>, tools: bool) -> Request {
@@ -1327,10 +692,8 @@ impl Runtime {
             .with_system(self.prompt.fragments().to_vec())
             .with_cancellation(self.cancellation.clone());
         if tools {
-            let mut specs = Vec::new();
-            specs.extend(self.tools.enabled_tools().map(crate::tools::Tool::spec));
-            specs.extend(self.hooks.initialized().tools);
-            request.with_tools(specs)
+            let specs = self.tools.tools().iter().map(crate::tools::Tool::spec);
+            request.with_tools(specs.collect())
         } else {
             request
         }
@@ -1352,80 +715,46 @@ impl Runtime {
         if !force && tokens_before <= threshold {
             return Ok(false);
         }
-        let mut notices = Vec::new();
-        let advice = self.hooks.before_compact(
-            serde_json::json!({
-                "automatic": !force,
-                "focus": focus,
-                "tokens_before": tokens_before,
-                "window_tokens": self.context.window_tokens,
-                "output_reserve_tokens": self.context.output_reserve_tokens,
-                "recent_tail_tokens": self.context.recent_tail_tokens,
-            }),
-            &mut self.session,
-            &self.cancellation,
-            &mut |notice| notices.push(notice),
-        )?;
-        emit_notices(observer, notices)?;
-        if advice.cancel {
-            observer.event(Event::Notice("compaction cancelled by hook".to_string()))?;
-            return Ok(false);
-        }
-        let reserve = advice
-            .output_reserve_tokens
-            .unwrap_or(self.context.output_reserve_tokens);
-        let tail_tokens = advice
-            .recent_tail_tokens
-            .unwrap_or(self.context.recent_tail_tokens);
+        let reserve = self.context.output_reserve_tokens;
+        let tail_tokens = self.context.recent_tail_tokens;
         validate_compaction_limits(self.context.window_tokens, reserve, tail_tokens)?;
         let (older, retained_tail) = split_tail(&messages, tail_tokens);
         if older.is_empty() {
             return Ok(false);
         }
-        let focus = advice.focus.or(focus);
-        let (summary, retained_tail) = match advice.summary {
-            Some(summary) => {
-                let retained = advice
-                    .retained_tail
-                    .ok_or("before_compact supplied a summary without a complete retained_tail")?;
-                (summary, retained)
-            }
-            None => {
-                let mut system = vec![crate::prompt::COMPACTION.trim().to_string()];
-                if let Some(focus) = focus.as_deref() {
-                    system.push(format!(
-                        "Additional focus: {}",
-                        clipped_text(focus, self.context.window_tokens as usize / 2)
-                    ));
-                }
-                let input = compaction_input(&older, self.context.window_tokens);
-                let request = Request::new(&self.model, input)
-                    .with_system(system)
-                    .with_cancellation(self.cancellation.clone());
-                if estimate_request_tokens(&request.system, &request.messages, &[])
-                    >= self.context.window_tokens
-                {
-                    return Err("compaction instructions exceed the model limit".to_string());
-                }
-                let mut sink = CancellationSink {
-                    cancellation: &self.cancellation,
-                };
-                let completion = self
-                    .provider
-                    .complete(&request, &mut sink)
-                    .map_err(|error| format!("compaction failed: {error}"))?;
-                self.usage.add(&completion.usage);
-                self.session.append_usage(&completion.usage)?;
-                observer.event(Event::Usage {
-                    request: completion.usage,
-                    total: self.usage,
-                })?;
-                if completion.content.trim().is_empty() {
-                    return Err("compaction returned an empty summary".to_string());
-                }
-                (completion.content, retained_tail)
-            }
+        let mut system = vec![crate::prompt::COMPACTION.trim().to_string()];
+        if let Some(focus) = focus.as_deref() {
+            system.push(format!(
+                "Additional focus: {}",
+                clipped_text(focus, self.context.window_tokens as usize / 2)
+            ));
+        }
+        let input = compaction_input(&older, self.context.window_tokens);
+        let request = Request::new(&self.model, input)
+            .with_system(system)
+            .with_cancellation(self.cancellation.clone());
+        if estimate_request_tokens(&request.system, &request.messages, &[])
+            >= self.context.window_tokens
+        {
+            return Err("compaction instructions exceed the model limit".to_string());
+        }
+        let mut sink = CancellationSink {
+            cancellation: &self.cancellation,
         };
+        let completion = self
+            .provider
+            .complete(&request, &mut sink)
+            .map_err(|error| format!("compaction failed: {error}"))?;
+        self.usage.add(&completion.usage);
+        self.session.append_usage(&completion.usage)?;
+        observer.event(Event::Usage {
+            request: completion.usage,
+            total: self.usage,
+        })?;
+        let summary = completion.content;
+        if summary.trim().is_empty() {
+            return Err("compaction returned an empty summary".to_string());
+        }
         let retained_tail = cap_tool_results(retained_tail, self.context.window_tokens);
         let compact_context = {
             let mut context = vec![Message::user(format!("[Conversation summary]\n{summary}"))];
@@ -1441,20 +770,7 @@ impl Runtime {
             retained_tail,
             tokens_before,
         };
-        let entry_id = self.session.append_compaction(&entry)?;
-        self.notify(
-            "entry",
-            serde_json::json!({"id": entry_id, "type": "compaction"}),
-            observer,
-        )?;
-        self.notify(
-            "after_compact",
-            serde_json::to_value(&entry).expect("compaction serializes"),
-            observer,
-        )?;
-        let refreshed = self.refresh_hooks("compaction");
-        emit_notices(observer, self.take_startup_notices())?;
-        refreshed?;
+        self.session.append_compaction(&entry)?;
         observer.event(Event::Notice("context compacted".to_string()))?;
         Ok(true)
     }
@@ -1468,40 +784,12 @@ impl Runtime {
         let tokens = estimate_request_tokens(&prefix.system, messages, &prefix.tools);
         if tokens > limit {
             Err(format!(
-                "hook-transformed context is approximately {tokens} tokens; limit is {limit}"
+                "context is approximately {tokens} tokens; limit is {limit}"
             ))
         } else {
             Ok(())
         }
     }
-
-    fn notify(
-        &mut self,
-        event: &str,
-        payload: Value,
-        observer: &mut dyn Observer,
-    ) -> Result<(), String> {
-        let mut notices = Vec::new();
-        self.hooks.notify(
-            event,
-            payload,
-            &mut self.session,
-            &self.cancellation,
-            &mut |notice| notices.push(notice),
-        );
-        emit_notices(observer, notices)?;
-        self.emit_hook_hint(observer)
-    }
-}
-
-fn call_detail(call: &ToolCall) -> String {
-    if call.name == "sh"
-        && let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments)
-        && let Some(command) = arguments.get("command").and_then(Value::as_str)
-    {
-        return command.to_string();
-    }
-    format!("{} {}", call.name, call.arguments)
 }
 
 fn emit_notices(observer: &mut dyn Observer, notices: Vec<String>) -> Result<(), String> {
@@ -1544,48 +832,12 @@ impl EventSink for CancellationSink<'_> {
     }
 }
 
-fn apply_tool_states(
-    tools: &mut Registry,
-    global: &Overrides,
-    session: &Session,
-) -> Result<Vec<String>, String> {
-    let session_states = session.tool_states()?;
-    let mut notices = Vec::new();
-    for name in global.tools.keys().chain(session_states.keys()) {
-        if !tools.tools().iter().any(|tool| &tool.name == name) {
-            notices.push(format!(
-                "tool state refers to unconfigured directory tool {name:?}"
-            ));
-        }
-    }
-    notices.sort();
-    notices.dedup();
-    let states = tools
-        .tools()
-        .iter()
-        .map(|tool| {
-            let enabled = session_states
-                .get(&tool.name)
-                .map(|state| *state == ToolState::Enabled)
-                .or_else(|| global.tools.get(&tool.name).copied())
-                .unwrap_or(tool.enabled_by_default);
-            (tool.name.clone(), enabled)
-        })
-        .collect::<Vec<_>>();
-    for (name, enabled) in states {
-        tools.set_enabled(&name, enabled)?;
-    }
-    Ok(notices)
-}
-
-fn effective_prompt(workspace: &std::path::Path, tools: &Registry, hooks: &Hooks) -> Effective {
+fn effective_prompt(workspace: &std::path::Path, tools: &Registry) -> Effective {
     let manifest = serde_json::json!({
-        "directory_tools": tools.enabled_tools().collect::<Vec<_>>(),
-        "hooks": hooks.manifest(),
+        "tools": tools.tools().iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
     });
-    Effective::new(workspace, hooks.initialized().prompt_fragments, &manifest)
+    Effective::new(workspace, &manifest)
 }
-
 fn estimate_request_tokens(prompt: &[String], messages: &[Message], tools: &[ToolSpec]) -> u64 {
     let bytes = serde_json::to_vec(&(prompt, messages, tools))
         .map(|bytes| bytes.len())
@@ -1681,7 +933,7 @@ fn compaction_input(messages: &[Message], window_tokens: u64) -> Vec<Message> {
 
 fn validate_compaction_limits(window: u64, reserve: u64, tail: u64) -> Result<(), String> {
     if reserve >= window || tail >= window.saturating_sub(reserve) {
-        return Err("hook returned invalid compaction thresholds".to_string());
+        return Err("invalid compaction thresholds".to_string());
     }
     Ok(())
 }
@@ -1689,39 +941,6 @@ fn validate_compaction_limits(window: u64, reserve: u64, tail: u64) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tool_state_precedence_and_stale_names() {
-        let root =
-            std::env::temp_dir().join(format!("gears-runtime-tool-state-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("workspace")).unwrap();
-        let store = Store::with_root(&root.join("workspace"), root.join("state")).unwrap();
-        let mut session = store.create(true, None).unwrap();
-        let mut registry = Registry::load(
-            &[crate::config::ToolDirectory {
-                directory: PathBuf::from("tools/sh"),
-                enabled: true,
-            }],
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
-        )
-        .unwrap();
-        let mut global = Overrides::default();
-        global.tools.insert("sh".into(), false);
-        global.tools.insert("removed".into(), true);
-        let notices = apply_tool_states(&mut registry, &global, &session).unwrap();
-        assert_eq!(notices.len(), 1);
-        assert!(notices[0].contains("removed"));
-        assert!(registry.enabled("sh").is_none());
-        session.set_tool_state("sh", ToolState::Enabled).unwrap();
-        apply_tool_states(&mut registry, &global, &session).unwrap();
-        assert!(registry.enabled("sh").is_some());
-        session.set_tool_state("sh", ToolState::Inherit).unwrap();
-        apply_tool_states(&mut registry, &global, &session).unwrap();
-        assert!(registry.enabled("sh").is_none());
-        drop(session);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn tail_does_not_begin_with_a_tool_result() {
@@ -1743,12 +962,6 @@ mod tests {
         assert!(retained[0].text_content().len() < 500);
         assert!(retained[0].text_content().contains("[truncated]"));
         assert_eq!(original[0].text_content().len(), 10_000);
-    }
-
-    #[test]
-    fn sh_detail_displays_the_exact_command() {
-        let call = ToolCall::new("one", "sh", r#"{"command":"printf '%s' hello"}"#);
-        assert_eq!(call_detail(&call), "printf '%s' hello");
     }
 
     #[test]

@@ -4,11 +4,10 @@ use std::path::Path;
 
 /// What an installation provides in the Gears directory; reset keeps it, and
 /// the lock file, which a running Gears holds.
-const KEPT: [&str; 4] = ["gears.toml", "gears-batteries.toml", "tools", "gears.lock"];
+const KEPT: [&str; 2] = ["gears.toml", "gears.lock"];
 
-pub const DESCRIPTION: &str = "Reset Gears: remove keys, saved settings, memory, skills and \
-    sessions from the Gears directory (keeping gears.toml, gears-batteries.toml and tools/) \
-    and remove .gears/ from this directory.";
+pub const DESCRIPTION: &str = "Reset Gears: remove keys, saved settings and sessions from the \
+    Gears directory (keeping gears.toml) and remove .gears/ from this directory.";
 
 /// Returns how many entries were removed. The caller holds the directory lock.
 pub fn reset(directory: &Path, workspace: &Path) -> Result<usize, String> {
@@ -32,7 +31,7 @@ pub fn reset(directory: &Path, workspace: &Path) -> Result<usize, String> {
         removed += 1;
     }
     let local = workspace.join(".gears");
-    // `~/.gears` is the Linux Gears directory itself when run from the home directory.
+    // The workspace-local directory may also contain the installation.
     if std::fs::symlink_metadata(&local).is_ok() && !directory.starts_with(canonical(&local)?) {
         remove(&local)?;
         removed += 1;
@@ -65,41 +64,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let directory = root.join("gears");
         let workspace = root.join("workspace");
-        for path in [
-            "gears/tools/sh",
-            "gears/sessions/group",
-            "gears/batteries/skills/s",
-            "workspace/.gears",
-        ] {
+        for path in ["gears/sessions/group", "workspace/.gears"] {
             std::fs::create_dir_all(root.join(path)).unwrap();
         }
         for file in [
             "gears/gears.toml",
-            "gears/gears-batteries.toml",
             "gears/gears.lock",
-            "gears/tools/sh/tool.toml",
             "gears/openrouter.key",
-            "gears/provider.toml",
-            "gears/tools.toml",
-            "gears/batteries.toml",
-            "gears/batteries/MEMORY.md",
             "gears/sessions/group/s.jsonl",
-            "workspace/.gears/MEMORY.md",
+            "workspace/.gears/state.json",
             "workspace/AGENTS.md",
         ] {
             std::fs::write(root.join(file), "x").unwrap();
         }
-        assert_eq!(reset(&directory, &workspace).unwrap(), 7);
+        assert_eq!(reset(&directory, &workspace).unwrap(), 3);
         let mut left = std::fs::read_dir(&directory)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
         left.sort();
-        assert_eq!(
-            left,
-            ["gears-batteries.toml", "gears.lock", "gears.toml", "tools"]
-        );
-        assert!(root.join("gears/tools/sh/tool.toml").is_file());
+        assert_eq!(left, ["gears.lock", "gears.toml"]);
         assert!(!workspace.join(".gears").exists());
         assert!(workspace.join("AGENTS.md").is_file());
         assert_eq!(reset(&directory, &workspace).unwrap(), 0);
@@ -110,12 +94,12 @@ mod tests {
     fn a_workspace_whose_gears_directory_is_the_gears_directory_keeps_the_installation() {
         let root = std::env::temp_dir().join(format!("gears-reset-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".gears/tools")).unwrap();
+        std::fs::create_dir_all(root.join(".gears/sessions")).unwrap();
         std::fs::write(root.join(".gears/gears.toml"), "x").unwrap();
         std::fs::write(root.join(".gears/local.key"), "x").unwrap();
-        assert_eq!(reset(&root.join(".gears"), &root).unwrap(), 1);
+        assert_eq!(reset(&root.join(".gears"), &root).unwrap(), 2);
         assert!(root.join(".gears/gears.toml").is_file());
-        assert!(root.join(".gears/tools").is_dir());
+        assert!(!root.join(".gears/sessions").exists());
         assert!(reset(Path::new("/"), &root).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }

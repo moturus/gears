@@ -1,8 +1,7 @@
-//! Small, versioned configuration for the provider, runtime, and hooks.
+//! Small, versioned configuration for the provider and runtime.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -13,15 +12,6 @@ const DEFAULT_TOOL_ROUNDS: usize = 256;
 const MAX_TOOL_ROUNDS: usize = 4096;
 const DEFAULT_OUTPUT_RESERVE: u64 = 16_384;
 const DEFAULT_RECENT_TAIL: u64 = 20_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HookConfig {
-    pub name: String,
-    pub command: Vec<String>,
-    pub events: Option<Vec<String>>,
-    pub timeout: Duration,
-    pub max_output_bytes: usize,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextConfig {
@@ -43,12 +33,6 @@ pub struct NamedProvider {
     pub reasoning_echo: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolDirectory {
-    pub directory: PathBuf,
-    pub enabled: bool,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub egress_allowlist: Vec<String>,
@@ -56,16 +40,13 @@ pub struct Config {
     pub models: Vec<String>,
     /// Every provider, `[provider]` among them as "default".
     pub providers: BTreeMap<String, NamedProvider>,
-    pub tools: Vec<ToolDirectory>,
-    /// Where relative tool directories resolve; the Gears directory if `None`.
-    pub tool_base: Option<PathBuf>,
+
     pub default_provider: String,
     pub default_model: Option<String>,
     pub log_file: Option<PathBuf>,
     pub log_level: crate::trace::Level,
     pub max_tool_rounds: usize,
     pub context: ContextConfig,
-    pub hooks: Vec<HookConfig>,
 }
 
 impl Default for Config {
@@ -75,8 +56,7 @@ impl Default for Config {
             plain_http_allowlist: Vec::new(),
             models: Vec::new(),
             providers: BTreeMap::new(),
-            tools: Vec::new(),
-            tool_base: None,
+
             default_provider: "default".to_string(),
             default_model: None,
             log_file: None,
@@ -87,7 +67,6 @@ impl Default for Config {
                 output_reserve_tokens: DEFAULT_OUTPUT_RESERVE,
                 recent_tail_tokens: DEFAULT_RECENT_TAIL,
             },
-            hooks: Vec::new(),
         }
     }
 }
@@ -104,8 +83,6 @@ struct RawConfig {
     #[serde(default)]
     providers: BTreeMap<String, RawProvider>,
     #[serde(default)]
-    tools: Vec<RawToolDirectory>,
-    #[serde(default)]
     models: RawModels,
     #[serde(default)]
     trace: RawTrace,
@@ -113,8 +90,6 @@ struct RawConfig {
     runtime: RawRuntime,
     #[serde(default)]
     context: RawContext,
-    #[serde(default)]
-    hooks: Vec<RawHook>,
 }
 
 #[derive(Default, Deserialize)]
@@ -133,13 +108,6 @@ struct RawProvider {
     ca_cert: Option<PathBuf>,
     reasoning_echo: Option<bool>,
     models: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawToolDirectory {
-    directory: PathBuf,
-    enabled: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -169,16 +137,6 @@ struct RawContext {
     recent_tail_tokens: Option<u64>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawHook {
-    name: String,
-    command: Vec<String>,
-    events: Option<Vec<String>>,
-    timeout_seconds: Option<u64>,
-    max_output_bytes: Option<usize>,
-}
-
 impl Config {
     pub fn provider(&self, name: &str) -> Option<NamedProvider> {
         self.providers.get(name).cloned()
@@ -206,15 +164,10 @@ impl Config {
             }
             (Found::SourceTree(package), _) | (Found::Both { package, .. }, true) => {
                 let path = package.join("config/gears.toml");
-                let mut config = Self::read_config(&path)?
-                    .ok_or_else(|| format!("{}: not found", path.display()))?;
-                // Its tools are the ones shipped beside it.
-                config.tool_base = Some(package.clone());
-                Ok(config)
+                Self::read_config(&path)?.ok_or_else(|| format!("{}: not found", path.display()))
             }
             (Found::Neither(directory), _) => Err(format!(
-                "no gears.toml in {}: copy config/gears.toml and tools/ from the Gears \
-                 source there",
+                "no gears.toml in {}: copy config/gears.toml from the Gears source there",
                 directory.display()
             )),
         }
@@ -321,25 +274,6 @@ impl Config {
             }
             None => "default".to_string(),
         };
-        let mut tools = Vec::with_capacity(raw.tools.len());
-        for tool in raw.tools {
-            if tool.directory.as_os_str().is_empty()
-                || (!tool.directory.is_absolute()
-                    && tool
-                        .directory
-                        .components()
-                        .any(|component| !matches!(component, std::path::Component::Normal(_))))
-            {
-                return Err(format!(
-                    "invalid tool directory {}",
-                    tool.directory.display()
-                ));
-            }
-            tools.push(ToolDirectory {
-                directory: tool.directory,
-                enabled: tool.enabled,
-            });
-        }
         let log_level = match raw.trace.level {
             Some(level) => crate::trace::Level::parse(&level)
                 .ok_or_else(|| format!("unknown trace level {level:?}"))?,
@@ -362,52 +296,8 @@ impl Config {
                 .recent_tail_tokens
                 .unwrap_or(DEFAULT_RECENT_TAIL),
         };
-        validate_context(context)?;
-        let mut names = std::collections::HashSet::new();
-        let mut hooks = Vec::with_capacity(raw.hooks.len());
-        for hook in raw.hooks {
-            if hook.name.is_empty() || !valid_name(&hook.name) {
-                return Err(format!("invalid hook name {:?}", hook.name));
-            }
-            if !names.insert(hook.name.clone()) {
-                return Err(format!("duplicate hook name {:?}", hook.name));
-            }
-            if hook.command.is_empty() || hook.command[0].is_empty() {
-                return Err(format!("hook {:?} has no command", hook.name));
-            }
-            if let Some(events) = &hook.events {
-                let mut names = std::collections::HashSet::new();
-                for event in events {
-                    if !crate::hooks::EVENTS.contains(&event.as_str()) || !names.insert(event) {
-                        return Err(format!(
-                            "hook {:?}: invalid or duplicate event {event:?}",
-                            hook.name
-                        ));
-                    }
-                }
-            }
-            let timeout = bounded_seconds(
-                "hooks.timeout_seconds",
-                hook.timeout_seconds.unwrap_or(30),
-                1,
-                3600,
-            )?;
-            let max_output_bytes = hook.max_output_bytes.unwrap_or(1024 * 1024);
-            if !(1024..=16 * 1024 * 1024).contains(&max_output_bytes) {
-                return Err(format!(
-                    "hook {:?} max_output_bytes must be between 1024 and 16777216",
-                    hook.name
-                ));
-            }
-            hooks.push(HookConfig {
-                name: hook.name,
-                command: hook.command,
-                events: hook.events,
-                timeout,
-                max_output_bytes,
-            });
-        }
         let mut models = raw.models.used.unwrap_or_default();
+        validate_context(context)?;
         models.retain(|model| !model.trim().is_empty());
         let mut seen_models = std::collections::HashSet::new();
         models.retain(|model| seen_models.insert(model.clone()));
@@ -416,15 +306,12 @@ impl Config {
             plain_http_allowlist,
             models,
             providers,
-            tools,
-            tool_base: None,
             default_provider,
             default_model: raw.default_model.filter(|model| !model.trim().is_empty()),
             log_file: raw.trace.file,
             log_level,
             max_tool_rounds,
             context,
-            hooks,
         })
     }
 }
@@ -461,7 +348,7 @@ impl Found {
 }
 
 /// The package directory when `executable` lies in its `target/` tree, as after
-/// `cargo run` or `lorry run`; only the Gears package with its shipped
+/// `lorry run`; only the Gears package with its shipped
 /// `config/gears.toml` counts.
 fn source_tree_of(executable: &Path) -> Option<PathBuf> {
     let target = executable
@@ -524,13 +411,6 @@ fn provider_path(path: Option<PathBuf>, base: Option<&Path>) -> Result<Option<Pa
         }
     })
     .transpose()
-}
-
-fn bounded_seconds(name: &str, value: u64, minimum: u64, maximum: u64) -> Result<Duration, String> {
-    if !(minimum..=maximum).contains(&value) {
-        return Err(format!("{name} must be between {minimum} and {maximum}"));
-    }
-    Ok(Duration::from_secs(value))
 }
 
 fn validate_hosts(hosts: Vec<String>) -> Result<Vec<String>, String> {
@@ -654,7 +534,6 @@ plain_http_allowlist = ["192.168.4.1"]"#,
         let config = Config::parse("version = 1").unwrap();
         assert_eq!(config.max_tool_rounds, 256);
         assert_eq!(config.context.output_reserve_tokens, 16_384);
-        assert!(config.hooks.is_empty());
         // No provider or host is built in; they come from the shipped gears.toml.
         assert!(config.provider("default").is_none());
         assert!(config.egress_allowlist.is_empty());
@@ -726,19 +605,6 @@ plain_http_allowlist = ["192.168.4.1"]"#,
         assert_eq!(source_tree_of(&root.join("bin/gears")), None);
         std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"other\"\n").unwrap();
         assert_eq!(source_tree_of(&executable), None);
-        let config = Config::load_found(&Found::SourceTree(package.clone()), false).unwrap();
-        assert_eq!(config.tool_base, Some(package.clone()));
-        let user = root.join("user.toml");
-        std::fs::write(&user, "version = 1\n").unwrap();
-        let both = Found::Both {
-            user,
-            package: package.clone(),
-        };
-        assert_eq!(Config::load_found(&both, false).unwrap().tool_base, None);
-        assert_eq!(
-            Config::load_found(&both, true).unwrap().tool_base,
-            Some(package)
-        );
         let error = Config::load_found(&Found::Neither(root.clone()), false).unwrap_err();
         assert!(error.contains("no gears.toml"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
@@ -754,45 +620,10 @@ plain_http_allowlist = ["192.168.4.1"]"#,
             "version = 1\n[runtime]\nsh_timeout_seconds = 5",
             "version = 1\n[net]\negress = ['a.test']",
             "version = 1\n[[tools]]\ndirectory = 'tools/sh'\nenabled = true\nname = 'sh'",
-            "version = 1\n[[hooks]]\nname = 'h'\ncommand = ['/h']\nevent = ['initialize']",
         ] {
             let error = Config::parse(text).unwrap_err();
             assert!(error.contains("unknown field"), "{text}: {error}");
         }
-    }
-
-    #[test]
-    fn shipped_batteries_config_loads_both_providers_and_hook() {
-        let config = Config::parse_in(
-            include_str!("../config/gears-batteries.toml"),
-            Path::new("/user/cfg/gears"),
-        )
-        .unwrap();
-        assert_eq!(config.default_provider, "openrouter");
-        assert!(config.providers["local"].plain_http);
-        assert_eq!(config.providers["local"].key_file, None);
-        assert_eq!(
-            config.providers["openrouter"].key_file,
-            Some(PathBuf::from("/user/cfg/gears/openrouter.key"))
-        );
-        assert_eq!(
-            config.providers.keys().collect::<Vec<_>>(),
-            ["local", "openai", "openrouter"]
-        );
-        assert!(
-            config
-                .providers
-                .values()
-                .all(|provider| !provider.models.is_empty())
-        );
-        let plain = Config::parse_in(
-            include_str!("../config/gears.toml"),
-            Path::new("/user/cfg/gears"),
-        )
-        .unwrap();
-        assert_eq!(plain.providers, config.providers);
-        assert_eq!(config.hooks[0].command, ["gears-batteries", "hook"]);
-        assert!(config.tools.iter().all(|tool| tool.enabled));
     }
 
     #[test]
@@ -835,87 +666,6 @@ reasoning_echo = false
         assert!(config.provider("missing").is_none());
         assert!(Config::parse("version = 1\n[providers.one]\nbase_url = 'https://one.test/v1'\n[providers.two]\nbase_url = 'https://two.test/v1'").is_err());
         assert!(Config::parse("version = 1\ndefault_provider = 'missing'").is_err());
-    }
-
-    #[test]
-    fn tool_directories_are_explicit_and_ordered() {
-        let config = Config::parse(
-            r#"version = 1
-[[tools]]
-directory = 'tools/sh'
-enabled = true
-[[tools]]
-directory = '/opt/gears/ls'
-enabled = false
-"#,
-        )
-        .unwrap();
-        assert_eq!(config.tools.len(), 2);
-        assert_eq!(config.tools[0].directory, PathBuf::from("tools/sh"));
-        assert!(config.tools[0].enabled);
-        assert_eq!(config.tools[1].directory, PathBuf::from("/opt/gears/ls"));
-        assert!(!config.tools[1].enabled);
-        assert!(Config::default().tools.is_empty());
-        assert!(Config::parse("version = 1\n[[tools]]\ndirectory = 'tools/sh'").is_err());
-        assert!(
-            Config::parse("version = 1\n[[tools]]\ndirectory = '../sh'\nenabled = true").is_err()
-        );
-    }
-
-    #[test]
-    fn hooks_are_ordered_and_unique() {
-        let config = Config::parse(
-            r#"
-version = 1
-[[hooks]]
-name = "first"
-command = ["/bin/first", "--json"]
-[[hooks]]
-name = "second"
-command = ["/bin/second"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(config.hooks[0].name, "first");
-        assert_eq!(config.hooks[1].name, "second");
-        assert!(
-            Config::parse(
-                r#"
-version = 1
-[[hooks]]
-name = "same"
-command = ["one"]
-[[hooks]]
-name = "same"
-command = ["two"]
-"#
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn hook_event_filters_are_explicit_and_validated() {
-        let all = serde_json::to_string(crate::hooks::EVENTS).unwrap();
-        assert!(
-            Config::parse(&format!(
-                "version = 1\n[[hooks]]\nname = 'policy'\ncommand = ['/hook']\nevents = {all}"
-            ))
-            .is_ok()
-        );
-        let config = Config::parse("version = 1\n[[hooks]]\nname = 'policy'\ncommand = ['/hook']\nevents = ['tool_execute', 'tool_result']").unwrap();
-        assert_eq!(
-            config.hooks[0].events.as_deref().unwrap(),
-            ["tool_execute", "tool_result"]
-        );
-        for events in ["['typo']", "['tool_execute', 'tool_execute']"] {
-            assert!(Config::parse(&format!("version = 1\n[[hooks]]\nname = 'policy'\ncommand = ['/hook']\nevents = {events}")).is_err());
-        }
-        let empty = Config::parse(
-            "version = 1\n[[hooks]]\nname = 'policy'\ncommand = ['/hook']\nevents = []",
-        )
-        .unwrap();
-        assert_eq!(empty.hooks[0].events, Some(Vec::new()));
     }
 
     #[test]
