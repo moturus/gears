@@ -116,7 +116,7 @@ impl Runtime {
             ));
         }
         let provider_name = session.provider().unwrap_or_else(|| "default".to_string());
-        let prompt = effective_prompt(store.workspace(), &tools);
+        let prompt = effective_prompt(store.workspace(), &tools)?;
         let identity = prompt.identity();
         if previous_identity
             .as_ref()
@@ -204,6 +204,7 @@ impl Runtime {
 
     pub fn turn(&mut self, input: String, observer: &mut dyn Observer) -> Result<(), String> {
         self.prepare_write()?;
+        self.reload_prompt()?;
         emit_notices(observer, self.take_startup_notices())?;
         self.cancellation.reset();
         if input.trim().is_empty() {
@@ -340,6 +341,7 @@ impl Runtime {
         observer: &mut dyn Observer,
     ) -> Result<(), String> {
         self.prepare_write()?;
+        self.reload_prompt()?;
         self.cancellation.reset();
         if self.maybe_compact(true, focus, observer)? {
             Ok(())
@@ -486,8 +488,16 @@ impl Runtime {
         notices
     }
 
+    /// Re-read the prompt resources. The workspace instructions are read from
+    /// disk here, so a request never carries an AGENTS.md that was edited since
+    /// the session was opened, and a compaction cannot drop it.
+    fn reload_prompt(&mut self) -> Result<(), String> {
+        self.prompt = effective_prompt(self.store.workspace(), &self.tools)?;
+        Ok(())
+    }
+
     fn refresh_prompt(&mut self) -> Result<Effective, String> {
-        let prompt = effective_prompt(self.store.workspace(), &self.tools);
+        let prompt = effective_prompt(self.store.workspace(), &self.tools)?;
         if self
             .session
             .latest_runtime_identity()
@@ -527,7 +537,7 @@ impl Runtime {
         if session.model().is_none() {
             session.set_model(&model)?;
         }
-        let prompt = effective_prompt(self.store.workspace(), &self.tools);
+        let prompt = effective_prompt(self.store.workspace(), &self.tools)?;
         let identity = prompt.identity();
         if session
             .latest_runtime_identity()
@@ -723,6 +733,12 @@ impl Runtime {
             return Ok(false);
         }
         let mut system = vec![crate::prompt::COMPACTION.trim().to_string()];
+        // The summarizer keeps what it is told about the workspace, and the
+        // model that continues afterwards still has the instructions in front
+        // of it even though the messages that carried them are gone.
+        if let Some(instructions) = self.prompt.instructions() {
+            system.push(instructions.to_string());
+        }
         if let Some(focus) = focus.as_deref() {
             system.push(format!(
                 "Additional focus: {}",
@@ -771,6 +787,7 @@ impl Runtime {
             tokens_before,
         };
         self.session.append_compaction(&entry)?;
+        self.reload_prompt()?;
         observer.event(Event::Notice("context compacted".to_string()))?;
         Ok(true)
     }
@@ -832,7 +849,7 @@ impl EventSink for CancellationSink<'_> {
     }
 }
 
-fn effective_prompt(workspace: &std::path::Path, tools: &Registry) -> Effective {
+fn effective_prompt(workspace: &std::path::Path, tools: &Registry) -> Result<Effective, String> {
     let manifest = serde_json::json!({
         "tools": tools.tools().iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
     });

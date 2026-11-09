@@ -189,6 +189,13 @@ opened. Their hashes are appended as a runtime identity; a change produces one
 notice. The five built-in tools are compiled in, so no tool directory or
 manifest is scanned or installed.
 
+A workspace's `AGENTS.md` is workspace instructions, and Gears sends it to the
+model with the system prompt on every request: it is read when a session is
+opened, at the start of every turn, and again right after a compaction, so an
+edit takes effect at the next turn and a compaction cannot cost the model the
+instructions it works under. A missing or empty file adds nothing; a file that
+cannot be read is reported. Gears never writes or removes `AGENTS.md`.
+
 ## A llama.cpp server on the VM host
 
 Build and boot the development image from the repository root after setting

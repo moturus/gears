@@ -1125,3 +1125,63 @@ fn file_tools_protect_keys_and_settings_beside_the_session_store() {
         }
     }
 }
+
+#[test]
+fn workspace_instructions_reach_every_request_including_after_compaction() {
+    let fixture = Fixture::new("instructions");
+    support::write(
+        fixture.workspace.join("AGENTS.md"),
+        "Build with lorry. Run `uname` to see the OS.\n",
+    )
+    .unwrap();
+    let provider = Scripted::new(vec![
+        answer(&"a".repeat(300)),
+        answer(&"b".repeat(300)),
+        answer("summary of prior work"),
+        answer("after compaction"),
+    ]);
+    let config = Config {
+        context: ContextConfig {
+            window_tokens: 10_000,
+            output_reserve_tokens: 2_000,
+            recent_tail_tokens: 50,
+        },
+        ..Config::default()
+    };
+    let mut runtime = fixture.runtime(provider.clone(), &config);
+    runtime.turn("one".to_string(), &mut |_| Ok(())).unwrap();
+    runtime.turn("two".to_string(), &mut |_| Ok(())).unwrap();
+    // An edit made while the session runs reaches the request after compaction.
+    support::write(
+        fixture.workspace.join("AGENTS.md"),
+        "Build with lorry and stay offline.\n",
+    )
+    .unwrap();
+    runtime.compact(None, &mut |_| Ok(())).unwrap();
+    runtime.turn("three".to_string(), &mut |_| Ok(())).unwrap();
+
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    for request in requests.iter() {
+        assert!(
+            request
+                .system
+                .iter()
+                .any(|fragment| fragment.contains("Build with lorry")),
+            "workspace instructions are missing from {:#?}",
+            request.system
+        );
+    }
+    let edited = |request: &Request| {
+        request
+            .system
+            .iter()
+            .any(|fragment| fragment.contains("stay offline"))
+    };
+    assert!(!edited(&requests[0]) && !edited(&requests[1]));
+    assert!(edited(&requests[2]), "the compaction request sees the edit");
+    assert!(
+        edited(&requests[3]),
+        "the turn after compaction sees the edit"
+    );
+}
