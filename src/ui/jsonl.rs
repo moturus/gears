@@ -112,6 +112,9 @@ impl<W: Write> Observer for Renderer<W> {
                 json!({"type": "usage", "request": request, "total": usage_value(&total)})
             }
             Event::ModelChanged(model) => json!({"type": "model", "model": model}),
+            Event::ContextUsage { used, max } => {
+                json!({"type": "context_usage", "used": used, "max": max})
+            }
             Event::SessionChanged(session) => json!({
                 "type": "session_changed", "session_id": session.id, "path": session.path,
             }),

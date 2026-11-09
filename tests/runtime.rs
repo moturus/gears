@@ -87,6 +87,51 @@ fn tool(name: &str, arguments: &str) -> Result<Completion, ProviderError> {
 }
 
 #[test]
+fn context_usage_counts_the_conversation_against_the_window() {
+    let fixture = Fixture::new("context-usage");
+    let config = Config::default();
+    let provider = Scripted::new(vec![answer("done")]);
+    let mut runtime = fixture.runtime(provider, &config);
+    let (before, window) = runtime.context_usage().unwrap();
+    assert_eq!(window, config.context.window_tokens);
+    runtime.turn("hello".to_string(), &mut |_| Ok(())).unwrap();
+    let (after, _) = runtime.context_usage().unwrap();
+    assert!(after > before, "{after} should exceed {before}");
+}
+
+#[test]
+fn context_usage_events_track_each_addition_during_a_turn() {
+    let fixture = Fixture::new("context-usage-events");
+    let config = Config::default();
+    let provider = Scripted::new(vec![
+        tool("sh", r#"{"command":"printf forbidden"}"#),
+        answer("done"),
+    ]);
+    let mut runtime = fixture.runtime(provider, &config);
+    let mut reported = Vec::new();
+    runtime
+        .turn("work".into(), &mut |event| {
+            if let Event::ContextUsage { used, max } = event {
+                reported.push((used, max));
+            }
+            Ok(())
+        })
+        .unwrap();
+    // The prompt, the assistant tool call, the tool result and the final answer
+    // each grow the context, so a status line never goes stale mid-turn.
+    assert_eq!(reported.len(), 4, "{reported:?}");
+    assert!(
+        reported.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "{reported:?}"
+    );
+    assert!(
+        reported
+            .iter()
+            .all(|(_, max)| *max == config.context.window_tokens)
+    );
+}
+
+#[test]
 fn runtime_events_pair_tool_ids_and_report_numeric_usage() {
     let fixture = Fixture::new("structured-events");
     let config = Config::default();

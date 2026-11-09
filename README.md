@@ -155,7 +155,7 @@ For machine-readable one-shot output, use `-p PROMPT --output jsonl`.
 Version 1 starts with a `session` record containing `session_id`, `path`
 (null for an ephemeral session), and `session_format_version`. Streaming
 records have types `text`, `reasoning`, `tool_start`, `tool_output`,
-`tool_result`, `notice`, `usage`, and `turn_end`. Tool results
+`tool_result`, `notice`, `usage`, `context_usage`, and `turn_end`. Tool results
 include the call id, error flag, and three-state outcome. Every record is
 one flushed JSON line; embedded newlines are escaped.
 

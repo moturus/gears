@@ -46,6 +46,12 @@ pub enum Event {
         request: Usage,
         total: UsageMeter,
     },
+    /// The context size after a change, so an interface can keep a status line
+    /// current while a turn is still running.
+    ContextUsage {
+        used: u64,
+        max: u64,
+    },
     ModelChanged(String),
     SessionChanged(SessionSummary),
     TurnEnd {
@@ -202,6 +208,23 @@ impl Runtime {
         }
     }
 
+    /// Tokens the active context holds right now, and the model's context
+    /// window, for the status line. The count is the same estimate the request
+    /// guard uses, so it includes the system prompt and the tool specs.
+    pub fn context_usage(&self) -> Result<(u64, u64), String> {
+        let messages = self.session.context_messages()?;
+        let prefix = self.request(Vec::new(), true);
+        let used = estimate_request_tokens(&prefix.system, &messages, &prefix.tools);
+        Ok((used, self.context.window_tokens.max(1)))
+    }
+
+    /// Report the context size after it changed. Interfaces that show it while
+    /// a turn runs cannot ask the runtime themselves, since the turn owns it.
+    fn emit_context_usage(&self, observer: &mut dyn Observer) -> Result<(), String> {
+        let (used, max) = self.context_usage()?;
+        observer.event(Event::ContextUsage { used, max })
+    }
+
     pub fn turn(&mut self, input: String, observer: &mut dyn Observer) -> Result<(), String> {
         self.prepare_write()?;
         self.reload_prompt()?;
@@ -211,6 +234,7 @@ impl Runtime {
             return Err("prompt must not be empty".to_string());
         }
         self.session.append_message(&Message::user(input.clone()))?;
+        self.emit_context_usage(observer)?;
 
         let entries_before = self.session.entries().len();
         let mut tool_rounds = 0;
@@ -301,6 +325,7 @@ impl Runtime {
                 request: completion.usage,
                 total: self.usage,
             })?;
+            self.emit_context_usage(observer)?;
             if completion.tool_calls.is_empty() {
                 return Ok(());
             }
@@ -331,7 +356,7 @@ impl Runtime {
     ) -> Result<(), String> {
         let cancelled = cancelled || self.cancellation.cancelled();
         self.session.append_error(&error, cancelled)?;
-        let _ = observer;
+        let _ = self.emit_context_usage(observer);
         Err(error)
     }
 
@@ -362,7 +387,8 @@ impl Runtime {
         self.session.append_runtime_identity(&prompt.identity())?;
         self.model = model.clone();
         self.prompt = prompt;
-        observer.event(Event::ModelChanged(model))
+        observer.event(Event::ModelChanged(model))?;
+        self.emit_context_usage(observer)
     }
 
     pub fn set_provider(&mut self, name: &str, observer: &mut dyn Observer) -> Result<(), String> {
@@ -383,7 +409,8 @@ impl Runtime {
         self.provider = provider;
         self.provider_name = name.to_string();
         self.prompt = prompt;
-        observer.event(Event::Notice(format!("provider: {name}")))
+        observer.event(Event::Notice(format!("provider: {name}")))?;
+        self.emit_context_usage(observer)
     }
 
     /// Use what `/setup` chose. The same provider is reconnected too, since
@@ -613,6 +640,7 @@ impl Runtime {
                 outcome,
             ))?;
         end?;
+        self.emit_context_usage(observer)?;
         crate::process::ensure_cleanup()
     }
 
@@ -639,6 +667,7 @@ impl Runtime {
                 is_error: true,
                 outcome: ToolOutcome::NotStarted,
             });
+            let _ = self.emit_context_usage(observer);
         }
         Ok(())
     }
@@ -789,6 +818,7 @@ impl Runtime {
         self.session.append_compaction(&entry)?;
         self.reload_prompt()?;
         observer.event(Event::Notice("context compacted".to_string()))?;
+        self.emit_context_usage(observer)?;
         Ok(true)
     }
 

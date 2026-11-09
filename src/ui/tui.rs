@@ -25,6 +25,15 @@ const ENABLE_TMUX_KEYS: &str = "\x1b[>4;2m";
 const DISABLE_TMUX_KEYS: &str = "\x1b[>4;0m";
 // rmux `status::AMBER`: keep shared terminal chrome visually consistent.
 const STATUS_COLOR: Color = Color::AnsiValue(222);
+// Light green (#80FF80) for the product name and its status-bar marker.
+const TITLE_COLOR: Color = Color::Rgb {
+    r: 0x80,
+    g: 0xFF,
+    b: 0x80,
+};
+const STATUS_TITLE: &str = " Motor OS Gears";
+// Separates the product name from the status fields, in the title's color.
+const STATUS_MARKER: &str = " >>";
 
 pub fn run(
     runtime: &mut Runtime,
@@ -155,6 +164,8 @@ struct App {
     scroll: usize,
     status: String,
     model: String,
+    context_used: u64,
+    context_max: u64,
     session: SessionSummary,
     input_enabled: bool,
     quit: bool,
@@ -233,6 +244,8 @@ impl App {
             scroll: 0,
             status: "idle".to_string(),
             model: runtime.model().to_string(),
+            context_used: 0,
+            context_max: 1,
             session: runtime.summary(),
             input_enabled: true,
             quit: false,
@@ -241,6 +254,7 @@ impl App {
         if interactive {
             app.restore_history(runtime)?;
         }
+        app.refresh(runtime)?;
         Ok(app)
     }
 
@@ -252,7 +266,7 @@ impl App {
             self.push(kind, text, false);
             Ok(())
         })?;
-        self.refresh(runtime);
+        self.refresh(runtime)?;
         self.status = "idle".into();
         self.invalidate();
         Ok(())
@@ -294,6 +308,10 @@ impl App {
             }
             Event::Notice(text) => self.push(Kind::Notice, text, false),
             Event::Usage { total, .. } => self.status = total.summary(),
+            Event::ContextUsage { used, max } => {
+                self.context_used = used;
+                self.context_max = max;
+            }
             Event::ModelChanged(model) => self.model = model,
             Event::SessionChanged(session) => self.session = session,
             Event::TurnEnd { .. } => self.status = "idle".to_string(),
@@ -440,9 +458,13 @@ impl App {
         }
     }
 
-    fn refresh(&mut self, runtime: &Runtime) {
+    fn refresh(&mut self, runtime: &Runtime) -> Result<(), String> {
         self.model = runtime.model().to_string();
         self.session = runtime.summary();
+        let (used, max) = runtime.context_usage()?;
+        self.context_used = used;
+        self.context_max = max;
+        Ok(())
     }
 
     fn render(&mut self) -> Result<(), String> {
@@ -504,9 +526,13 @@ impl App {
             );
             target.push(Color::White, line, width);
         }
+        // The product name keeps its own color; the rest of the bar stays chrome.
+        // The product name and its marker keep their own color; the rest of the
+        // bar stays chrome.
         let status = single_line(&format!(
-            "gears | {} | {} | {}{}",
+            " {} | {} | {} | {}{}",
             self.status,
+            context_status(self.context_used, self.context_max),
             self.model,
             self.session.name.as_deref().unwrap_or(&self.session.id),
             if self.session.ephemeral {
@@ -515,7 +541,10 @@ impl App {
                 ""
             }
         ));
-        frame.lines[layout.status_row].push(STATUS_COLOR, &status, width);
+        let line = &mut frame.lines[layout.status_row];
+        line.push(TITLE_COLOR, STATUS_TITLE, width);
+        line.push(TITLE_COLOR, STATUS_MARKER, width);
+        line.push(STATUS_COLOR, &status, width);
         if layout.editor_rows != 0 {
             let row = layout.editor_start + cursor_row.saturating_sub(editor_first);
             let column = (cursor_column + 2).min(width.saturating_sub(1));
@@ -674,7 +703,8 @@ fn run_operation(
     app.render()?;
     let cancellation = runtime.cancellation();
     let (sender, receiver) = mpsc::channel();
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
+        let runtime = &mut *runtime;
         let worker_sender = sender.clone();
         scope.spawn(move || {
             let mut observer = ChannelObserver {
@@ -735,7 +765,8 @@ fn run_operation(
                 app.render()?;
             }
         }
-    })
+    });
+    app.refresh(runtime).and(result)
 }
 
 fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> Result<(), String> {
@@ -744,7 +775,8 @@ fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> R
     app.render()?;
     let cancellation = runtime.cancellation();
     let (sender, receiver) = mpsc::channel();
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
+        let runtime = &mut *runtime;
         let worker_sender = sender.clone();
         scope.spawn(move || {
             let mut observer = ChannelObserver {
@@ -793,7 +825,8 @@ fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> R
                 app.render()?;
             }
         }
-    })
+    });
+    app.refresh(runtime).and(result)
 }
 
 struct ChannelObserver {
@@ -1045,7 +1078,7 @@ fn handle_command(
             app.push(Kind::Error, format!("unknown command /{other}"), false);
         }
     }
-    app.refresh(runtime);
+    app.refresh(runtime)?;
     Ok(())
 }
 
@@ -1245,6 +1278,14 @@ fn color(kind: Kind) -> Color {
         Kind::Notice => Color::Yellow,
         Kind::Error => Color::Red,
     }
+}
+
+/// The status bar's context element: tokens the active context holds and how
+/// much of the model's window that is.
+fn context_status(used: u64, max: u64) -> String {
+    let max = max.max(1);
+    let percent = used.saturating_mul(100).saturating_add(max / 2) / max;
+    format!("context: {used} used {percent}%")
 }
 
 fn clean(text: &str) -> String {
@@ -1509,6 +1550,8 @@ mod tests {
             scroll: 0,
             status: "working".to_string(),
             model: "test/model".to_string(),
+            context_used: 0,
+            context_max: 1,
             session: SessionSummary {
                 id: "test-session".to_string(),
                 path: None,
@@ -1689,30 +1732,82 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!(status(&app).starts_with("gears | working |"));
+        assert!(status(&app).starts_with(" Motor OS Gears >> working |"));
         app.apply(Event::Reasoning("plan".to_string()));
-        assert!(status(&app).starts_with("gears | thinking |"));
+        assert!(status(&app).starts_with(" Motor OS Gears >> thinking |"));
         app.apply(Event::Text("answer".to_string()));
-        assert!(status(&app).starts_with("gears | responding |"));
+        assert!(status(&app).starts_with(" Motor OS Gears >> responding |"));
         app.apply(Event::TurnEnd {
             status: "completed",
             tool_rounds: 0,
             last_entry_id: None,
         });
-        assert!(status(&app).starts_with("gears | idle |"));
+        assert!(status(&app).starts_with(" Motor OS Gears >> idle |"));
+    }
+
+    #[test]
+    fn the_status_bar_reports_context_use_before_the_model() {
+        let mut app = app();
+        app.context_used = 32_000;
+        app.context_max = 128_000;
+        let status = app.frame(80, 24).lines[23]
+            .0
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>();
+        assert!(
+            status
+                .starts_with(" Motor OS Gears >> working | context: 32000 used 25% | test/model |"),
+            "{status}"
+        );
+        assert_eq!(context_status(0, 0), "context: 0 used 0%");
+        assert_eq!(context_status(1, 3), "context: 1 used 33%");
+    }
+
+    #[test]
+    fn context_usage_events_update_the_status_bar_during_a_turn() {
+        let mut app = app();
+        let status = |app: &App| {
+            app.frame(80, 24).lines[23]
+                .0
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>()
+        };
+
+        app.apply(Event::ContextUsage {
+            used: 1_000,
+            max: 4_000,
+        });
+        let first = status(&app);
+        assert!(first.contains("| context: 1000 used 25% |"), "{first}");
+        app.apply(Event::ContextUsage {
+            used: 2_000,
+            max: 4_000,
+        });
+        let second = status(&app);
+        assert!(second.contains("| context: 2000 used 50% |"), "{second}");
     }
 
     #[test]
     fn status_and_disabled_prompt_use_the_chrome_palette() {
         let mut app = app();
         let frame = app.frame(80, 24);
-        assert!(
-            frame.lines[23]
-                .0
-                .iter()
-                .all(|cell| cell.color == STATUS_COLOR)
-        );
+        let (title, rest) = frame.lines[23]
+            .0
+            .split_at(STATUS_TITLE.len() + STATUS_MARKER.len());
+        assert!(title.iter().all(|cell| cell.color == TITLE_COLOR));
+        assert!(!rest.is_empty());
+        assert!(rest.iter().all(|cell| cell.color == STATUS_COLOR));
         assert_eq!(STATUS_COLOR, Color::AnsiValue(222));
+        assert_eq!(
+            TITLE_COLOR,
+            Color::Rgb {
+                r: 0x80,
+                g: 0xFF,
+                b: 0x80
+            }
+        );
         assert!(
             frame.lines[22].0[..2]
                 .iter()
