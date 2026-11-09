@@ -30,9 +30,9 @@ which to use when both exist. Keys, settings and sessions always stay in the
 Gears directory. A provider address saved in `provider.toml` replaces the
 configured one, and its host is allowed for egress.
 
-Gears always provides five tools: `sh`, `read_file`, `write_file`, `patch` and
-`session_search`. `sh` receives one string command and runs it in the selected
-workspace through `/system/bin/rush -c` on Motor OS. It
+Gears always provides five tools: `sh`, `read_file`, `write_file`, `patch_file`
+and `search_session`. `sh` receives one string command and runs it in the
+selected workspace through `/system/bin/rush -c` on Motor OS. It
 is not a sandbox: a command has the same filesystem authority as Gears and may
 leave the workspace. Stdout, stderr, status, timeout, cancellation, and
 truncation remain distinct. The working directory and exports it saves live
@@ -40,9 +40,11 @@ beside a saved session, or in `sessions/ephemeral/` in the Gears directory for
 an ephemeral one; Gears removes the ephemeral state at exit, and what a killed
 Gears left there at its next start.
 
-`read_file` reads numbered UTF-8 pages, and `write_file` and `patch` refuse to
-change a file Gears has not read completely in this session. `session_search`
-finds text in every saved session, across branches and workspaces.
+`read_file` reads numbered UTF-8 pages, and `write_file` refuses to replace a
+file Gears has not read completely in this session. `patch_file` replaces one
+unique text block and keeps every other byte, so it needs no prior read.
+`search_session` finds text in every saved session, across branches and
+workspaces.
 
 The built-in tools are the only tools: Gears does not infer safe shell
 commands. The provider credential is removed from the environment inherited by

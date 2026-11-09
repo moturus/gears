@@ -1,4 +1,4 @@
-//! The built-in `session_search` pages saved sessions.
+//! The built-in `search_session` pages saved sessions.
 
 use gears::cancellation::Cancellation;
 use gears::process::Stream;
@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 fn run(context: &Context, arguments: Value) -> Result<Value, String> {
     let registry = Registry::new();
-    let tool = registry.get("session_search").unwrap();
+    let tool = registry.get("search_session").unwrap();
     assert!(tool.read_only);
     let (result, _) = tool.execute(
         &arguments.to_string(),

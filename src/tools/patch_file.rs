@@ -1,4 +1,4 @@
-//! File patches share atomic-write and current-read requirements.
+//! Unique-block patches that keep every byte outside the match.
 
 use std::io::Read;
 
@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tools::Context;
-use crate::tools::file_read::MAX_FILE_BYTES;
+use crate::tools::read_file::MAX_FILE_BYTES;
 
 const MAX_DIFF_BYTES: usize = 30_000;
 
@@ -20,7 +20,7 @@ struct PatchFile {
 
 pub fn execute(arguments: &str, context: &Context) -> Result<Value, String> {
     let arguments: PatchFile = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid patch arguments: {error}"))?;
+        .map_err(|error| format!("invalid patch_file arguments: {error}"))?;
     patch(
         context,
         &arguments.path,
@@ -35,7 +35,7 @@ fn patch(context: &Context, input: &str, old: &str, new: &str) -> Result<Value, 
         .map_err(|error| error.to_string())?
         .is_file()
     {
-        return Err("patch requires a regular file".into());
+        return Err("patch_file requires a regular file".into());
     }
     let mut bytes = Vec::new();
     std::fs::File::open(&path)
@@ -47,7 +47,7 @@ fn patch(context: &Context, input: &str, old: &str, new: &str) -> Result<Value, 
         return Err("file tools support files up to 4 MiB; use sh for larger ones".into());
     }
     let version = crate::tools::record::FileVersion::of(&bytes);
-    let source = String::from_utf8(bytes).map_err(|_| "patch requires UTF-8 text")?;
+    let source = String::from_utf8(bytes).map_err(|_| "patch_file requires UTF-8 text")?;
     let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
     let matched = crate::tools::patch_match::locate(source, old, new)?;
     let replacement = if version.windows_lines {
@@ -61,8 +61,7 @@ fn patch(context: &Context, input: &str, old: &str, new: &str) -> Result<Value, 
     let mut changed = source.to_string();
     changed.replace_range(matched.range.clone(), &replacement);
     let diff = diff(source, &changed, matched.range, replacement.len());
-    let mut receipt =
-        crate::tools::file_write::write_over(context, &path, Some(version), &changed)?;
+    let mut receipt = crate::tools::write_file::replace(context, &path, Some(version), &changed)?;
     receipt["match_rule"] = json!(matched.rule);
     receipt["diff"] = json!(diff.0);
     receipt["diff_truncated"] = json!(diff.1);
@@ -112,12 +111,8 @@ fn diff(before: &str, after: &str, range: std::ops::Range<usize>, added: usize) 
 mod tests {
     use super::*;
 
-    fn read(context: &Context, path: &str) {
-        crate::tools::file_read::execute(&json!({"path": path}).to_string(), context).unwrap();
-    }
-
     #[test]
-    fn patch_requires_current_reads_preserves_format_and_reports_the_actual_diff() {
+    fn patch_needs_no_prior_read_preserves_format_and_reports_the_actual_diff() {
         let root = std::env::temp_dir().join(format!("gears-tools-patch-{}", std::process::id()));
         std::fs::create_dir_all(root.join("workspace")).unwrap();
         let context = Context::new(
@@ -129,8 +124,7 @@ mod tests {
         .unwrap();
         let path = context.workspace.join("source");
         std::fs::write(&path, "\u{feff}    first\r\n      second\r\nlast\r\n").unwrap();
-        assert!(patch(&context, "source", "first\nsecond\n", "new\n  next\n").is_err());
-        read(&context, "source");
+        // No read_file call: patch_file keeps every byte outside its match.
         let result = patch(&context, "source", "first\nsecond\n", "new\n  next\n").unwrap();
         assert_eq!(result["match_rule"], "indentation");
         assert_eq!(
@@ -140,7 +134,6 @@ mod tests {
         assert!(result["diff"].as_str().unwrap().contains("+    new\r\n"));
         patch(&context, "source", "last", "done").unwrap();
         std::fs::write(&path, "same same").unwrap();
-        read(&context, "source");
         assert!(
             patch(&context, "source", "same", "changed")
                 .unwrap_err()

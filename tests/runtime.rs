@@ -1148,7 +1148,7 @@ fn file_tools_protect_keys_and_settings_beside_the_session_store() {
                 serde_json::json!({"path": path, "content": "bad"}),
             ),
             (
-                "patch",
+                "patch_file",
                 serde_json::json!({"path": path, "old_text": "private", "new_text": "bad"}),
             ),
         ] {

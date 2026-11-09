@@ -25,7 +25,7 @@ pub fn execute(arguments: &str, context: &Context) -> Result<Value, String> {
 fn write(context: &Context, input: &str, content: &str) -> Result<Value, String> {
     let path = context.resolve(input, true)?;
     let previous = match std::fs::symlink_metadata(&path) {
-        Ok(_) => Some(crate::tools::file_read::version(&path)?),
+        Ok(_) => Some(crate::tools::read_file::version(&path)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.to_string()),
     };
@@ -42,8 +42,24 @@ pub(crate) fn write_over(
     if let Some(version) = &previous
         && !fully_read(context, path, version)?
     {
-        return Err("read every page of the current file before overwriting it".into());
+        return Err(format!(
+            "refusing to write {}: it has not been read completely in this session, or it \
+             changed since it was read. Call read_file and follow next_offset until \
+             all_pages_read is true, then retry.",
+            context.relative(path).display()
+        ));
     }
+    replace(context, path, previous, content)
+}
+
+/// Replace `path` without requiring a prior read. `patch_file` keeps every
+/// byte outside its unique match, so it needs no read coverage.
+pub(crate) fn replace(
+    context: &Context,
+    path: &Path,
+    previous: Option<FileVersion>,
+    content: &str,
+) -> Result<Value, String> {
     if content.contains('\0') {
         return Err("binary files are not supported".into());
     }
@@ -99,11 +115,13 @@ mod tests {
         let (root, context) = fixture("coverage");
         let path = context.workspace.join("text");
         std::fs::write(&path, "a".repeat(40_000)).unwrap();
-        assert!(write(&context, "text", "replacement").is_err());
-        let first = crate::tools::file_read::execute(r#"{"path":"text"}"#, &context).unwrap();
+        let refused = write(&context, "text", "replacement").unwrap_err();
+        assert!(refused.contains("refusing to write text"), "{refused}");
+        assert!(refused.contains("read_file"), "{refused}");
+        let first = crate::tools::read_file::execute(r#"{"path":"text"}"#, &context).unwrap();
         assert!(write(&context, "text", "replacement").is_err());
         let next = first["next_offset"].as_u64().unwrap();
-        crate::tools::file_read::execute(
+        crate::tools::read_file::execute(
             &serde_json::json!({"path": "text", "offset": next}).to_string(),
             &context,
         )
@@ -138,7 +156,7 @@ mod tests {
         let (root, context) = fixture("format");
         let path = context.workspace.join("script");
         std::fs::write(&path, "\u{feff}first\r\nsecond\r\n").unwrap();
-        crate::tools::file_read::execute(r#"{"path":"script"}"#, &context).unwrap();
+        crate::tools::read_file::execute(r#"{"path":"script"}"#, &context).unwrap();
         write(&context, "script", "changed\nline\r\n").unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),

@@ -1,13 +1,13 @@
 //! The five tools built into Gears: a shell, file editing, and session search.
 
 pub mod context;
-mod file_patch;
-mod file_read;
-mod file_write;
+mod patch_file;
 mod patch_match;
+mod read_file;
 mod record;
 mod search_session;
 mod sh;
+mod write_file;
 
 use std::path::Path;
 
@@ -28,8 +28,8 @@ enum Kind {
     Sh,
     ReadFile,
     WriteFile,
-    Patch,
-    SessionSearch,
+    PatchFile,
+    SearchSession,
 }
 
 #[derive(Debug, Clone)]
@@ -55,8 +55,10 @@ impl Registry {
                 Tool::new(
                     Kind::ReadFile,
                     "read_file",
-                    "Read numbered UTF-8 file text in bounded pages. Follow next_offset \
-                     until all_pages_read before overwriting an existing file.",
+                    "Read numbered UTF-8 file text in bounded pages. Only pages returned by \
+                     read_file count as a read: follow next_offset until all_pages_read is true \
+                     before write_file replaces an existing file, and read the file again if it \
+                     changed since it was read.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -72,8 +74,9 @@ impl Registry {
                 Tool::new(
                     Kind::WriteFile,
                     "write_file",
-                    "Atomically write UTF-8 text. Read every page of an existing file first; \
-                     preserve its BOM, Windows lines and access.",
+                    "Atomically write UTF-8 text. An existing file must first be read completely \
+                     with read_file (all_pages_read true), otherwise the write is refused. \
+                     Preserves its BOM, Windows lines and access.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -87,10 +90,10 @@ impl Registry {
                     false,
                 ),
                 Tool::new(
-                    Kind::Patch,
-                    "patch",
-                    "Replace one unique text block in a completely read UTF-8 file, reindent it \
-                     and return a diff. Ambiguous matches fail.",
+                    Kind::PatchFile,
+                    "patch_file",
+                    "Replace one unique text block in a UTF-8 file, reindent it and return a diff. \
+                     Ambiguous matches fail; the rest of the file is preserved.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -105,8 +108,8 @@ impl Registry {
                     false,
                 ),
                 Tool::new(
-                    Kind::SessionSearch,
-                    "session_search",
+                    Kind::SearchSession,
+                    "search_session",
                     "Search saved session text across every branch and workspace. Hits retain \
                      session and entry IDs and identify off-branch results.",
                     json!({
@@ -180,8 +183,8 @@ impl Tool {
                     None => command.to_string(),
                 }
             }
-            Kind::ReadFile | Kind::WriteFile | Kind::Patch => text("path")?.to_string(),
-            Kind::SessionSearch => format!("{:?}", text("query")?),
+            Kind::ReadFile | Kind::WriteFile | Kind::PatchFile => text("path")?.to_string(),
+            Kind::SearchSession => format!("{:?}", text("query")?),
         })
     }
 
@@ -198,10 +201,10 @@ impl Tool {
         }
         let result = match self.kind {
             Kind::Sh => unreachable!(),
-            Kind::ReadFile => file_read::execute(arguments, context),
-            Kind::WriteFile => file_write::execute(arguments, context),
-            Kind::Patch => file_patch::execute(arguments, context),
-            Kind::SessionSearch => search_session::execute(arguments, context),
+            Kind::ReadFile => read_file::execute(arguments, context),
+            Kind::WriteFile => write_file::execute(arguments, context),
+            Kind::PatchFile => patch_file::execute(arguments, context),
+            Kind::SearchSession => search_session::execute(arguments, context),
         };
         match result {
             Ok(value) => (Ok(value.to_string()), ToolOutcome::Completed),
@@ -224,7 +227,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            ["sh", "read_file", "write_file", "patch", "session_search"]
+            [
+                "sh",
+                "read_file",
+                "write_file",
+                "patch_file",
+                "search_session"
+            ]
         );
     }
 }

@@ -25,14 +25,14 @@ fn search_limit() -> usize {
 
 pub fn execute(arguments: &str, context: &Context) -> Result<Value, String> {
     let arguments: SearchSession = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid session_search arguments: {error}"))?;
+        .map_err(|error| format!("invalid search_session arguments: {error}"))?;
     search(context, &arguments.query, arguments.offset, arguments.limit)
 }
 
 fn search(context: &Context, query: &str, offset: usize, limit: usize) -> Result<Value, String> {
     if query.is_empty() || query.len() > 256 || !(1..=10).contains(&limit) {
         return Err(
-            "session_search needs a nonempty query up to 256 bytes and a limit of 1-10".into(),
+            "search_session needs a nonempty query up to 256 bytes and a limit of 1-10".into(),
         );
     }
     let query = query.to_ascii_lowercase();

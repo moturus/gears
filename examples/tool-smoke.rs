@@ -96,7 +96,13 @@ fn check_tools(workspace: &Path) -> Result<(), String> {
             .iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>(),
-        ["sh", "read_file", "write_file", "patch", "session_search"]
+        [
+            "sh",
+            "read_file",
+            "write_file",
+            "patch_file",
+            "search_session"
+        ]
     );
     let directory = "literal * [x]";
     std::fs::create_dir(workspace.join(directory)).map_err(|error| error.to_string())?;
@@ -124,7 +130,7 @@ fn check_tools(workspace: &Path) -> Result<(), String> {
     let patched = execute(
         &registry,
         &context,
-        "patch",
+        "patch_file",
         json!({"path": "literal * [x]/a * [x].txt",
             "old_text": "first\n", "new_text": "changed\n"}),
     )?;
@@ -160,7 +166,7 @@ fn check_tools(workspace: &Path) -> Result<(), String> {
     let found = execute(
         &registry,
         &context,
-        "session_search",
+        "search_session",
         json!({"query": "needle", "limit": 10}),
     )?;
     let found: Value = serde_json::from_str(&found).map_err(|error| error.to_string())?;
