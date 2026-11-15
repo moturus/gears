@@ -692,6 +692,35 @@ fn compaction_bounds_a_large_tool_result_sent_to_the_summarizer() {
 }
 
 #[test]
+fn context_window_can_be_set_for_the_run() {
+    let fixture = Fixture::new("context-window");
+    let config = Config {
+        context: ContextConfig {
+            window_tokens: 8192,
+            output_reserve_tokens: 2048,
+            recent_tail_tokens: 2048,
+        },
+        ..Config::default()
+    };
+    let mut runtime = fixture.runtime(Scripted::new(vec![]), &config);
+    assert_eq!(runtime.context().window_tokens, 8192);
+    assert_eq!(runtime.context_usage().unwrap().1, 8192);
+
+    runtime.set_context_window(16_384).unwrap();
+    assert_eq!(runtime.context().window_tokens, 16_384);
+    assert_eq!(runtime.context_usage().unwrap().1, 16_384);
+    // The reserve and recent tail keep their configured sizes.
+    assert_eq!(runtime.context().output_reserve_tokens, 2048);
+    assert_eq!(runtime.context().recent_tail_tokens, 2048);
+
+    // A window that leaves no room for a summary, or falls below the minimum,
+    // is refused and leaves the previous window in place.
+    assert!(runtime.set_context_window(4096).is_err());
+    assert!(runtime.set_context_window(2048).is_err());
+    assert_eq!(runtime.context().window_tokens, 16_384);
+}
+
+#[test]
 fn provider_failures_are_recorded() {
     let fixture = Fixture::new("error");
     let provider = Scripted::new(vec![Err(ProviderError::Unavailable(

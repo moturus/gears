@@ -107,6 +107,10 @@ fn command(
             eprintln!("{}", super::format_tools(runtime));
             Ok(Command::Continue)
         }
+        "context" => {
+            eprintln!("{}", super::context_command(runtime, argument)?);
+            Ok(Command::Continue)
+        }
         "session" => {
             show_session(runtime);
             Ok(Command::Continue)

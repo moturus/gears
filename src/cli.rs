@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 pub const COMMAND_NAMES: &[&str] = &[
     "quit", "exit", "help", "status", "tools", "session", "name", "new", "resume", "label", "tree",
-    "fork", "clone", "compact", "model", "provider", "reset", "setup",
+    "fork", "clone", "compact", "model", "provider", "reset", "setup", "context",
 ];
 
 pub const USAGE: &str = "\
@@ -36,7 +36,7 @@ Options:
   --help              Print this help
 
 Interactive commands include /new, /resume, /name, /session, /tree, /label,
-/fork, /clone, /compact, /provider, /model, /tools, /status, /setup,
+/fork, /clone, /compact, /provider, /model, /tools, /context, /status, /setup,
 /reset, /help, and /quit.
 Without a chosen model, an interactive start asks for the provider, model and
 key; /setup asks again at any time.

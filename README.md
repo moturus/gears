@@ -170,7 +170,7 @@ exit status. Errors before a session is ready use stderr.
 Useful startup options are --continue, --resume ID, --session ID,
 --fork ID, --ephemeral, and --name NAME. Interactive commands include /new,
 /resume, /name, /session, /tree, /label, /fork, /clone, /compact, /tools,
-/status, /setup, /reset, /help, and /quit. Use
+/context, /status, /setup, /reset, /help, and /quit. Use
 /label ENTRY [TEXT] to set or clear an entry label. Fork selects an earlier
 user prompt; clone copies the current active branch into a new file.
 
@@ -184,7 +184,9 @@ use until Gears restarts. `gears reset` refuses to run inside another Gears.
 Compaction summarizes older active-branch context and retains a recent tail.
 It appends a compaction entry but never deletes history. /compact accepts
 optional focus text. Automatic compaction uses the configured context limit,
-output reserve, and recent-tail size.
+output reserve, and recent-tail size. `/context` shows those settings with the
+current usage, and `/context set TOKENS` changes the window for this run
+without editing the configuration file.
 
 Prompt resources are loaded from the current installation when a session is
 opened. Their hashes are appended as a runtime identity; a change produces one

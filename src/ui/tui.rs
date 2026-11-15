@@ -878,6 +878,11 @@ fn handle_command(
             false,
         ),
         "tools" => app.push(Kind::Notice, super::format_tools(runtime), false),
+        "context" => app.push(
+            Kind::Notice,
+            super::context_command(runtime, argument)?,
+            false,
+        ),
         "session" => {
             let session = runtime.summary();
             app.push(
@@ -1296,9 +1301,7 @@ fn color(kind: Kind) -> Color {
 /// The status bar's context element: tokens the active context holds and how
 /// much of the model's window that is.
 fn context_status(used: u64, max: u64) -> String {
-    let max = max.max(1);
-    let percent = used.saturating_mul(100).saturating_add(max / 2) / max;
-    format!("context: {used} used {percent}%")
+    format!("context: {used} used {}", super::percent(used, max))
 }
 
 fn clean(text: &str) -> String {
@@ -1539,6 +1542,38 @@ mod tests {
         assert!(visible(&app).contains("saved answer"));
         assert!(!visible(&app).contains("latest answer"));
         assert!(!visible(&app).contains("abandoned answer"));
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_command_reports_and_changes_the_window() {
+        let (mut runtime, root) = saved_runtime("context-command");
+        let config = crate::config::Config::default();
+        let mut app = App::new(&runtime, true).unwrap();
+        handle_command(&mut runtime, &mut app, "/context", &config).unwrap();
+        let frame = visible(&app);
+        assert!(frame.contains("window: 128000 tokens"), "{frame}");
+        assert!(frame.contains("output reserve: 16384 tokens"), "{frame}");
+        assert!(frame.contains("recent tail: 20000 tokens"), "{frame}");
+
+        handle_command(&mut runtime, &mut app, "/context set 200,000", &config).unwrap();
+        assert_eq!(runtime.context().window_tokens, 200_000);
+        let frame = visible(&app);
+        assert!(
+            frame.contains("context window set to 200000 tokens for this run"),
+            "{frame}"
+        );
+        assert!(frame.contains("window: 200000 tokens"), "{frame}");
+
+        // A window that leaves no room for the reserve and tail is refused.
+        let error =
+            handle_command(&mut runtime, &mut app, "/context set 4096", &config).unwrap_err();
+        assert!(
+            error.contains("leave room for the 16384 token output reserve"),
+            "{error}"
+        );
+        assert_eq!(runtime.context().window_tokens, 200_000);
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }

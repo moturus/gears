@@ -218,6 +218,29 @@ impl Runtime {
         Ok((used, self.context.window_tokens.max(1)))
     }
 
+    /// The context settings this run uses, including a window set interactively.
+    pub fn context(&self) -> ContextConfig {
+        self.context
+    }
+
+    /// Set the context window for this run. The output reserve and recent tail
+    /// keep their configured sizes, so a window that leaves no room for a
+    /// summary is refused rather than accepted and never compacted.
+    pub fn set_context_window(&mut self, window_tokens: u64) -> Result<(), String> {
+        let mut context = self.context;
+        context.window_tokens = window_tokens;
+        context.validate().map_err(|_| {
+            format!(
+                "context window {window_tokens} must be at least {} tokens and leave room for the {} token output reserve and {} token recent tail",
+                crate::config::MIN_CONTEXT_TOKENS,
+                context.output_reserve_tokens,
+                context.recent_tail_tokens
+            )
+        })?;
+        self.context = context;
+        Ok(())
+    }
+
     /// Report the context size after it changed. Interfaces that show it while
     /// a turn runs cannot ask the runtime themselves, since the turn owns it.
     fn emit_context_usage(&self, observer: &mut dyn Observer) -> Result<(), String> {

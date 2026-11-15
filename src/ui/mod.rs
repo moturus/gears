@@ -70,6 +70,62 @@ pub(crate) fn format_tools(runtime: &Runtime) -> String {
         .join("\n")
 }
 
+/// The context window, its reserve and recent tail, and how much of the window
+/// the active branch currently holds. `/context` shows this before a change.
+pub(crate) fn context_report(runtime: &Runtime) -> Result<String, String> {
+    let context = runtime.context();
+    let (used, max) = runtime.context_usage()?;
+    Ok(format!(
+        "window: {max} tokens\nused: {used} tokens ({})\noutput reserve: {} tokens\nrecent tail: {} tokens",
+        percent(used, max),
+        context.output_reserve_tokens,
+        context.recent_tail_tokens
+    ))
+}
+
+/// A whole-number percentage of `max`, rounded to the nearest point.
+pub(crate) fn percent(used: u64, max: u64) -> String {
+    let max = max.max(1);
+    format!(
+        "{}%",
+        used.saturating_mul(100).saturating_add(max / 2) / max
+    )
+}
+
+/// `/context` reports the window and its usage; `/context set TOKENS` changes
+/// the window for this run only, leaving the configuration file untouched.
+pub(crate) fn context_command(runtime: &mut Runtime, argument: &str) -> Result<String, String> {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return context_report(runtime);
+    }
+    let (action, value) = argument
+        .split_once(char::is_whitespace)
+        .map_or((argument, ""), |(action, value)| (action, value.trim()));
+    match action {
+        "set" => {
+            let window = parse_tokens(value)?;
+            runtime.set_context_window(window)?;
+            Ok(format!(
+                "context window set to {window} tokens for this run\n{}",
+                context_report(runtime)?
+            ))
+        }
+        _ => Err("usage: /context [set TOKENS]".to_string()),
+    }
+}
+
+/// A token count as typed, so thousands separators are accepted.
+fn parse_tokens(value: &str) -> Result<u64, String> {
+    let digits: String = value
+        .chars()
+        .filter(|character| !matches!(character, ',' | '_'))
+        .collect();
+    digits
+        .parse()
+        .map_err(|_| "usage: /context set TOKENS".to_string())
+}
+
 pub(crate) fn selection_and_default(argument: &str) -> (&str, bool) {
     let argument = argument.trim();
     if argument == "--default" {

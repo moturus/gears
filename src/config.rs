@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 const DEFAULT_CONTEXT_TOKENS: u64 = 128_000;
+/// The smallest window Gears accepts, from the configuration or /context set.
+pub const MIN_CONTEXT_TOKENS: u64 = 4096;
 /// Model round trips one turn of an unattended run may use; attended sessions
 /// have no cap.
 const DEFAULT_TOOL_ROUNDS: usize = 256;
@@ -18,6 +20,29 @@ pub struct ContextConfig {
     pub window_tokens: u64,
     pub output_reserve_tokens: u64,
     pub recent_tail_tokens: u64,
+}
+
+impl ContextConfig {
+    /// The bounds a window must satisfy so compaction still leaves room for a
+    /// summary: the window covers the output reserve and the recent tail.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.window_tokens < MIN_CONTEXT_TOKENS {
+            return Err(format!(
+                "context.window_tokens must be at least {MIN_CONTEXT_TOKENS}"
+            ));
+        }
+        if self.output_reserve_tokens >= self.window_tokens {
+            return Err("context.output_reserve_tokens must be below window_tokens".to_string());
+        }
+        if self.recent_tail_tokens
+            >= self
+                .window_tokens
+                .saturating_sub(self.output_reserve_tokens)
+        {
+            return Err("context.recent_tail_tokens leaves no room for a summary".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -297,7 +322,7 @@ impl Config {
                 .unwrap_or(DEFAULT_RECENT_TAIL),
         };
         let mut models = raw.models.used.unwrap_or_default();
-        validate_context(context)?;
+        context.validate()?;
         models.retain(|model| !model.trim().is_empty());
         let mut seen_models = std::collections::HashSet::new();
         models.retain(|model| seen_models.insert(model.clone()));
@@ -433,23 +458,6 @@ fn validate_host(host: &str) -> Result<String, String> {
 fn valid_name(name: &str) -> bool {
     name.bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-fn validate_context(context: ContextConfig) -> Result<(), String> {
-    if context.window_tokens < 4096 {
-        return Err("context.window_tokens must be at least 4096".to_string());
-    }
-    if context.output_reserve_tokens >= context.window_tokens {
-        return Err("context.output_reserve_tokens must be below window_tokens".to_string());
-    }
-    if context.recent_tail_tokens
-        >= context
-            .window_tokens
-            .saturating_sub(context.output_reserve_tokens)
-    {
-        return Err("context.recent_tail_tokens leaves no room for a summary".to_string());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -674,6 +682,25 @@ reasoning_echo = false
             Config::parse(
                 "version = 1\n[context]\nwindow_tokens = 10000\noutput_reserve_tokens = 10000"
             )
+            .is_err()
+        );
+        assert!(
+            Config::parse("version = 1\n[context]\nwindow_tokens = 4095").is_err(),
+            "a window below the minimum is refused"
+        );
+        let context = ContextConfig {
+            window_tokens: 4096,
+            output_reserve_tokens: 1024,
+            recent_tail_tokens: 1024,
+        };
+        assert_eq!(context.validate(), Ok(()));
+        assert!(
+            ContextConfig {
+                window_tokens: 4096,
+                output_reserve_tokens: 2048,
+                recent_tail_tokens: 2048,
+            }
+            .validate()
             .is_err()
         );
     }
