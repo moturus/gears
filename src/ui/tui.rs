@@ -15,6 +15,7 @@ use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
 
+use crate::platform::ProcessRole;
 use crate::runtime::{Event, Observer, Runtime, SessionSummary};
 use crate::ui::history::Kind;
 use crate::ui::tui_editor::{Edit, Editor};
@@ -25,15 +26,24 @@ const ENABLE_TMUX_KEYS: &str = "\x1b[>4;2m";
 const DISABLE_TMUX_KEYS: &str = "\x1b[>4;0m";
 // rmux `status::AMBER`: keep shared terminal chrome visually consistent.
 const STATUS_COLOR: Color = Color::AnsiValue(222);
-// Light green (#80FF80) for the product name and its status-bar marker.
-const TITLE_COLOR: Color = Color::Rgb {
-    r: 0x80,
-    g: 0xFF,
-    b: 0x80,
-};
+// The role colors rush's prompt uses: red for System, amber for Interactive,
+// light green for None. The title takes the role's color, so the bar says who
+// gears runs as; the fields after it stay chrome.
+const SYSTEM_COLOR: Color = Color::AnsiValue(196);
+const INTERACTIVE_COLOR: Color = Color::AnsiValue(214);
+const NONE_COLOR: Color = Color::AnsiValue(120);
 const STATUS_TITLE: &str = " Motor OS Gears";
 // Separates the product name from the status fields, in the title's color.
 const STATUS_MARKER: &str = " >>";
+
+/// The title's color: the process's role, as rush's prompt shows it.
+fn title_color(role: ProcessRole) -> Color {
+    match role {
+        ProcessRole::System => SYSTEM_COLOR,
+        ProcessRole::Interactive => INTERACTIVE_COLOR,
+        ProcessRole::None => NONE_COLOR,
+    }
+}
 
 pub fn run(
     runtime: &mut Runtime,
@@ -167,6 +177,7 @@ struct App {
     context_used: u64,
     context_max: u64,
     session: SessionSummary,
+    role: ProcessRole,
     input_enabled: bool,
     quit: bool,
     last_frame: Option<Frame>,
@@ -247,6 +258,7 @@ impl App {
             context_used: 0,
             context_max: 1,
             session: runtime.summary(),
+            role: crate::platform::process_role(),
             input_enabled: true,
             quit: false,
             last_frame: None,
@@ -542,8 +554,9 @@ impl App {
             }
         ));
         let line = &mut frame.lines[layout.status_row];
-        line.push(TITLE_COLOR, STATUS_TITLE, width);
-        line.push(TITLE_COLOR, STATUS_MARKER, width);
+        let role_color = title_color(self.role);
+        line.push(role_color, STATUS_TITLE, width);
+        line.push(role_color, STATUS_MARKER, width);
         line.push(STATUS_COLOR, &status, width);
         if layout.editor_rows != 0 {
             let row = layout.editor_start + cursor_row.saturating_sub(editor_first);
@@ -1559,6 +1572,7 @@ mod tests {
                 entries: 0,
                 ephemeral: true,
             },
+            role: ProcessRole::Interactive,
             input_enabled: true,
             quit: false,
             last_frame: None,
@@ -1790,26 +1804,25 @@ mod tests {
     }
 
     #[test]
-    fn status_and_disabled_prompt_use_the_chrome_palette() {
+    fn status_bar_colors_the_title_by_role_and_the_rest_as_chrome() {
         let mut app = app();
-        let frame = app.frame(80, 24);
-        let (title, rest) = frame.lines[23]
-            .0
-            .split_at(STATUS_TITLE.len() + STATUS_MARKER.len());
-        assert!(title.iter().all(|cell| cell.color == TITLE_COLOR));
-        assert!(!rest.is_empty());
-        assert!(rest.iter().all(|cell| cell.color == STATUS_COLOR));
+        for (role, expected) in [
+            (ProcessRole::System, Color::AnsiValue(196)),
+            (ProcessRole::Interactive, Color::AnsiValue(214)),
+            (ProcessRole::None, Color::AnsiValue(120)),
+        ] {
+            app.role = role;
+            let frame = app.frame(80, 24);
+            let (title, rest) = frame.lines[23]
+                .0
+                .split_at(STATUS_TITLE.len() + STATUS_MARKER.len());
+            assert!(title.iter().all(|cell| cell.color == expected), "{role:?}");
+            assert!(!rest.is_empty());
+            assert!(rest.iter().all(|cell| cell.color == STATUS_COLOR));
+        }
         assert_eq!(STATUS_COLOR, Color::AnsiValue(222));
-        assert_eq!(
-            TITLE_COLOR,
-            Color::Rgb {
-                r: 0x80,
-                g: 0xFF,
-                b: 0x80
-            }
-        );
         assert!(
-            frame.lines[22].0[..2]
+            app.frame(80, 24).lines[22].0[..2]
                 .iter()
                 .all(|cell| cell.color == STATUS_COLOR)
         );

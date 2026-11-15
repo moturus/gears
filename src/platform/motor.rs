@@ -10,6 +10,8 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use moto_sys::caps::ProcessRole;
+
 const STDIN_TOKEN: u64 = 0;
 const CTRL_C_TOKEN: u64 = 1;
 
@@ -99,6 +101,12 @@ fn io_error(error: moto_rt::Error) -> io::Error {
 /// The selected UI installs its handler with its own input wake path.
 pub fn install_interrupt_handler() -> bool {
     true
+}
+
+/// The process's own role, from its immutable capability word. The TUI colors
+/// its title by it, as rush's prompt does.
+pub fn process_role() -> ProcessRole {
+    ProcessRole::from_caps(moto_sys::ProcessStaticPage::get().capabilities)
 }
 
 /// Whether the console needs gears to do its own echo and line editing.

@@ -1,7 +1,8 @@
 mod motor;
 pub use motor::{
-    TerminalInput, cancellation_text, cleanup_after_exit, install_interrupt_handler, kill_tree,
-    process_alive, process_is_descendant_of, process_is_gears, raw_console, spawn, status_text,
+    ProcessRole, TerminalInput, cancellation_text, cleanup_after_exit, install_interrupt_handler,
+    kill_tree, process_alive, process_is_descendant_of, process_is_gears, process_role,
+    raw_console, spawn, status_text,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
