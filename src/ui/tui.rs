@@ -26,11 +26,12 @@ const ENABLE_TMUX_KEYS: &str = "\x1b[>4;2m";
 const DISABLE_TMUX_KEYS: &str = "\x1b[>4;0m";
 // rmux `status::AMBER`: keep shared terminal chrome visually consistent.
 const STATUS_COLOR: Color = Color::AnsiValue(222);
-// Terminals may draw the gear two cells wide, swallowing the first space;
-// the second keeps a visible gap before the status text. When idle or during
-// the off phase of its blink, the gear is replaced by spaces of the same
-// width, so the status text keeps its place.
-const STATUS_TITLE: &str = " ⚙ ";
+// The status title is the gear and its variation selector followed by one
+// space. U+FE0F is zero-width; StyledLine attaches it to the gear cell so the
+// cell model still matches the columns the terminal prints. Idle and the
+// blink's off phase use spaces of the same width, keeping the status text in
+// place.
+const STATUS_TITLE: &str = " \u{26ed}\u{fe0f} ";
 const STATUS_IDLE: &str = "   ";
 // The working gear blinks at 1 Hz: visible for the first half of each second,
 // hidden for the second half.
@@ -202,6 +203,7 @@ struct Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StyledChar {
     character: char,
+    mark: Option<char>,
     color: Color,
 }
 
@@ -210,12 +212,22 @@ struct StyledLine(Vec<StyledChar>);
 
 impl StyledLine {
     fn push(&mut self, color: Color, text: &str, width: usize) {
-        let remaining = width.saturating_sub(self.0.len());
-        self.0.extend(
-            text.chars()
-                .take(remaining)
-                .map(|character| StyledChar { character, color }),
-        );
+        for character in text.chars() {
+            if matches!(character, '\u{fe0e}' | '\u{fe0f}') {
+                if let Some(last) = self.0.last_mut() {
+                    last.mark = Some(character);
+                }
+                continue;
+            }
+            if self.0.len() == width {
+                break;
+            }
+            self.0.push(StyledChar {
+                character,
+                mark: None,
+                color,
+            });
+        }
     }
 }
 
@@ -556,7 +568,7 @@ impl App {
         // idle and the blink's off phase replace it with spaces. The rest of
         // the bar stays chrome.
         let status = single_line(&format!(
-            " {} | {} | {}{} | {}",
+            "{} | {} | {}{} | {}",
             context_status(self.context_used, self.context_max),
             self.model,
             self.session.name.as_deref().unwrap_or(&self.session.id),
@@ -704,6 +716,9 @@ fn paint_line<W: Write>(
         let mut text = String::new();
         while index < next.0.len() && next.0[index].color == color {
             text.push(next.0[index].character);
+            if let Some(mark) = next.0[index].mark {
+                text.push(mark);
+            }
             index += 1;
         }
         queue!(output, SetForegroundColor(color), Print(text))?;
@@ -1823,7 +1838,7 @@ mod tests {
         };
         let phase = |app: &App, phase: &str| {
             let status = status(app);
-            assert!(status.starts_with(" ⚙  context: "), "{status}");
+            assert!(status.starts_with(" \u{26ed} context: "), "{status}");
             assert!(status.ends_with(&format!(" | {phase}")), "{status}");
         };
 
@@ -1861,7 +1876,7 @@ mod tests {
         app.input_enabled = true;
         // Idle hides the gear behind spaces of the same width.
         let status = status(&app);
-        assert!(status.starts_with("    context: "), "{status}");
+        assert!(status.starts_with("   context: "), "{status}");
         assert!(status.ends_with(" | idle"), "{status}");
     }
 
@@ -1895,7 +1910,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             status,
-            " ⚙  context: 32000 used 25% | test/model | test-session (ephemeral) | starting turn"
+            " \u{26ed} context: 32000 used 25% | test/model | test-session (ephemeral) | starting turn"
         );
         assert_eq!(context_status(0, 0), "context: 0 used 0%");
         assert_eq!(context_status(1, 3), "context: 1 used 33%");
@@ -1968,7 +1983,8 @@ mod tests {
             app.role = role;
             app.busy_since = Instant::now();
             let frame = app.frame(80, 24);
-            assert_eq!(frame.lines[23].0[1].character, '⚙', "{role:?}");
+            assert_eq!(frame.lines[23].0[1].character, '\u{26ed}', "{role:?}");
+            assert_eq!(frame.lines[23].0[1].mark, Some('\u{fe0f}'), "{role:?}");
             assert_eq!(frame.lines[23].0[1].color, expected, "{role:?}");
 
             app.busy_since = Instant::now() - BLINK_HALF;
@@ -1987,6 +2003,20 @@ mod tests {
                 .iter()
                 .all(|cell| cell.color == Color::DarkGrey)
         );
+    }
+
+    #[test]
+    fn a_variation_selector_stays_with_its_cell() {
+        let mut line = StyledLine::default();
+        line.push(Color::White, "\u{26ed}\u{fe0f} x", 3);
+        assert_eq!(line.0.len(), 3);
+        assert_eq!(line.0[0].character, '\u{26ed}');
+        assert_eq!(line.0[0].mark, Some('\u{fe0f}'));
+
+        let mut output = Vec::new();
+        paint_line(&mut output, 0, None, &line).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\u{26ed}\u{fe0f} x"), "{output:?}");
     }
 
     #[test]
