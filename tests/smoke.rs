@@ -731,6 +731,11 @@ fn line_commands_save_provider_and_model_defaults() {
         .unwrap();
     assert!(child.wait().unwrap().success());
     assert!(root.join(".gears/provider.toml").exists());
+    let saved = std::fs::read_to_string(root.join(".gears/gears.toml")).unwrap();
+    assert!(
+        saved.contains("default_model = \"chosen/model\""),
+        "{saved}"
+    );
 
     let output = gears(&root, &workspace, &config)
         .args(["-p", "hello"])
@@ -747,6 +752,86 @@ fn line_commands_save_provider_and_model_defaults() {
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["model"], "chosen/model");
     assert!(remote.requests().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn model_and_context_changes_persist_as_defaults_in_gears_toml() {
+    let root = fixture("persisted-defaults");
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let server = MockServer::start_one(sse_response(&[
+        r#"{"choices":[{"index":0,"delta":{"content":"persisted"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+    ]))
+    .unwrap();
+    let directory = root.join(".gears");
+    std::fs::create_dir(&directory).unwrap();
+    let config = directory.join("gears.toml");
+    support::write(
+        &config,
+        format!(
+            "version = 1\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[provider]\nbase_url = '{}'\nmodel = 'old/model'\n",
+            server.url("/v1")
+        ),
+    )
+    .unwrap();
+    let mut child = gears(&root, &workspace, &config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/model chosen/model\n/context set 64000\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        saved.contains("default_model = \"chosen/model\""),
+        "{saved}"
+    );
+    assert!(saved.contains("window_tokens = 64000"), "{saved}");
+    // The gears.toml defaults stand on their own, without the saved choice.
+    std::fs::remove_file(directory.join("provider.toml")).unwrap();
+    let output = gears(&root, &workspace, &config)
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("persisted"));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["model"], "chosen/model");
+    let mut child = gears(&root, &workspace, &config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/context\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("window: 64000 tokens"), "{stderr}");
     std::fs::remove_dir_all(root).unwrap();
 }
 

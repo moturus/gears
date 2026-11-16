@@ -50,7 +50,11 @@ impl ProviderChoice {
         Self::save_selection_at(&crate::directory::default_root()?, provider, model)
     }
 
-    fn save_selection_at(directory: &Path, provider: &str, model: &str) -> Result<(), String> {
+    pub(crate) fn save_selection_at(
+        directory: &Path,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), String> {
         let urls = Self::load_at(directory)?
             .map(|saved| saved.urls)
             .unwrap_or_default();

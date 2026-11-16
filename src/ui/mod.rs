@@ -93,7 +93,7 @@ pub(crate) fn percent(used: u64, max: u64) -> String {
 }
 
 /// `/context` reports the window and its usage; `/context set TOKENS` changes
-/// the window for this run only, leaving the configuration file untouched.
+/// the window and saves it as the default in the user's gears.toml.
 pub(crate) fn context_command(runtime: &mut Runtime, argument: &str) -> Result<String, String> {
     let argument = argument.trim();
     if argument.is_empty() {
@@ -106,10 +106,15 @@ pub(crate) fn context_command(runtime: &mut Runtime, argument: &str) -> Result<S
         "set" => {
             let window = parse_tokens(value)?;
             runtime.set_context_window(window)?;
-            Ok(format!(
-                "context window set to {window} tokens for this run\n{}",
-                context_report(runtime)?
-            ))
+            let notice = match runtime.save_context_default() {
+                Ok(()) => format!(
+                    "context window set to {window} tokens and saved as the default in gears.toml"
+                ),
+                Err(error) => format!(
+                    "context window set to {window} tokens for this run; saving the default failed: {error}"
+                ),
+            };
+            Ok(format!("{notice}\n{}", context_report(runtime)?))
         }
         _ => Err("usage: /context [set TOKENS]".to_string()),
     }

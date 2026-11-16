@@ -72,6 +72,9 @@ pub struct Config {
     pub log_level: crate::trace::Level,
     pub max_tool_rounds: usize,
     pub context: ContextConfig,
+    /// The file this configuration was read from. It seeds a missing user
+    /// gears.toml when interactive defaults are saved for the first time.
+    pub source_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -92,6 +95,7 @@ impl Default for Config {
                 output_reserve_tokens: DEFAULT_OUTPUT_RESERVE,
                 recent_tail_tokens: DEFAULT_RECENT_TAIL,
             },
+            source_path: None,
         }
     }
 }
@@ -221,6 +225,66 @@ impl Config {
         Ok(())
     }
 
+    /// Save a provider and model choice as defaults in the user's gears.toml,
+    /// keeping the rest of the file as written.
+    pub fn save_model_defaults(
+        &self,
+        directory: &Path,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), String> {
+        self.edit_user_config(directory, |config| {
+            config["default_provider"] = toml_edit::value(provider);
+            config["default_model"] = toml_edit::value(model);
+        })
+    }
+
+    /// Save the context window as the default in the user's gears.toml.
+    pub fn save_context_default(&self, directory: &Path, window_tokens: u64) -> Result<(), String> {
+        let window_tokens = i64::try_from(window_tokens)
+            .map_err(|_| format!("context window {window_tokens} is too large"))?;
+        self.edit_user_config(directory, |config| {
+            let context = &mut config["context"];
+            if context.is_none() {
+                *context = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            context["window_tokens"] = toml_edit::value(window_tokens);
+        })
+    }
+
+    /// Edit the user's gears.toml in place, preserving comments and layout. A
+    /// missing file is seeded from the configuration this run loaded. The
+    /// edited file must still load, so a saved default never breaks a start.
+    fn edit_user_config(
+        &self,
+        directory: &Path,
+        edit: impl FnOnce(&mut toml_edit::DocumentMut),
+    ) -> Result<(), String> {
+        let state = crate::state::StateRoot::new(directory.to_path_buf())?;
+        let path = state.file(Path::new("gears.toml"))?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let source = self.source_path.as_deref().ok_or_else(|| {
+                    format!(
+                        "{}: not found; copy config/gears.toml there first",
+                        path.display()
+                    )
+                })?;
+                std::fs::read_to_string(source)
+                    .map_err(|error| format!("{}: {error}", source.display()))?
+            }
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        let mut document: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        edit(&mut document);
+        let text = document.to_string();
+        Self::parse_in(&text, directory).map_err(|error| format!("{}: {error}", path.display()))?;
+        state.replace_file(Path::new("gears.toml"), text.as_bytes())
+    }
+
     fn read_config(path: &Path) -> Result<Option<Self>, String> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
@@ -228,6 +292,10 @@ impl Config {
                 // gears.toml names them.
                 let directory = crate::directory::default_root().ok();
                 Self::parse_with_base(&text, directory.as_deref())
+                    .map(|mut config| {
+                        config.source_path = Some(path.to_path_buf());
+                        config
+                    })
                     .map(Some)
                     .map_err(|error| format!("{}: {error}", path.display()))
             }
@@ -337,6 +405,7 @@ impl Config {
             log_level,
             max_tool_rounds,
             context,
+            source_path: None,
         })
     }
 }
@@ -703,5 +772,62 @@ reasoning_echo = false
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn interactive_defaults_are_saved_without_losing_the_rest_of_the_file() {
+        let root = std::env::temp_dir().join(format!("gears-defaults-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let shipped = include_str!("../config/gears.toml");
+        std::fs::write(root.join("gears.toml"), shipped).unwrap();
+        let config = Config::parse_in(shipped, &root).unwrap();
+        config
+            .save_model_defaults(&root, "openrouter", "qwen/qwen4-max")
+            .unwrap();
+        config.save_context_default(&root, 200_000).unwrap();
+        let text = std::fs::read_to_string(root.join("gears.toml")).unwrap();
+        assert!(
+            text.contains("# The Gears settings that ship with Gears."),
+            "{text}"
+        );
+        let saved = Config::parse_in(&text, &root).unwrap();
+        assert_eq!(saved.default_provider, "openrouter");
+        assert_eq!(saved.default_model.as_deref(), Some("qwen/qwen4-max"));
+        assert_eq!(saved.context.window_tokens, 200_000);
+        assert_eq!(saved.providers.len(), config.providers.len());
+        assert_eq!(saved.egress_allowlist, config.egress_allowlist);
+        // A default the file cannot load is refused, leaving the file alone.
+        assert!(config.save_model_defaults(&root, "missing", "m").is_err());
+        assert!(config.save_context_default(&root, 100).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("gears.toml")).unwrap(),
+            text
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_user_config_is_seeded_from_the_loaded_file() {
+        let root = std::env::temp_dir().join(format!("gears-defaults-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let text = "version = 1\n[provider]\nbase_url = 'https://one.test/v1'\n";
+        let source = root.join("loaded.toml");
+        std::fs::write(&source, text).unwrap();
+        let mut config = Config::parse(text).unwrap();
+        let directory = root.join("fresh");
+        let error = config.save_context_default(&directory, 64_000).unwrap_err();
+        assert!(error.contains("not found"), "{error}");
+        config.source_path = Some(source);
+        config.save_context_default(&directory, 64_000).unwrap();
+        let saved = Config::parse_in(
+            &std::fs::read_to_string(directory.join("gears.toml")).unwrap(),
+            &directory,
+        )
+        .unwrap();
+        assert_eq!(saved.context.window_tokens, 64_000);
+        assert!(saved.provider("default").is_some());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -43,7 +43,8 @@ key; /setup asks again at any time.
 `gears reset` and /reset ask, then remove keys, saved settings and sessions
 from the Gears directory (keeping gears.toml) and .gears/ from the current
 directory.
-Use /provider NAME --default or /model ID --default to save both defaults.
+/model ID and /context set TOKENS save their changes as defaults in the user's
+gears.toml. Use /provider NAME --default to save the provider and model defaults.
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

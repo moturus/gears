@@ -18,6 +18,8 @@ sha2 = { version = "=0.10.8", default-features = false, features = [
     "std",
 ] }
 toml = "0.8.10"
+# Format-preserving edits of the user's gears.toml (already a `toml` dependency).
+toml_edit = "0.22.27"
 yaml_serde = "=0.10.7"
 
 # Native process control and terminal-input readiness on Motor OS.

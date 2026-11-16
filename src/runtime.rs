@@ -112,6 +112,8 @@ pub struct Runtime {
     model: String,
     max_tool_rounds: usize,
     context: ContextConfig,
+    /// The loaded configuration, whose source file seeds saved defaults.
+    config: Config,
     cancellation: Cancellation,
     usage: UsageMeter,
     startup_notices: Vec<String>,
@@ -164,6 +166,7 @@ impl Runtime {
             model,
             max_tool_rounds: config.max_tool_rounds,
             context: config.context,
+            config: config.clone(),
             cancellation,
             usage,
             startup_notices,
@@ -481,9 +484,25 @@ impl Runtime {
         self.set_model(model, observer)
     }
 
+    /// Save the provider and model as defaults for future runs: the choice in
+    /// provider.toml and the defaults in the user's gears.toml.
     pub fn save_default_selection(&mut self) -> Result<(), String> {
         self.prepare_write()?;
-        crate::provider_choice::ProviderChoice::save_selection(&self.provider_name, &self.model)
+        let directory = self.store.directory();
+        crate::provider_choice::ProviderChoice::save_selection_at(
+            directory,
+            &self.provider_name,
+            &self.model,
+        )?;
+        self.config
+            .save_model_defaults(directory, &self.provider_name, &self.model)
+    }
+
+    /// Save the context window as the default in the user's gears.toml.
+    pub fn save_context_default(&mut self) -> Result<(), String> {
+        self.prepare_write()?;
+        self.config
+            .save_context_default(self.store.directory(), self.context.window_tokens)
     }
 
     pub fn set_name(&mut self, name: &str) -> Result<(), String> {

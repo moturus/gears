@@ -216,7 +216,9 @@ fn command(
             Ok(Command::Continue)
         }
         "model" => {
-            let (argument, save_default) = super::selection_and_default(argument);
+            // A model change is always saved as the default; --default is
+            // accepted for compatibility.
+            let (argument, _) = super::selection_and_default(argument);
             let model = if argument.is_empty() {
                 choose_model(
                     runtime.model(),
@@ -227,12 +229,11 @@ fn command(
                 argument.to_string()
             };
             runtime.set_model(model, renderer)?;
-            if save_default {
-                runtime.save_default_selection()?;
-                renderer.event(Event::Notice(
-                    "saved provider and model defaults".to_string(),
-                ))?;
-            }
+            let notice = match runtime.save_default_selection() {
+                Ok(()) => "saved provider and model defaults in gears.toml".to_string(),
+                Err(error) => format!("could not save provider and model defaults: {error}"),
+            };
+            renderer.event(Event::Notice(notice))?;
             Ok(Command::Continue)
         }
         "provider" => {
@@ -251,7 +252,7 @@ fn command(
             if save_default {
                 runtime.save_default_selection()?;
                 renderer.event(Event::Notice(
-                    "saved provider and model defaults".to_string(),
+                    "saved provider and model defaults in gears.toml".to_string(),
                 ))?;
             }
             Ok(Command::Continue)

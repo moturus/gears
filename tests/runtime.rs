@@ -375,6 +375,38 @@ fn reset_removes_what_the_user_added_and_keeps_the_built_in_tools() {
 }
 
 #[test]
+fn model_and_context_defaults_are_saved_in_the_gears_directory() {
+    let fixture = Fixture::new("saved-defaults");
+    let directory = fixture.root.join("state");
+    std::fs::create_dir_all(&directory).unwrap();
+    support::write(
+        directory.join("gears.toml"),
+        "# kept comment\nversion = 1\n[provider]\nbase_url = 'https://one.test/v1'\n",
+    )
+    .unwrap();
+    let mut runtime = fixture.runtime(Scripted::new(vec![]), &Config::default());
+    runtime
+        .set_model("chosen/model".into(), &mut |_| Ok(()))
+        .unwrap();
+    runtime.save_default_selection().unwrap();
+    runtime.set_context_window(64_000).unwrap();
+    runtime.save_context_default().unwrap();
+    let text = std::fs::read_to_string(directory.join("gears.toml")).unwrap();
+    assert!(text.contains("# kept comment"), "{text}");
+    let saved = Config::parse_in(&text, &directory).unwrap();
+    assert_eq!(saved.default_provider, "default");
+    assert_eq!(saved.default_model.as_deref(), Some("chosen/model"));
+    assert_eq!(saved.context.window_tokens, 64_000);
+    let choice = gears::provider_choice::ProviderChoice::load_at(&directory)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (choice.provider.as_str(), choice.model.as_str()),
+        ("default", "chosen/model")
+    );
+}
+
+#[test]
 fn shipped_sh_tool_runs_from_its_directory() {
     let fixture = Fixture::new("shipped-sh");
     let config = Config::default();

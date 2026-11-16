@@ -1046,7 +1046,9 @@ fn handle_command(
             )?;
         }
         "model" => {
-            let (argument, save_default) = super::selection_and_default(argument);
+            // A model change is always saved as the default; --default is
+            // accepted for compatibility.
+            let (argument, _) = super::selection_and_default(argument);
             let model = if argument.is_empty() {
                 let mut choices = vec![runtime.model().to_string()];
                 for model in super::model_choices(config, runtime.provider_name()) {
@@ -1061,14 +1063,11 @@ fn handle_command(
                 argument.to_string()
             };
             runtime.set_model(model, &mut AppObserver(app))?;
-            if save_default {
-                runtime.save_default_selection()?;
-                app.push(
-                    Kind::Notice,
-                    "saved provider and model defaults".to_string(),
-                    false,
-                );
-            }
+            let notice = match runtime.save_default_selection() {
+                Ok(()) => "saved provider and model defaults in gears.toml".to_string(),
+                Err(error) => format!("could not save provider and model defaults: {error}"),
+            };
+            app.push(Kind::Notice, notice, false);
         }
         "provider" => {
             let (argument, save_default) = super::selection_and_default(argument);
@@ -1090,7 +1089,7 @@ fn handle_command(
                 runtime.save_default_selection()?;
                 app.push(
                     Kind::Notice,
-                    "saved provider and model defaults".to_string(),
+                    "saved provider and model defaults in gears.toml".to_string(),
                     false,
                 );
             }
@@ -1554,6 +1553,9 @@ mod tests {
     fn context_command_reports_and_changes_the_window() {
         let (mut runtime, root) = saved_runtime("context-command");
         let config = crate::config::Config::default();
+        let directory = root.join("state");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("gears.toml"), "version = 1\n").unwrap();
         let mut app = App::new(&runtime, true).unwrap();
         handle_command(&mut runtime, &mut app, "/context", &config).unwrap();
         let frame = visible(&app);
@@ -1565,10 +1567,17 @@ mod tests {
         assert_eq!(runtime.context().window_tokens, 200_000);
         let frame = visible(&app);
         assert!(
-            frame.contains("context window set to 200000 tokens for this run"),
+            frame.contains(
+                "context window set to 200000 tokens and saved as the default in gears.toml"
+            ),
             "{frame}"
         );
         assert!(frame.contains("window: 200000 tokens"), "{frame}");
+        let saved = crate::config::Config::parse(
+            &std::fs::read_to_string(directory.join("gears.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.context.window_tokens, 200_000);
 
         // A window that leaves no room for the reserve and tail is refused.
         let error =
@@ -1578,6 +1587,11 @@ mod tests {
             "{error}"
         );
         assert_eq!(runtime.context().window_tokens, 200_000);
+        let saved = crate::config::Config::parse(
+            &std::fs::read_to_string(directory.join("gears.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.context.window_tokens, 200_000);
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
