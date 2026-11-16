@@ -17,9 +17,14 @@ fn interactive_resume_displays_history_without_a_provider_request() {
     ]))
     .unwrap();
     let config = root.join("gears.toml");
-    std::fs::write(&config, format!(
-        "version = 1\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[provider]\nbase_url = '{}'\nmodel = 'test/model'\n", server.url("/v1")
-    )).unwrap();
+    support::write_config(
+        &config,
+        &format!(
+            "[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[provider]\nbase_url = '{}'\nmodel = 'test/model'\n",
+            server.url("/v1")
+        ),
+    )
+    .unwrap();
     let store = Store::with_root(&root, root.join(".gears")).unwrap();
     let mut session = store.create(false, None).unwrap();
     session

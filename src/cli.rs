@@ -41,10 +41,11 @@ Interactive commands include /new, /resume, /name, /session, /tree, /label,
 Without a chosen model, an interactive start asks for the provider, model and
 key; /setup asks again at any time.
 `gears reset` and /reset ask, then remove keys, saved settings and sessions
-from the Gears directory (keeping gears.toml) and .gears/ from the current
-directory.
+from the Gears directory (keeping gears.toml and the system prompt it names)
+and .gears/ from the current directory.
 /model ID and /context set TOKENS save their changes as defaults in the user's
 gears.toml. Use /provider NAME --default to save the provider and model defaults.
+The system prompt is read from the file gears.toml names beside itself.
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

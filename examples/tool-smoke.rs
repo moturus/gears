@@ -8,6 +8,8 @@ use gears::session::Store;
 use gears::tools::{Context, Registry};
 use serde_json::{Value, json};
 
+#[path = "tool-smoke/config.rs"]
+mod config;
 #[path = "tool-smoke/directory_lock.rs"]
 mod directory_lock;
 #[path = "tool-smoke/file_access.rs"]

@@ -72,6 +72,12 @@ pub struct Config {
     pub log_level: crate::trace::Level,
     pub max_tool_rounds: usize,
     pub context: ContextConfig,
+    /// The system prompt file this build reads, named by the configuration and
+    /// found beside it. It is never a path.
+    pub system_prompt_file: String,
+    /// That file's text, read when the configuration is loaded from a file. A
+    /// configuration that was only parsed has none.
+    pub system_prompt: String,
     /// The file this configuration was read from. It seeds a missing user
     /// gears.toml when interactive defaults are saved for the first time.
     pub source_path: Option<PathBuf>,
@@ -95,6 +101,8 @@ impl Default for Config {
                 output_reserve_tokens: DEFAULT_OUTPUT_RESERVE,
                 recent_tail_tokens: DEFAULT_RECENT_TAIL,
             },
+            system_prompt_file: String::new(),
+            system_prompt: String::new(),
             source_path: None,
         }
     }
@@ -106,6 +114,10 @@ struct RawConfig {
     version: u32,
     default_provider: Option<String>,
     default_model: Option<String>,
+    /// The system prompt file for each platform. Both are required: Gears sends
+    /// the one for the platform it was built for.
+    system_prompt_linux: String,
+    system_prompt_motor_os: String,
     #[serde(default)]
     net: RawNet,
     provider: Option<RawProvider>,
@@ -196,7 +208,7 @@ impl Config {
                 Self::read_config(&path)?.ok_or_else(|| format!("{}: not found", path.display()))
             }
             (Found::Neither(directory), _) => Err(format!(
-                "no gears.toml in {}: copy config/gears.toml from the Gears source there",
+                "no gears.toml in {}: copy config/gears.toml and config/SYSTEM.md from the Gears source there",
                 directory.display()
             )),
         }
@@ -262,8 +274,8 @@ impl Config {
     ) -> Result<(), String> {
         let state = crate::state::StateRoot::new(directory.to_path_buf())?;
         let path = state.file(Path::new("gears.toml"))?;
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let (text, seeded) = match std::fs::read_to_string(&path) {
+            Ok(text) => (text, false),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let source = self.source_path.as_deref().ok_or_else(|| {
                     format!(
@@ -271,8 +283,9 @@ impl Config {
                         path.display()
                     )
                 })?;
-                std::fs::read_to_string(source)
-                    .map_err(|error| format!("{}: {error}", source.display()))?
+                let text = std::fs::read_to_string(source)
+                    .map_err(|error| format!("{}: {error}", source.display()))?;
+                (text, true)
             }
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
@@ -282,7 +295,25 @@ impl Config {
         edit(&mut document);
         let text = document.to_string();
         Self::parse_in(&text, directory).map_err(|error| format!("{}: {error}", path.display()))?;
+        if seeded {
+            // The prompt is read beside gears.toml, so a seeded file needs its
+            // prompt written first: the next start reads it there.
+            self.seed_system_prompt(&state)?;
+        }
         state.replace_file(Path::new("gears.toml"), text.as_bytes())
+    }
+
+    /// Write this run's system prompt beside a gears.toml Gears just seeded,
+    /// unless the directory already has one.
+    fn seed_system_prompt(&self, state: &crate::state::StateRoot) -> Result<(), String> {
+        if self.system_prompt.is_empty() {
+            return Ok(());
+        }
+        let name = Path::new(&self.system_prompt_file);
+        if state.existing_file(name)?.is_some() {
+            return Ok(());
+        }
+        state.replace_file(name, self.system_prompt.as_bytes())
     }
 
     fn read_config(path: &Path) -> Result<Option<Self>, String> {
@@ -291,17 +322,44 @@ impl Config {
                 // Key and certificate files live in the Gears directory, whichever
                 // gears.toml names them.
                 let directory = crate::directory::default_root().ok();
-                Self::parse_with_base(&text, directory.as_deref())
-                    .map(|mut config| {
-                        config.source_path = Some(path.to_path_buf());
-                        config
-                    })
-                    .map(Some)
-                    .map_err(|error| format!("{}: {error}", path.display()))
+                let mut config = Self::parse_with_base(&text, directory.as_deref())
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                config.source_path = Some(path.to_path_buf());
+                config.read_system_prompt()?;
+                Ok(Some(config))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!("{}: {error}", path.display())),
         }
+    }
+
+    /// Read this build's system prompt from beside the file this configuration
+    /// came from. Only a loaded configuration knows where that is.
+    fn read_system_prompt(&mut self) -> Result<(), String> {
+        let source = self
+            .source_path
+            .as_deref()
+            .ok_or("the system prompt needs the file this configuration came from")?;
+        let directory = source
+            .parent()
+            .ok_or_else(|| format!("{}: no directory", source.display()))?;
+        let path = directory.join(&self.system_prompt_file);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "{}: not found; copy SYSTEM.md beside {}",
+                    path.display(),
+                    source.display()
+                ));
+            }
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        if text.trim().is_empty() {
+            return Err(format!("{}: the system prompt is empty", path.display()));
+        }
+        self.system_prompt = text;
+        Ok(())
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -321,6 +379,9 @@ impl Config {
                 raw.version
             ));
         }
+        prompt_file_name("system_prompt_linux", &raw.system_prompt_linux)?;
+        prompt_file_name("system_prompt_motor_os", &raw.system_prompt_motor_os)?;
+        let system_prompt_file = platform_prompt_file(&raw).to_string();
         let egress_allowlist = validate_hosts(raw.net.egress_allowlist.unwrap_or_default())?;
         let plain_http_allowlist =
             validate_hosts(raw.net.plain_http_allowlist.unwrap_or_default())?;
@@ -405,6 +466,8 @@ impl Config {
             log_level,
             max_tool_rounds,
             context,
+            system_prompt_file,
+            system_prompt: String::new(),
             source_path: None,
         })
     }
@@ -529,46 +592,80 @@ fn valid_name(name: &str) -> bool {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+/// The system prompt file this build sends. The platform is chosen when Gears
+/// is built, not when it runs.
+#[cfg(target_os = "motor")]
+fn platform_prompt_file(raw: &RawConfig) -> &str {
+    &raw.system_prompt_motor_os
+}
+
+#[cfg(not(target_os = "motor"))]
+fn platform_prompt_file(raw: &RawConfig) -> &str {
+    &raw.system_prompt_linux
+}
+
+/// A system prompt lives beside the configuration that names it, so the
+/// configuration gives a file name and nothing else.
+fn prompt_file_name(label: &str, name: &str) -> Result<(), String> {
+    let mut components = Path::new(name).components();
+    let bare = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+        && !name.contains(['/', '\\']);
+    if !bare {
+        return Err(format!(
+            "{label} must be a file name beside gears.toml, not a path: {name:?}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The prompt settings every gears.toml carries: a file name in the
+    /// configuration's own directory.
+    const PROMPTS: &str =
+        "system_prompt_linux = 'SYSTEM.md'\nsystem_prompt_motor_os = 'SYSTEM.md'\n";
+
+    /// Configuration text for the tests, with the mandatory prompt settings.
+    fn configured(body: &str) -> String {
+        format!("version = 1\n{PROMPTS}{body}")
+    }
+
     #[test]
     fn plaintext_hosts_require_explicit_egress_and_use_the_same_matching() {
         assert!(
-            Config::parse("version = 1")
+            Config::parse(&configured(""))
                 .unwrap()
                 .plain_http_allowlist
                 .is_empty()
         );
-        let config = Config::parse(
-            r#"version = 1
-[net]
+        let config = Config::parse(&configured(
+            r#"[net]
 egress_allowlist = ["192.168.4.1", "Host.Test"]
 plain_http_allowlist = ["192.168.4.1", "host.test"]
 "#,
-        )
+        ))
         .unwrap();
         assert_eq!(config.plain_http_allowlist, config.egress_allowlist);
         for host in ["192.168.4.1", "api.host.test"] {
-            let error = Config::parse(&format!(
-                r#"version = 1
-[net]
+            let error = Config::parse(&configured(&format!(
+                r#"[net]
 egress_allowlist = ["host.test"]
 plain_http_allowlist = ["{host}"]
 "#
-            ))
+            )))
             .unwrap_err();
             assert!(error.contains("net.plain_http_allowlist"));
             assert!(error.contains("net.egress_allowlist"));
         }
         assert!(
-            Config::parse(
-                r#"version = 1
-[net]
+            Config::parse(&configured(
+                r#"[net]
 plain_http_allowlist = ["http://host.test"]
 "#
-            )
+            ))
             .is_err()
         );
     }
@@ -576,14 +673,13 @@ plain_http_allowlist = ["http://host.test"]
     #[test]
     fn a_plaintext_endpoint_is_checked_when_the_config_loads() {
         let text = |net: &str| {
-            format!(
-                r#"version = 1
-[provider]
+            configured(&format!(
+                r#"[provider]
 base_url = "http://192.168.4.1:8080/v1"
 [net]
 {net}
 "#
-            )
+            ))
         };
         for net in [
             "",
@@ -608,7 +704,7 @@ plain_http_allowlist = ["192.168.4.1"]"#,
 
     #[test]
     fn minimal_config_has_redesign_defaults() {
-        let config = Config::parse("version = 1").unwrap();
+        let config = Config::parse(&configured("")).unwrap();
         assert_eq!(config.max_tool_rounds, 256);
         assert_eq!(config.context.output_reserve_tokens, 16_384);
         // No provider or host is built in; they come from the shipped gears.toml.
@@ -620,7 +716,7 @@ plain_http_allowlist = ["192.168.4.1"]"#,
     fn relative_key_files_live_in_the_gears_directory() {
         let directory = Path::new("/home/user/.gears");
         let config = Config::parse_in(
-            "version = 1\n[provider]\nbase_url = 'https://one.test/v1'\nmodel = 'current'\napi_key_file = 'secrets/key'\nca_cert = 'ca.pem'\nmodels = ['a', '', 'b']\n",
+            &configured("[provider]\nbase_url = 'https://one.test/v1'\nmodel = 'current'\napi_key_file = 'secrets/key'\nca_cert = 'ca.pem'\nmodels = ['a', '', 'b']\n"),
             directory,
         )
         .unwrap();
@@ -629,13 +725,19 @@ plain_http_allowlist = ["192.168.4.1"]"#,
         assert_eq!(provider.models, ["a", "b"]);
         assert_eq!(provider.key_file, Some(directory.join("secrets/key")));
         assert_eq!(provider.ca_cert, Some(directory.join("ca.pem")));
-        assert!(Config::parse("version = 1\n[provider]\nmodel = 'm'").is_err());
+        assert!(
+            Config::parse(&configured("[provider]\nmodel = 'm'")).is_err(),
+            "a provider without base_url is refused"
+        );
     }
 
     #[test]
     fn saved_addresses_replace_provider_urls_and_allow_their_hosts() {
+        // This test names its own providers rather than reading `config/`.
         let mut config = Config::parse_in(
-            include_str!("../config/gears.toml"),
+            &configured(
+                "default_provider = 'cloud'\n[providers.cloud]\nbase_url = 'https://cloud.test/v1'\n[providers.local]\nbase_url = 'http://127.0.0.1:8080/v1'\nmodels = ['local']\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n",
+            ),
             Path::new("/user/cfg/gears"),
         )
         .unwrap();
@@ -689,26 +791,109 @@ plain_http_allowlist = ["192.168.4.1"]"#,
 
     #[test]
     fn unknown_keys_are_refused_in_every_section() {
-        for text in [
-            "version = 1\nunknown = 1",
-            "version = 1\n[after_turn]\ncommand = ['/review']",
-            "version = 1\n[provider]\nkey_file = '/secret/key'",
-            "version = 1\n[providers.local]\nbase_url = 'https://local.test/v1'\nmodle = 'm'",
-            "version = 1\n[runtime]\nsh_timeout_seconds = 5",
-            "version = 1\n[net]\negress = ['a.test']",
-            "version = 1\n[[tools]]\ndirectory = 'tools/sh'\nenabled = true\nname = 'sh'",
+        for body in [
+            "unknown = 1",
+            "[after_turn]\ncommand = ['/review']",
+            "[provider]\nkey_file = '/secret/key'",
+            "[providers.local]\nbase_url = 'https://local.test/v1'\nmodle = 'm'",
+            "[runtime]\nsh_timeout_seconds = 5",
+            "[net]\negress = ['a.test']",
+            "[[tools]]\ndirectory = 'tools/sh'\nenabled = true\nname = 'sh'",
         ] {
-            let error = Config::parse(text).unwrap_err();
+            let text = configured(body);
+            let error = Config::parse(&text).unwrap_err();
             assert!(error.contains("unknown field"), "{text}: {error}");
         }
+    }
+
+    #[test]
+    fn the_prompt_settings_are_mandatory_file_names() {
+        for (body, field) in [
+            (
+                "system_prompt_motor_os = 'SYSTEM.md'\n",
+                "system_prompt_linux",
+            ),
+            (
+                "system_prompt_linux = 'SYSTEM.md'\n",
+                "system_prompt_motor_os",
+            ),
+        ] {
+            let error = Config::parse(&format!("version = 1\n{body}")).unwrap_err();
+            assert!(error.contains(field), "{body}: {error}");
+        }
+        for name in [
+            "/etc/prompts.md",
+            "prompts/SYSTEM.md",
+            "./SYSTEM.md",
+            "..",
+            "",
+        ] {
+            let error = Config::parse(&format!(
+                "version = 1\nsystem_prompt_linux = '{name}'\nsystem_prompt_motor_os = 'SYSTEM.md'\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains("beside gears.toml"), "{name}: {error}");
+            let error = Config::parse(&format!(
+                "version = 1\nsystem_prompt_linux = 'SYSTEM.md'\nsystem_prompt_motor_os = '{name}'\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains("beside gears.toml"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_build_chooses_the_prompt_for_its_platform() {
+        let config = Config::parse(&format!(
+            "version = 1\nsystem_prompt_linux = 'LINUX.md'\nsystem_prompt_motor_os = 'MOTOR.md'\n"
+        ))
+        .unwrap();
+        let expected = if cfg!(target_os = "motor") {
+            "MOTOR.md"
+        } else {
+            "LINUX.md"
+        };
+        assert_eq!(config.system_prompt_file, expected);
+        // Nothing is read until the configuration is loaded from a file.
+        assert!(config.system_prompt.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_is_read_from_beside_the_loaded_configuration() {
+        let root = std::env::temp_dir().join(format!("gears-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("gears.toml");
+        std::fs::write(
+            &path,
+            "version = 1\nsystem_prompt_linux = 'PROMPT.md'\nsystem_prompt_motor_os = 'PROMPT.md'\n",
+        )
+        .unwrap();
+        let error = Config::read_config(&path).unwrap_err();
+        assert!(error.contains("PROMPT.md"), "{error}");
+        std::fs::write(root.join("PROMPT.md"), " \n").unwrap();
+        let error = Config::read_config(&path).unwrap_err();
+        assert!(error.contains("is empty"), "{error}");
+        std::fs::write(root.join("PROMPT.md"), "Work carefully.\n").unwrap();
+        let config = Config::read_config(&path).unwrap().unwrap();
+        assert_eq!(config.system_prompt_file, "PROMPT.md");
+        assert_eq!(config.system_prompt, "Work carefully.\n");
+        assert_eq!(config.source_path.as_deref(), Some(path.as_path()));
+        // A prompt elsewhere in the tree is not read.
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::write(root.join("prompts/PROMPT.md"), "Elsewhere.\n").unwrap();
+        assert_eq!(
+            Config::read_config(&path).unwrap().unwrap().system_prompt,
+            "Work carefully.\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn named_providers_are_validated_and_have_a_selected_default() {
         let path = Path::new("/tmp/gears-test-config");
         let config = Config::parse_in(
-            r#"version = 1
-default_provider = 'local'
+            &configured(
+                r#"default_provider = 'local'
 default_model = 'small'
 [net]
 egress_allowlist = ['127.0.0.1', 'openrouter.ai']
@@ -722,6 +907,7 @@ reasoning_echo = true
 base_url = 'https://openrouter.ai/api/v1'
 reasoning_echo = false
 "#,
+            ),
             path,
         )
         .unwrap();
@@ -741,20 +927,25 @@ reasoning_echo = false
             Some("local/model")
         );
         assert!(config.provider("missing").is_none());
-        assert!(Config::parse("version = 1\n[providers.one]\nbase_url = 'https://one.test/v1'\n[providers.two]\nbase_url = 'https://two.test/v1'").is_err());
-        assert!(Config::parse("version = 1\ndefault_provider = 'missing'").is_err());
+        assert!(
+            Config::parse(&configured(
+                "[providers.one]\nbase_url = 'https://one.test/v1'\n[providers.two]\nbase_url = 'https://two.test/v1'\n"
+            ))
+            .is_err()
+        );
+        assert!(Config::parse(&configured("default_provider = 'missing'\n")).is_err());
     }
 
     #[test]
     fn context_bounds_are_checked() {
         assert!(
-            Config::parse(
-                "version = 1\n[context]\nwindow_tokens = 10000\noutput_reserve_tokens = 10000"
-            )
+            Config::parse(&configured(
+                "[context]\nwindow_tokens = 10000\noutput_reserve_tokens = 10000"
+            ))
             .is_err()
         );
         assert!(
-            Config::parse("version = 1\n[context]\nwindow_tokens = 4095").is_err(),
+            Config::parse(&configured("[context]\nwindow_tokens = 4095")).is_err(),
             "a window below the minimum is refused"
         );
         let context = ContextConfig {
@@ -779,16 +970,20 @@ reasoning_echo = false
         let root = std::env::temp_dir().join(format!("gears-defaults-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let shipped = include_str!("../config/gears.toml");
-        std::fs::write(root.join("gears.toml"), shipped).unwrap();
-        let config = Config::parse_in(shipped, &root).unwrap();
+        // Settings of this test's own rather than `config/`, whose contents
+        // change by hand.
+        let shipped = configured(
+            "# This comment must survive a saved default.\n[providers.openrouter]\nbase_url = 'https://openrouter.ai/api/v1'\nmodels = ['vendor/model']\n[net]\negress_allowlist = ['openrouter.ai']\n",
+        );
+        std::fs::write(root.join("gears.toml"), &shipped).unwrap();
+        let config = Config::parse_in(&shipped, &root).unwrap();
         config
             .save_model_defaults(&root, "openrouter", "qwen/qwen4-max")
             .unwrap();
         config.save_context_default(&root, 200_000).unwrap();
         let text = std::fs::read_to_string(root.join("gears.toml")).unwrap();
         assert!(
-            text.contains("# The Gears settings that ship with Gears."),
+            text.contains("# This comment must survive a saved default."),
             "{text}"
         );
         let saved = Config::parse_in(&text, &root).unwrap();
@@ -812,15 +1007,22 @@ reasoning_echo = false
         let root = std::env::temp_dir().join(format!("gears-defaults-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let text = "version = 1\n[provider]\nbase_url = 'https://one.test/v1'\n";
+        let text = configured("[provider]\nbase_url = 'https://one.test/v1'\n");
         let source = root.join("loaded.toml");
-        std::fs::write(&source, text).unwrap();
-        let mut config = Config::parse(text).unwrap();
+        std::fs::write(&source, &text).unwrap();
+        let mut config = Config::parse(&text).unwrap();
         let directory = root.join("fresh");
         let error = config.save_context_default(&directory, 64_000).unwrap_err();
         assert!(error.contains("not found"), "{error}");
         config.source_path = Some(source);
+        // A seeded gears.toml needs the prompt it names beside it, so this run's
+        // prompt is written first.
+        config.system_prompt = "You are a test agent.\n".to_string();
         config.save_context_default(&directory, 64_000).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("SYSTEM.md")).unwrap(),
+            "You are a test agent.\n"
+        );
         let saved = Config::parse_in(
             &std::fs::read_to_string(directory.join("gears.toml")).unwrap(),
             &directory,

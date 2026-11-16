@@ -5,7 +5,6 @@ use std::path::Path;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const DEFAULT_SYSTEM: &str = include_str!("../prompts/system.md");
 pub const COMPACTION: &str = include_str!("../prompts/compact.md");
 /// The workspace file whose contents every request carries.
 pub const INSTRUCTIONS: &str = "AGENTS.md";
@@ -19,14 +18,20 @@ pub struct Effective {
 }
 
 impl Effective {
-    /// Load the prompt a request is built from: the built-in system text, the
-    /// working directory, and the workspace instructions, if present.
-    pub fn new(workspace: &Path, manifest: &Value) -> Result<Self, String> {
+    /// Load the prompt a request is built from: the system text the
+    /// configuration names, the working directory, and the workspace
+    /// instructions, if present.
+    pub fn new(workspace: &Path, manifest: &Value, system: &str) -> Result<Self, String> {
         let instructions = instructions(workspace)?;
-        let mut fragments = vec![
-            DEFAULT_SYSTEM.trim().to_string(),
-            format!("Current working directory: {}", workspace.display()),
-        ];
+        let mut fragments = Vec::new();
+        let system = system.trim();
+        if !system.is_empty() {
+            fragments.push(system.to_string());
+        }
+        fragments.push(format!(
+            "Current working directory: {}",
+            workspace.display()
+        ));
         fragments.extend(instructions.clone());
         let prompt_hash = hash_json(&fragments);
         let manifest_hash = hash_json(manifest);
@@ -88,6 +93,9 @@ fn hash_json(value: &impl serde::Serialize) -> String {
 mod tests {
     use super::*;
 
+    /// The system text a configuration supplies in these tests.
+    const SYSTEM: &str = "You are a test agent.";
+
     /// A temporary workspace directory, removed when the test ends.
     struct Workspace(std::path::PathBuf);
 
@@ -109,17 +117,23 @@ mod tests {
 
     #[test]
     fn workspace_and_manifest_affect_identity() {
-        let first =
-            Effective::new(Path::new("/work"), &serde_json::json!({"tools": ["sh"]})).unwrap();
+        let first = Effective::new(
+            Path::new("/work"),
+            &serde_json::json!({"tools": ["sh"]}),
+            SYSTEM,
+        )
+        .unwrap();
         let moved = Effective::new(
             Path::new("/elsewhere"),
             &serde_json::json!({"tools": ["sh"]}),
+            SYSTEM,
         )
         .unwrap();
         assert_ne!(first.identity().prompt_hash, moved.identity().prompt_hash);
         let changed = Effective::new(
             Path::new("/work"),
             &serde_json::json!({"tools": ["sh", "extra"]}),
+            SYSTEM,
         )
         .unwrap();
         assert_ne!(
@@ -129,8 +143,27 @@ mod tests {
     }
 
     #[test]
+    fn the_configured_system_text_leads_and_changes_the_identity() {
+        let prompt = Effective::new(Path::new("/work"), &Value::Null, "  Do not guess.  ").unwrap();
+        assert_eq!(prompt.fragments()[0], "Do not guess.");
+        let other = Effective::new(Path::new("/work"), &Value::Null, "Do not guess!").unwrap();
+        assert_ne!(prompt.identity().prompt_hash, other.identity().prompt_hash);
+        // A configuration that was only parsed supplies no system text.
+        let empty = Effective::new(Path::new("/work"), &Value::Null, " \n").unwrap();
+        assert!(
+            empty
+                .fragments()
+                .iter()
+                .all(|fragment| !fragment.trim().is_empty()),
+            "{:?}",
+            empty.fragments()
+        );
+        assert_eq!(empty.fragments().len(), 1);
+    }
+
+    #[test]
     fn working_directory_is_explicit() {
-        let prompt = Effective::new(Path::new("/chosen"), &Value::Null).unwrap();
+        let prompt = Effective::new(Path::new("/chosen"), &Value::Null, SYSTEM).unwrap();
         assert!(
             prompt
                 .fragments()
@@ -142,7 +175,7 @@ mod tests {
     #[test]
     fn workspace_instructions_are_sent_and_change_the_identity() {
         let workspace = Workspace::new("instructions");
-        let absent = Effective::new(&workspace.0, &Value::Null).unwrap();
+        let absent = Effective::new(&workspace.0, &Value::Null, SYSTEM).unwrap();
         assert!(absent.instructions().is_none());
         assert!(
             absent
@@ -152,7 +185,7 @@ mod tests {
         );
 
         std::fs::write(workspace.0.join(INSTRUCTIONS), "Run the tests.\n").unwrap();
-        let present = Effective::new(&workspace.0, &Value::Null).unwrap();
+        let present = Effective::new(&workspace.0, &Value::Null, SYSTEM).unwrap();
         let instructions = present.instructions().unwrap();
         assert!(instructions.contains("Run the tests."));
         assert!(instructions.contains(INSTRUCTIONS));
@@ -172,7 +205,7 @@ mod tests {
     fn empty_instructions_are_not_sent() {
         let workspace = Workspace::new("empty-instructions");
         std::fs::write(workspace.0.join(INSTRUCTIONS), " \n").unwrap();
-        let prompt = Effective::new(&workspace.0, &Value::Null).unwrap();
+        let prompt = Effective::new(&workspace.0, &Value::Null, SYSTEM).unwrap();
         assert!(prompt.instructions().is_none());
     }
 }

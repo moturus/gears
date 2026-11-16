@@ -51,10 +51,14 @@ fn check(gears: &Path, root: &Path) -> Result<(), String> {
         let key = workspace.join("key");
         std::fs::write(&key, "fixture-owned-key").map_err(|error| error.to_string())?;
         let config = workspace.join("gears.toml");
-        std::fs::write(&config, format!(
-            "version = 1\n[provider]\nbase_url = {:?}\nmodel = 'test/model'\napi_key_file = {:?}\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n",
-            server.url("/v1"), key,
-        )).map_err(|error| error.to_string())?;
+        super::config::write(
+            &config,
+            &format!(
+                "[provider]\nbase_url = {:?}\nmodel = 'test/model'\napi_key_file = {:?}\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n",
+                server.url("/v1"),
+                key,
+            ),
+        )?;
         let cancellation = Cancellation::new();
         let mut streamed = String::new();
         let output = run(

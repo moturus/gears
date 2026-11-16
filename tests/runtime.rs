@@ -361,7 +361,7 @@ fn reset_removes_what_the_user_added_and_keeps_the_built_in_tools() {
         "test/model".into(),
     )
     .unwrap();
-    support::write(directory.join("gears.toml"), "version = 1\n").unwrap();
+    support::write_config(&directory.join("gears.toml"), "").unwrap();
     support::write(directory.join("local.key"), "key").unwrap();
     std::fs::create_dir_all(fixture.workspace.join(".gears")).unwrap();
     support::write(fixture.workspace.join(".gears/MEMORY.md"), "fact").unwrap();
@@ -381,7 +381,7 @@ fn model_and_context_defaults_are_saved_in_the_gears_directory() {
     std::fs::create_dir_all(&directory).unwrap();
     support::write(
         directory.join("gears.toml"),
-        "# kept comment\nversion = 1\n[provider]\nbase_url = 'https://one.test/v1'\n",
+        "# kept comment\nversion = 1\nsystem_prompt_linux = 'SYSTEM.md'\nsystem_prompt_motor_os = 'SYSTEM.md'\n[provider]\nbase_url = 'https://one.test/v1'\n",
     )
     .unwrap();
     let mut runtime = fixture.runtime(Scripted::new(vec![]), &Config::default());

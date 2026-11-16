@@ -32,15 +32,14 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
     let config = root.join("gears.toml");
     let key = root.join("key");
     std::fs::write(&key, "fixture").map_err(|error| error.to_string())?;
-    std::fs::write(
+    super::config::write(
         &config,
-        format!(
-            "version=1\n[provider]\nbase_url={:?}\napi_key_file={:?}\nmodel='fixture'\n[net]\negress_allowlist=['127.0.0.1']\nplain_http_allowlist=['127.0.0.1']\n",
+        &format!(
+            "[provider]\nbase_url={:?}\napi_key_file={:?}\nmodel='fixture'\n[net]\negress_allowlist=['127.0.0.1']\nplain_http_allowlist=['127.0.0.1']\n",
             server.url("/v1"),
             key,
         ),
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     let mut request = Request {
         program: gears.display().to_string(),
         args: vec![

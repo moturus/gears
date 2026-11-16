@@ -16,11 +16,10 @@ fn fixture(name: &str) -> PathBuf {
 
 fn config(root: &Path, server: &MockServer) -> PathBuf {
     let path = root.join("gears.toml");
-    support::write(
+    support::write_config(
         &path,
-        format!(
-            r#"version = 1
-[net]
+        &format!(
+            r#"[net]
 egress_allowlist = ["127.0.0.1"]
 plain_http_allowlist = ["127.0.0.1"]
 [provider]
@@ -53,12 +52,28 @@ fn a_first_run_asks_provider_model_and_key_and_saves_them_in_the_gears_directory
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let directory = root.join("gears-directory");
+    // Gears runs from a source tree of this test's own, so this test reads
+    // nothing from the repository's config/, which changes by hand.
+    let source = root.join("source");
+    std::fs::create_dir_all(source.join("target/release")).unwrap();
+    std::fs::create_dir_all(source.join("config")).unwrap();
+    support::write(source.join("Cargo.toml"), "[package]\nname = \"gears\"\n").unwrap();
+    support::write_config(
+        &source.join("config/gears.toml"),
+        r#"[providers.shipped]
+base_url = "https://provider.test/v1"
+api_key_file = "shipped.key"
+models = ["vendor/first", "vendor/second"]
+"#,
+    )
+    .unwrap();
+    let gears = source.join("target/release/gears");
+    std::fs::copy(env!("CARGO_BIN_EXE_gears"), &gears).unwrap();
     let run = |answers: &[u8]| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_gears"))
+        let mut child = Command::new(&gears)
             .args(["--ui", "line", "--ephemeral", "--workspace"])
             .arg(&workspace)
             .env("HOME", &root)
-            .env(gears::directory::ENV, root.join(".gears"))
             .env(gears::directory::ENV, &directory)
             .env_remove("GEARS_LOCK_OWNER")
             .env_remove("OPENROUTER_API_KEY")
@@ -70,27 +85,29 @@ fn a_first_run_asks_provider_model_and_key_and_saves_them_in_the_gears_directory
         child.stdin.take().unwrap().write_all(answers).unwrap();
         child.wait_with_output().unwrap()
     };
-    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
+    let shipped = source.join("config");
     let before = std::fs::read_dir(&shipped).unwrap().count();
-    // The shipped settings apply: openrouter, its second model, then the key.
+    // The shipped settings apply: the provider, its second model, then the key.
     let output = run(b"1\n2\nsk-first-run\n/quit\n");
     assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Choose a provider"), "{stderr}");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("sk-first-run"));
     assert_eq!(
-        std::fs::read_to_string(directory.join("openrouter.key")).unwrap(),
+        std::fs::read_to_string(directory.join("shipped.key")).unwrap(),
         "sk-first-run\n"
     );
     let saved = std::fs::read_to_string(directory.join("provider.toml")).unwrap();
-    assert!(saved.contains("google/gemini-3.8-flash"), "{saved}");
+    assert!(saved.contains("vendor/second"), "{saved}");
     assert_eq!(std::fs::read_dir(&shipped).unwrap().count(), before);
     // The next start asks nothing.
     let output = run(b"/quit\n");
     assert!(output.status.success(), "{output:?}");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Choose a provider"));
     // With settings of its own too, Gears asks which to use.
-    std::fs::copy(shipped.join("gears.toml"), directory.join("gears.toml")).unwrap();
+    for file in ["gears.toml", support::SYSTEM_PROMPT_FILE] {
+        std::fs::copy(shipped.join(file), directory.join(file)).unwrap();
+    }
     let output = run(b"\n");
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("running from its source tree"));
@@ -570,10 +587,10 @@ fn one_shot_uses_the_selected_named_provider() {
     ]))
     .unwrap();
     let config = root.join("gears.toml");
-    support::write(
+    support::write_config(
         &config,
-        format!(
-            "version = 1\ndefault_provider = 'local'\ndefault_model = 'test/model'\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[providers.local]\nbase_url = '{}'\n",
+        &format!(
+            "default_provider = 'local'\ndefault_model = 'test/model'\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[providers.local]\nbase_url = '{}'\n",
             server.url("/v1")
         ),
     )
@@ -606,10 +623,10 @@ fn continued_session_uses_its_recorded_provider() {
     let local = MockServer::start(vec![response(), response()]).unwrap();
     let remote = MockServer::start_one(sse_response(&[])).unwrap();
     let config = root.join("gears.toml");
-    support::write(
+    support::write_config(
         &config,
-        format!(
-            "version = 1\ndefault_provider = 'remote'\ndefault_model = 'test/model'\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[providers.local]\nbase_url = '{}'\n[providers.remote]\nbase_url = '{}'\n",
+        &format!(
+            "default_provider = 'remote'\ndefault_model = 'test/model'\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[providers.local]\nbase_url = '{}'\n[providers.remote]\nbase_url = '{}'\n",
             local.url("/v1"),
             remote.url("/v1")
         ),
@@ -662,10 +679,10 @@ fn line_command_switches_provider_before_the_next_turn() {
     .unwrap();
     let remote = MockServer::start_one(sse_response(&[])).unwrap();
     let config = root.join("gears.toml");
-    support::write(
+    support::write_config(
         &config,
-        format!(
-            "version = 1\ndefault_provider = 'remote'\ndefault_model = 'test/model'\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[providers.local]\nbase_url = '{}'\n[providers.remote]\nbase_url = '{}'\n",
+        &format!(
+            "default_provider = 'remote'\ndefault_model = 'test/model'\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[providers.local]\nbase_url = '{}'\n[providers.remote]\nbase_url = '{}'\n",
             local.url("/v1"),
             remote.url("/v1")
         ),
@@ -708,10 +725,10 @@ fn line_commands_save_provider_and_model_defaults() {
     .unwrap();
     let remote = MockServer::start_one(sse_response(&[])).unwrap();
     let config = root.join("custom-config.toml");
-    support::write(
+    support::write_config(
         &config,
-        format!(
-            "version = 1\ndefault_provider = 'remote'\ndefault_model = 'old/model'\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[providers.local]\nbase_url = '{}'\n[providers.remote]\nbase_url = '{}'\n",
+        &format!(
+            "default_provider = 'remote'\ndefault_model = 'old/model'\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[providers.local]\nbase_url = '{}'\n[providers.remote]\nbase_url = '{}'\n",
             local.url("/v1"),
             remote.url("/v1")
         ),
@@ -768,10 +785,10 @@ fn model_and_context_changes_persist_as_defaults_in_gears_toml() {
     let directory = root.join(".gears");
     std::fs::create_dir(&directory).unwrap();
     let config = directory.join("gears.toml");
-    support::write(
+    support::write_config(
         &config,
-        format!(
-            "version = 1\n[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[provider]\nbase_url = '{}'\nmodel = 'old/model'\n",
+        &format!(
+            "[net]\negress_allowlist = ['127.0.0.1']\nplain_http_allowlist = ['127.0.0.1']\n[provider]\nbase_url = '{}'\nmodel = 'old/model'\n",
             server.url("/v1")
         ),
     )

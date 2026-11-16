@@ -2,6 +2,12 @@
 version = 1
 default_provider = "openrouter"
 
+# The system prompt Gears sends, read when this file is read. Each names a file
+# in this directory; Gears uses the one for the platform it was built for and
+# accepts no other path.
+system_prompt_linux = "SYSTEM_LINUX.md"
+system_prompt_motor_os = "SYSTEM_MOTOR_OS.md"
+
 # Gears offers these providers and models when no model is chosen yet, and in
 # /setup; any other model id can be typed there. Keys are saved beside this
 # file in the Gears directory. A provider without api_key_file gets no key.

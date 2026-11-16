@@ -223,11 +223,34 @@ mod tests {
         }
     }
 
+    /// What these tests offer: a cloud provider with a key file, and a local
+    /// server. They name their own providers and models rather than reading
+    /// `config/`, which changes by hand.
+    const CONFIG: &str = "\
+version = 1
+system_prompt_linux = 'SYSTEM.md'
+system_prompt_motor_os = 'SYSTEM.md'
+default_provider = 'openrouter'
+
+[providers.openrouter]
+base_url = 'https://openrouter.ai/api/v1'
+api_key_file = 'openrouter.key'
+models = ['vendor/flash', 'vendor/pro']
+
+[providers.local]
+base_url = 'http://127.0.0.1:8080/v1'
+models = ['local']
+
+[net]
+egress_allowlist = ['127.0.0.1', 'openrouter.ai']
+plain_http_allowlist = ['127.0.0.1']
+";
+
     fn fixture(name: &str) -> (std::path::PathBuf, Config) {
         let root = std::env::temp_dir().join(format!("gears-setup-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let config = Config::parse_in(include_str!("../config/gears.toml"), &root).unwrap();
+        let config = Config::parse_in(CONFIG, &root).unwrap();
         (root, config)
     }
 
@@ -248,7 +271,7 @@ mod tests {
         ]);
         let chosen = run(&config, &root, &mut ask).unwrap().unwrap();
         assert_eq!(chosen.provider, "openrouter");
-        assert_eq!(chosen.model, "google/gemini-3.8-flash");
+        assert_eq!(chosen.model, "vendor/pro");
         assert!(ask.asked[0].starts_with("Choose a provider: openrouter "));
         assert!(ask.asked[2].ends_with("hidden=true"), "{:?}", ask.asked);
         assert_eq!(
@@ -258,7 +281,7 @@ mod tests {
         let saved = ProviderChoice::load_at(&root).unwrap().unwrap();
         assert_eq!(
             (saved.provider.as_str(), saved.model.as_str()),
-            ("openrouter", "google/gemini-3.8-flash")
+            ("openrouter", "vendor/pro")
         );
         // With the key saved, choosing again asks no key question.
         let mut again = script(vec![Answer::Pick(0), Answer::Pick(0)]);

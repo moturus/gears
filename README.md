@@ -57,6 +57,8 @@ The default configuration is `/user/cfg/gears/gears.toml`. Set
 A minimal file is:
 
     version = 1
+    system_prompt_linux = "SYSTEM.md"
+    system_prompt_motor_os = "SYSTEM.md"
 
     [provider]
     base_url = "https://openrouter.ai/api/v1"
@@ -65,8 +67,16 @@ A minimal file is:
     [models]
     used = ["provider/model", "another/model"]
 
-[config/gears.toml](config/gears.toml) is the complete starting point: copy it
-into the Gears directory.
+[config/gears.toml](config/gears.toml) is the complete starting point: copy it,
+and the `config/SYSTEM.md` it names, into the Gears directory.
+
+The two system prompt settings are required. Each names a file beside the
+`gears.toml` that gives it; an absolute or relative path is refused. Gears reads
+the one for the platform it was built for, which is fixed when it is compiled,
+not when it runs. The file is read when the configuration is read, so an edit
+takes effect at the next start; a missing or empty prompt is an error. When
+Gears seeds a Gears directory with a `gears.toml`, it writes the prompt it is
+running with beside that file.
 
 Important optional fields are:
 
@@ -179,9 +189,10 @@ user prompt; clone copies the current active branch into a new file.
 `gears reset` (or `/reset` in a running Gears) asks once, then removes
 everything the user and Gears added: key files, saved settings and model
 choices, and sessions in the Gears directory, and `.gears/` in the current
-directory. It keeps what an installation provides: `gears.toml`. `/reset`
-continues in a new session; the provider, model and key already loaded stay in
-use until Gears restarts. `gears reset` refuses to run inside another Gears.
+directory. It keeps what an installation provides: `gears.toml` and the system
+prompt file that configuration names. `/reset` continues in a new session; the
+provider, model and key already loaded stay in use until Gears restarts. `gears
+reset` refuses to run inside another Gears.
 
 Compaction summarizes older active-branch context and retains a recent tail.
 It appends a compaction entry but never deletes history. /compact accepts
@@ -190,10 +201,10 @@ output reserve, and recent-tail size. `/context` shows those settings with the
 current usage, and `/context set TOKENS` changes the window for this run
 without editing the configuration file.
 
-Prompt resources are loaded from the current installation when a session is
-opened. Their hashes are appended as a runtime identity; a change produces one
-notice. The five built-in tools are compiled in, so no tool directory or
-manifest is scanned or installed.
+The system prompt and the workspace instructions are read from files, so both
+change without rebuilding Gears. Their hashes are appended as a runtime
+identity; a change produces one notice. The five built-in tools are compiled
+in, so no tool directory or manifest is scanned or installed.
 
 A workspace's `AGENTS.md` is workspace instructions, and Gears sends it to the
 model with the system prompt on every request: it is read when a session is
@@ -219,10 +230,13 @@ your model, using a context size the model supports:
       --host 192.168.4.1 --port 8080 --ctx-size 32768 --parallel 1 --jinja
 
 Tool use requires a model and chat template supporting tool calls. An
-unauthenticated local server needs no key file. Save this as `/user/cfg/gears/gears.toml`:
+unauthenticated local server needs no key file. Save this as `/user/cfg/gears/gears.toml`,
+with the `SYSTEM.md` it names beside it:
 
 ```toml
 version = 1
+system_prompt_linux = "SYSTEM.md"
+system_prompt_motor_os = "SYSTEM.md"
 
 [provider]
 base_url = "http://192.168.4.1:8080/v1"

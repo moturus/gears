@@ -7,7 +7,8 @@ use std::path::Path;
 const KEPT: [&str; 2] = ["gears.toml", "gears.lock"];
 
 pub const DESCRIPTION: &str = "Reset Gears: remove keys, saved settings and sessions from the \
-    Gears directory (keeping gears.toml) and remove .gears/ from this directory.";
+    Gears directory (keeping gears.toml and the system prompt it names) and remove .gears/ from \
+    this directory.";
 
 /// Returns how many entries were removed. The caller holds the directory lock.
 pub fn reset(directory: &Path, workspace: &Path) -> Result<usize, String> {
@@ -21,10 +22,15 @@ pub fn reset(directory: &Path, workspace: &Path) -> Result<usize, String> {
             directory.display()
         ));
     }
+    let prompts = kept_prompts(&directory);
     let mut removed = 0;
     for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
-        if KEPT.iter().any(|name| entry.file_name() == *name) {
+        if KEPT.iter().any(|name| entry.file_name() == *name)
+            || prompts
+                .iter()
+                .any(|name| entry.file_name() == name.as_str())
+        {
             continue;
         }
         remove(&entry.path())?;
@@ -42,6 +48,22 @@ pub fn reset(directory: &Path, workspace: &Path) -> Result<usize, String> {
 fn canonical(path: &Path) -> Result<std::path::PathBuf, String> {
     path.canonicalize()
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The system prompt files the directory's gears.toml names. Reset keeps them
+/// with the configuration that reads them. A file it cannot read or parse
+/// names none.
+fn kept_prompts(directory: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(directory.join("gears.toml")) else {
+        return Vec::new();
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+        return Vec::new();
+    };
+    ["system_prompt_linux", "system_prompt_motor_os"]
+        .iter()
+        .filter_map(|key| table.get(*key)?.as_str().map(str::to_string))
+        .collect()
 }
 
 fn remove(path: &Path) -> Result<(), String> {
@@ -77,13 +99,21 @@ mod tests {
         ] {
             std::fs::write(root.join(file), "x").unwrap();
         }
-        assert_eq!(reset(&directory, &workspace).unwrap(), 3);
+        // The prompt the configuration names stays with it.
+        std::fs::write(
+            root.join("gears/gears.toml"),
+            "version = 1\nsystem_prompt_linux = 'SYSTEM.md'\nsystem_prompt_motor_os = 'SYSTEM.md'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("gears/SYSTEM.md"), "x").unwrap();
+        std::fs::write(root.join("gears/OTHER.md"), "x").unwrap();
+        assert_eq!(reset(&directory, &workspace).unwrap(), 4);
         let mut left = std::fs::read_dir(&directory)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
         left.sort();
-        assert_eq!(left, ["gears.lock", "gears.toml"]);
+        assert_eq!(left, ["SYSTEM.md", "gears.lock", "gears.toml"]);
         assert!(!workspace.join(".gears").exists());
         assert!(workspace.join("AGENTS.md").is_file());
         assert_eq!(reset(&directory, &workspace).unwrap(), 0);

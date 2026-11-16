@@ -21,15 +21,14 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
     std::fs::write(&key, "fixture").map_err(|e| e.to_string())?;
     let config = selected.join("gears.toml");
     let settings = format!(
-        "version=1\n[provider]\nbase_url={:?}\napi_key_file={:?}\nmodel='config-model'\n[net]\negress_allowlist=['127.0.0.1']\nplain_http_allowlist=['127.0.0.1']\n",
+        "[provider]\nbase_url={:?}\napi_key_file={:?}\nmodel='config-model'\n[net]\negress_allowlist=['127.0.0.1']\nplain_http_allowlist=['127.0.0.1']\n",
         server.url("/v1"),
         key
     );
-    std::fs::write(
+    super::config::write(
         &config,
-        format!("{settings}[runtime]\nsh_timeout_seconds = 5\n"),
-    )
-    .map_err(|e| e.to_string())?;
+        &format!("{settings}[runtime]\nsh_timeout_seconds = 5\n"),
+    )?;
     std::fs::write(
         selected.join("provider.toml"),
         "version=1\nprovider='default'\nmodel='isolated-model'\n",
@@ -58,7 +57,7 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
     assert!(!output.success());
     assert!(output.stderr.contains("unknown field"), "{output:?}");
     assert!(server.requests().is_empty());
-    std::fs::write(&config, &settings).map_err(|e| e.to_string())?;
+    std::fs::write(&config, super::config::text(&settings)).map_err(|e| e.to_string())?;
     let output = run(&request, &Cancellation::new(), &mut |_, _| {}).map_err(|e| e.to_string())?;
     assert!(output.success(), "{output:?}");
     // Abandoned temporary state in the selected directory is cleaned at startup.

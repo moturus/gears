@@ -140,7 +140,7 @@ impl Runtime {
             ));
         }
         let provider_name = session.provider().unwrap_or_else(|| "default".to_string());
-        let prompt = effective_prompt(store.workspace(), &tools)?;
+        let prompt = effective_prompt(store.workspace(), &tools, &config.system_prompt)?;
         let identity = prompt.identity();
         if previous_identity
             .as_ref()
@@ -585,12 +585,20 @@ impl Runtime {
     /// disk here, so a request never carries an AGENTS.md that was edited since
     /// the session was opened, and a compaction cannot drop it.
     fn reload_prompt(&mut self) -> Result<(), String> {
-        self.prompt = effective_prompt(self.store.workspace(), &self.tools)?;
+        self.prompt = effective_prompt(
+            self.store.workspace(),
+            &self.tools,
+            &self.config.system_prompt,
+        )?;
         Ok(())
     }
 
     fn refresh_prompt(&mut self) -> Result<Effective, String> {
-        let prompt = effective_prompt(self.store.workspace(), &self.tools)?;
+        let prompt = effective_prompt(
+            self.store.workspace(),
+            &self.tools,
+            &self.config.system_prompt,
+        )?;
         if self
             .session
             .latest_runtime_identity()
@@ -630,7 +638,11 @@ impl Runtime {
         if session.model().is_none() {
             session.set_model(&model)?;
         }
-        let prompt = effective_prompt(self.store.workspace(), &self.tools)?;
+        let prompt = effective_prompt(
+            self.store.workspace(),
+            &self.tools,
+            &self.config.system_prompt,
+        )?;
         let identity = prompt.identity();
         if session
             .latest_runtime_identity()
@@ -946,11 +958,15 @@ impl EventSink for CancellationSink<'_> {
     }
 }
 
-fn effective_prompt(workspace: &std::path::Path, tools: &Registry) -> Result<Effective, String> {
+fn effective_prompt(
+    workspace: &std::path::Path,
+    tools: &Registry,
+    system: &str,
+) -> Result<Effective, String> {
     let manifest = serde_json::json!({
         "tools": tools.tools().iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
     });
-    Effective::new(workspace, &manifest)
+    Effective::new(workspace, &manifest, system)
 }
 fn estimate_request_tokens(prompt: &[String], messages: &[Message], tools: &[ToolSpec]) -> u64 {
     let bytes = serde_json::to_vec(&(prompt, messages, tools))
