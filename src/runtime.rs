@@ -41,6 +41,10 @@ pub enum Event {
         is_error: bool,
         outcome: ToolOutcome,
     },
+    /// The turn is waiting on the provider. A request can take a while and
+    /// says nothing of its own meanwhile, so without this an interface could
+    /// only report the event before it.
+    Waiting(Waiting),
     Notice(String),
     Usage {
         request: Usage,
@@ -59,6 +63,18 @@ pub enum Event {
         tool_rounds: usize,
         last_entry_id: Option<String>,
     },
+}
+
+/// What a turn is waiting for while it can report nothing from the stream, so
+/// a status line can say what is happening rather than what just finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    /// The request is out and the model has sent nothing yet.
+    Model,
+    /// The request carries the tool results the turn just recorded.
+    ToolOutput,
+    /// A compaction request is rewriting the context.
+    Compaction,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +329,14 @@ impl Runtime {
             let messages = self.session.context_messages()?;
             self.ensure_fits(&messages)?;
             let request = self.request(messages, true);
+            // The turn's first request waits for the model; a later one also
+            // hands it the results of the tool round before it.
+            let waiting = if *tool_rounds == 0 {
+                Waiting::Model
+            } else {
+                Waiting::ToolOutput
+            };
+            observer.event(Event::Waiting(waiting))?;
             let completion = {
                 let mut sink = RuntimeSink {
                     cancellation: &self.cancellation,
@@ -809,6 +833,7 @@ impl Runtime {
         let mut sink = CancellationSink {
             cancellation: &self.cancellation,
         };
+        observer.event(Event::Waiting(Waiting::Compaction))?;
         let completion = self
             .provider
             .complete(&request, &mut sink)

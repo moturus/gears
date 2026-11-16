@@ -157,9 +157,11 @@ For machine-readable one-shot output, use `-p PROMPT --output jsonl`.
 Version 1 starts with a `session` record containing `session_id`, `path`
 (null for an ephemeral session), and `session_format_version`. Streaming
 records have types `text`, `reasoning`, `tool_start`, `tool_output`,
-`tool_result`, `notice`, `usage`, `context_usage`, and `turn_end`. Tool results
-include the call id, error flag, and three-state outcome. Every record is
-one flushed JSON line; embedded newlines are escaped.
+`tool_result`, `waiting`, `notice`, `usage`, `context_usage`, and `turn_end`.
+Tool results include the call id, error flag, and three-state outcome. A
+`waiting` record names what the turn waits for (`model`, `tool_output`, or
+`compaction`) while the provider sends nothing. Every record is one flushed
+JSON line; embedded newlines are escaped.
 
 The last `final` record contains `success`, `answer`, `error`, and numeric
 `usage` for this run, including compaction requests. `session_usage` includes

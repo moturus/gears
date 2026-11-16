@@ -16,7 +16,7 @@ use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_m
 use crossterm::{execute, queue};
 
 use crate::platform::ProcessRole;
-use crate::runtime::{Event, Observer, Runtime, SessionSummary};
+use crate::runtime::{Event, Observer, Runtime, SessionSummary, Waiting};
 use crate::ui::history::Kind;
 use crate::ui::tui_editor::{Edit, Editor};
 
@@ -244,7 +244,9 @@ fn screen_layout(height: usize, editor_rows: usize) -> Layout {
 impl App {
     fn begin_operation(&mut self) {
         self.input_enabled = false;
-        self.status = "working".to_string();
+        // The runtime reports its own waits once the turn starts; until then the
+        // turn is reading the prompt and the session.
+        self.status = "starting turn".to_string();
     }
 
     fn new(runtime: &Runtime, interactive: bool) -> Result<Self, String> {
@@ -307,19 +309,21 @@ impl App {
                 is_error,
                 ..
             } => {
-                self.status = if is_error {
-                    format!("{name} failed")
-                } else {
-                    format!("{name} finished")
-                };
+                // The result goes back to the model next, and `Waiting` reports
+                // that wait; the outcome already has its transcript line.
                 self.push(
                     if is_error { Kind::Error } else { Kind::Tool },
                     format!("{name}> {}", fold(&content)),
                     false,
                 );
             }
+            Event::Waiting(Waiting::Model) => self.status = "waiting for model".to_string(),
+            Event::Waiting(Waiting::ToolOutput) => {
+                self.status = "processing tool output".to_string()
+            }
+            Event::Waiting(Waiting::Compaction) => self.status = "compacting".to_string(),
             Event::Notice(text) => self.push(Kind::Notice, text, false),
-            Event::Usage { total, .. } => self.status = total.summary(),
+            Event::Usage { .. } => {}
             Event::ContextUsage { used, max } => {
                 self.context_used = used;
                 self.context_max = max;
@@ -1596,7 +1600,7 @@ mod tests {
             bytes: 0,
             editor: Editor::new(),
             scroll: 0,
-            status: "working".to_string(),
+            status: "starting turn".to_string(),
             model: "test/model".to_string(),
             context_used: 0,
             context_max: 1,
@@ -1771,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_events_keep_the_activity_marker_current() {
+    fn the_status_line_reports_what_the_turn_is_doing() {
         let mut app = app();
         let status = |app: &App| {
             app.frame(80, 24).lines[23]
@@ -1780,18 +1784,63 @@ mod tests {
                 .map(|cell| cell.character)
                 .collect::<String>()
         };
+        let phase = |app: &App, phase: &str| {
+            let status = status(app);
+            assert!(
+                status.starts_with(&format!(" Motor OS Gears >> {phase} |")),
+                "{status}"
+            );
+        };
 
-        assert!(status(&app).starts_with(" Motor OS Gears >> working |"));
+        phase(&app, "starting turn");
+        app.apply(Event::Waiting(Waiting::Model));
+        phase(&app, "waiting for model");
         app.apply(Event::Reasoning("plan".to_string()));
-        assert!(status(&app).starts_with(" Motor OS Gears >> thinking |"));
+        phase(&app, "thinking");
         app.apply(Event::Text("answer".to_string()));
-        assert!(status(&app).starts_with(" Motor OS Gears >> responding |"));
+        phase(&app, "responding");
+        app.apply(Event::ToolStart {
+            call_id: "call_1".to_string(),
+            name: "sh".to_string(),
+            detail: "uname".to_string(),
+        });
+        phase(&app, "running sh");
+        app.apply(Event::ToolEnd {
+            call_id: "call_1".to_string(),
+            name: "sh".to_string(),
+            content: "Motor OS".to_string(),
+            is_error: false,
+            outcome: crate::provider::ToolOutcome::Completed,
+        });
+        // The tool's own outcome is in the transcript; the status line moves on
+        // to the wait the runtime reports next.
+        app.apply(Event::Waiting(Waiting::ToolOutput));
+        phase(&app, "processing tool output");
+        app.apply(Event::Waiting(Waiting::Compaction));
+        phase(&app, "compacting");
         app.apply(Event::TurnEnd {
             status: "completed",
-            tool_rounds: 0,
+            tool_rounds: 1,
             last_entry_id: None,
         });
-        assert!(status(&app).starts_with(" Motor OS Gears >> idle |"));
+        phase(&app, "idle");
+    }
+
+    #[test]
+    fn usage_totals_do_not_replace_the_reported_phase() {
+        let mut app = app();
+        let mut total = crate::provider::UsageMeter::new();
+        total.add(&crate::provider::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            ..crate::provider::Usage::default()
+        });
+        app.apply(Event::Waiting(Waiting::ToolOutput));
+        app.apply(Event::Usage {
+            request: crate::provider::Usage::default(),
+            total,
+        });
+        assert_eq!(app.status, "processing tool output");
     }
 
     #[test]
@@ -1805,8 +1854,9 @@ mod tests {
             .map(|cell| cell.character)
             .collect::<String>();
         assert!(
-            status
-                .starts_with(" Motor OS Gears >> working | context: 32000 used 25% | test/model |"),
+            status.starts_with(
+                " Motor OS Gears >> starting turn | context: 32000 used 25% | test/model |"
+            ),
             "{status}"
         );
         assert_eq!(context_status(0, 0), "context: 0 used 0%");
@@ -1865,7 +1915,7 @@ mod tests {
         app.status = "idle".into();
         app.begin_operation();
         assert!(!app.input_enabled);
-        assert_eq!(app.status, "working");
+        assert_eq!(app.status, "starting turn");
         let frame = app.frame(80, 24);
         assert!(
             frame.lines[22].0[..2]

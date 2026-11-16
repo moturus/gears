@@ -288,17 +288,28 @@ fn jsonl_one_shot_streams_reasoning_text_and_numeric_usage() {
             .iter()
             .map(|record| record["type"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["session", "reasoning", "text", "usage", "turn_end", "final"]
+        [
+            "session",
+            "context_usage",
+            "waiting",
+            "reasoning",
+            "text",
+            "usage",
+            "context_usage",
+            "turn_end",
+            "final"
+        ]
     );
     assert_eq!(records[0]["version"], 1);
     assert_eq!(records[0]["session_format_version"], 1);
     assert!(records[0]["session_id"].as_str().is_some());
     assert!(records[0]["path"].is_null());
-    assert_eq!(records[1]["text"], "thinking\n");
-    assert_eq!(records[2]["text"], "hello\nmock");
-    assert_eq!(records[4]["status"], "completed");
-    assert_eq!(records[4]["tool_rounds"], 0);
-    assert!(records[4]["last_entry_id"].as_str().is_some());
+    assert_eq!(records[2]["waiting_for"], "model");
+    assert_eq!(records[3]["text"], "thinking\n");
+    assert_eq!(records[4]["text"], "hello\nmock");
+    assert_eq!(records[7]["status"], "completed");
+    assert_eq!(records[7]["tool_rounds"], 0);
+    assert!(records[7]["last_entry_id"].as_str().is_some());
     let last = records.last().unwrap();
     assert_eq!(last["success"], true);
     assert_eq!(last["answer"], "hello\nmock");
@@ -344,6 +355,13 @@ fn jsonl_tool_records_report_the_call_and_its_output() {
     assert_eq!(result["call_id"], start["call_id"]);
     assert_eq!(result["outcome"], "completed");
     assert_eq!(result["is_error"], false);
+    let waits = records
+        .iter()
+        .filter(|record| record["type"] == "waiting")
+        .map(|record| record["waiting_for"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    // The second request carries the tool results the first round recorded.
+    assert_eq!(waits, ["model", "tool_output"]);
     let output = records
         .iter()
         .filter(|record| record["type"] == "tool_output")

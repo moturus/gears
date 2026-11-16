@@ -454,6 +454,7 @@ impl Observer for Renderer {
                 eprintln!("gears: {notice}");
             }
             Event::Usage { .. } => {}
+            Event::Waiting(_) => {}
             Event::ContextUsage { .. } => {}
             Event::TurnEnd { .. } => self.finish_turn(),
             Event::ModelChanged(model) => eprintln!("model: {model}"),

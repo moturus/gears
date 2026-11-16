@@ -13,7 +13,7 @@ use gears::provider::{
     Completion, ContentBlock, Endpoint, EventSink, FinishReason, Message, OpenAiCompat, Provider,
     ProviderError, Quirks, Request, StreamEvent, ToolCall, ToolOutcome,
 };
-use gears::runtime::{Event, Runtime};
+use gears::runtime::{Event, Runtime, Waiting};
 use gears::session::Store;
 
 struct Scripted {
@@ -132,6 +132,29 @@ fn context_usage_events_track_each_addition_during_a_turn() {
 }
 
 #[test]
+fn waiting_events_say_what_each_request_is_for() {
+    let fixture = Fixture::new("waiting-events");
+    let config = Config::default();
+    let provider = Scripted::new(vec![
+        tool("sh", r#"{"command":"printf forbidden"}"#),
+        answer("done"),
+    ]);
+    let mut runtime = fixture.runtime(provider, &config);
+    let mut waits = Vec::new();
+    runtime
+        .turn("work".into(), &mut |event| {
+            if let Event::Waiting(waiting) = event {
+                waits.push(waiting);
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Nothing has streamed yet on the first request; the second one carries the
+    // tool result the round just recorded.
+    assert_eq!(waits, [Waiting::Model, Waiting::ToolOutput]);
+}
+
+#[test]
 fn runtime_events_pair_tool_ids_and_report_numeric_usage() {
     let fixture = Fixture::new("structured-events");
     let config = Config::default();
@@ -207,10 +230,13 @@ fn compaction_reports_its_usage_as_a_numeric_event() {
         runtime.turn(prompt.into(), &mut |_| Ok(())).unwrap();
     }
     let mut reported = Vec::new();
+    let mut waits = Vec::new();
     runtime
         .compact(None, &mut |event| {
-            if let Event::Usage { request, total } = event {
-                reported.push((request, total));
+            match event {
+                Event::Usage { request, total } => reported.push((request, total)),
+                Event::Waiting(waiting) => waits.push(waiting),
+                _ => {}
             }
             Ok(())
         })
@@ -219,6 +245,7 @@ fn compaction_reports_its_usage_as_a_numeric_event() {
     assert_eq!(reported[0].0.total(), 12);
     assert_eq!(reported[0].1.completions, 3);
     assert_eq!(reported[0].1.total_tokens(), 36);
+    assert_eq!(waits, [Waiting::Compaction]);
 }
 
 #[test]

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::process::Stream;
 use crate::provider::{Role, UsageMeter};
-use crate::runtime::{Event, Observer, Runtime};
+use crate::runtime::{Event, Observer, Runtime, Waiting};
 
 pub const VERSION: u32 = 1;
 
@@ -105,6 +105,14 @@ impl<W: Write> Observer for Renderer<W> {
             } => json!({
                 "type": "tool_result", "call_id": call_id, "name": name,
                 "content": content, "is_error": is_error, "outcome": outcome,
+            }),
+            Event::Waiting(waiting) => json!({
+                "type": "waiting",
+                "waiting_for": match waiting {
+                    Waiting::Model => "model",
+                    Waiting::ToolOutput => "tool_output",
+                    Waiting::Compaction => "compaction",
+                },
             }),
             Event::Notice(text) => json!({"type": "notice", "text": text}),
             Event::Usage { request, total } => {
