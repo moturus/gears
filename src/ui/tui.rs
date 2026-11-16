@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::{OnceLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor;
 use crossterm::event::{
@@ -26,23 +26,29 @@ const ENABLE_TMUX_KEYS: &str = "\x1b[>4;2m";
 const DISABLE_TMUX_KEYS: &str = "\x1b[>4;0m";
 // rmux `status::AMBER`: keep shared terminal chrome visually consistent.
 const STATUS_COLOR: Color = Color::AnsiValue(222);
-// The role colors rush's prompt uses: red for System, amber for Interactive,
-// light green for None. The title takes the role's color, so the bar says who
-// gears runs as; the fields after it stay chrome.
-const SYSTEM_COLOR: Color = Color::AnsiValue(196);
-const INTERACTIVE_COLOR: Color = Color::AnsiValue(214);
-const NONE_COLOR: Color = Color::AnsiValue(120);
-const STATUS_TITLE: &str = " Motor OS Gears";
-// Separates the product name from the status fields, in the title's color.
-const STATUS_MARKER: &str = " >>";
+// Terminals may draw the gear two cells wide, swallowing the first space;
+// the second keeps a visible gap before the status text. When idle or during
+// the off phase of its blink, the gear is replaced by spaces of the same
+// width, so the status text keeps its place.
+const STATUS_TITLE: &str = " ⚙ ";
+const STATUS_IDLE: &str = "   ";
+// The working gear blinks at 1 Hz: visible for the first half of each second,
+// hidden for the second half.
+const BLINK_HALF: Duration = Duration::from_millis(500);
 
-/// The title's color: the process's role, as rush's prompt shows it.
-fn title_color(role: ProcessRole) -> Color {
+/// The role colors rush's prompt uses: red for System, amber for Interactive,
+/// light green for None. The working gear takes the role's color; the fields
+/// after it stay chrome.
+fn gear_color(role: ProcessRole) -> Color {
     match role {
-        ProcessRole::System => SYSTEM_COLOR,
-        ProcessRole::Interactive => INTERACTIVE_COLOR,
-        ProcessRole::None => NONE_COLOR,
+        ProcessRole::System => Color::AnsiValue(196),
+        ProcessRole::Interactive => Color::AnsiValue(214),
+        ProcessRole::None => Color::AnsiValue(120),
     }
+}
+
+fn gear_visible(elapsed: Duration) -> bool {
+    (elapsed.as_millis() / BLINK_HALF.as_millis()).is_multiple_of(2)
 }
 
 pub fn run(
@@ -179,6 +185,8 @@ struct App {
     session: SessionSummary,
     role: ProcessRole,
     input_enabled: bool,
+    /// When the current operation started; drives the gear's working blink.
+    busy_since: Instant,
     quit: bool,
     last_frame: Option<Frame>,
 }
@@ -244,6 +252,7 @@ fn screen_layout(height: usize, editor_rows: usize) -> Layout {
 impl App {
     fn begin_operation(&mut self) {
         self.input_enabled = false;
+        self.busy_since = Instant::now();
         // The runtime reports its own waits once the turn starts; until then the
         // turn is reading the prompt and the session.
         self.status = "starting turn".to_string();
@@ -262,6 +271,7 @@ impl App {
             session: runtime.summary(),
             role: crate::platform::process_role(),
             input_enabled: true,
+            busy_since: Instant::now(),
             quit: false,
             last_frame: None,
         };
@@ -542,12 +552,11 @@ impl App {
             );
             target.push(Color::White, line, width);
         }
-        // The product name keeps its own color; the rest of the bar stays chrome.
-        // The product name and its marker keep their own color; the rest of the
-        // bar stays chrome.
+        // The gear shows while working, blinking at 1 Hz in the role's color;
+        // idle and the blink's off phase replace it with spaces. The rest of
+        // the bar stays chrome.
         let status = single_line(&format!(
-            " {} | {} | {} | {}{}",
-            self.status,
+            " {} | {} | {}{} | {}",
             context_status(self.context_used, self.context_max),
             self.model,
             self.session.name.as_deref().unwrap_or(&self.session.id),
@@ -555,12 +564,15 @@ impl App {
                 " (ephemeral)"
             } else {
                 ""
-            }
+            },
+            self.status
         ));
         let line = &mut frame.lines[layout.status_row];
-        let role_color = title_color(self.role);
-        line.push(role_color, STATUS_TITLE, width);
-        line.push(role_color, STATUS_MARKER, width);
+        if !self.input_enabled && gear_visible(self.busy_since.elapsed()) {
+            line.push(gear_color(self.role), STATUS_TITLE, width);
+        } else {
+            line.push(STATUS_COLOR, STATUS_IDLE, width);
+        }
         line.push(STATUS_COLOR, &status, width);
         if layout.editor_rows != 0 {
             let row = layout.editor_start + cursor_row.saturating_sub(editor_first);
@@ -730,6 +742,7 @@ fn run_operation(
             let result = operation.run(runtime, &mut observer);
             let _ = sender.send(TurnMessage::Done(result));
         });
+        let mut blink_phase = None;
         loop {
             let mut dirty = false;
             loop {
@@ -753,8 +766,11 @@ fn run_operation(
                     }
                 }
             }
-            if dirty {
+            // Repaint on events and on each gear blink edge (1 Hz).
+            let visible = gear_visible(app.busy_since.elapsed());
+            if dirty || blink_phase != Some(visible) {
                 app.render()?;
+                blink_phase = Some(visible);
             }
             if event::poll(POLL).map_err(|error| error.to_string())? {
                 match event::read().map_err(|error| error.to_string())? {
@@ -788,6 +804,7 @@ fn run_operation(
 
 fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> Result<(), String> {
     app.input_enabled = false;
+    app.busy_since = Instant::now();
     app.status = "compacting".to_string();
     app.render()?;
     let cancellation = runtime.cancellation();
@@ -802,6 +819,7 @@ fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> R
             let result = runtime.compact(focus, &mut observer);
             let _ = sender.send(TurnMessage::Done(result));
         });
+        let mut blink_phase = None;
         loop {
             let mut dirty = false;
             loop {
@@ -823,8 +841,11 @@ fn run_compact(runtime: &mut Runtime, focus: Option<String>, app: &mut App) -> R
                     }
                 }
             }
-            if dirty {
+            // Repaint on events and on each gear blink edge (1 Hz).
+            let visible = gear_visible(app.busy_since.elapsed());
+            if dirty || blink_phase != Some(visible) {
                 app.render()?;
+                blink_phase = Some(visible);
             }
             if event::poll(POLL).map_err(|error| error.to_string())? {
                 match event::read().map_err(|error| error.to_string())? {
@@ -1627,6 +1648,7 @@ mod tests {
             },
             role: ProcessRole::Interactive,
             input_enabled: true,
+            busy_since: Instant::now(),
             quit: false,
             last_frame: None,
         }
@@ -1791,8 +1813,9 @@ mod tests {
     #[test]
     fn the_status_line_reports_what_the_turn_is_doing() {
         let mut app = app();
+        app.begin_operation();
         let status = |app: &App| {
-            app.frame(80, 24).lines[23]
+            app.frame(120, 24).lines[23]
                 .0
                 .iter()
                 .map(|cell| cell.character)
@@ -1800,10 +1823,8 @@ mod tests {
         };
         let phase = |app: &App, phase: &str| {
             let status = status(app);
-            assert!(
-                status.starts_with(&format!(" Motor OS Gears >> {phase} |")),
-                "{status}"
-            );
+            assert!(status.starts_with(" ⚙  context: "), "{status}");
+            assert!(status.ends_with(&format!(" | {phase}")), "{status}");
         };
 
         phase(&app, "starting turn");
@@ -1837,7 +1858,11 @@ mod tests {
             tool_rounds: 1,
             last_entry_id: None,
         });
-        phase(&app, "idle");
+        app.input_enabled = true;
+        // Idle hides the gear behind spaces of the same width.
+        let status = status(&app);
+        assert!(status.starts_with("    context: "), "{status}");
+        assert!(status.ends_with(" | idle"), "{status}");
     }
 
     #[test]
@@ -1860,18 +1885,17 @@ mod tests {
     #[test]
     fn the_status_bar_reports_context_use_before_the_model() {
         let mut app = app();
+        app.begin_operation();
         app.context_used = 32_000;
         app.context_max = 128_000;
-        let status = app.frame(80, 24).lines[23]
+        let status = app.frame(120, 24).lines[23]
             .0
             .iter()
             .map(|cell| cell.character)
             .collect::<String>();
-        assert!(
-            status.starts_with(
-                " Motor OS Gears >> starting turn | context: 32000 used 25% | test/model |"
-            ),
-            "{status}"
+        assert_eq!(
+            status,
+            " ⚙  context: 32000 used 25% | test/model | test-session (ephemeral) | starting turn"
         );
         assert_eq!(context_status(0, 0), "context: 0 used 0%");
         assert_eq!(context_status(1, 3), "context: 1 used 33%");
@@ -1893,29 +1917,34 @@ mod tests {
             max: 4_000,
         });
         let first = status(&app);
-        assert!(first.contains("| context: 1000 used 25% |"), "{first}");
+        assert!(first.contains("context: 1000 used 25% |"), "{first}");
         app.apply(Event::ContextUsage {
             used: 2_000,
             max: 4_000,
         });
         let second = status(&app);
-        assert!(second.contains("| context: 2000 used 50% |"), "{second}");
+        assert!(second.contains("context: 2000 used 50% |"), "{second}");
     }
 
     #[test]
-    fn status_bar_colors_the_title_by_role_and_the_rest_as_chrome() {
+    fn status_bar_shows_the_gear_only_while_working() {
         let mut app = app();
-        for (role, expected) in [
-            (ProcessRole::System, Color::AnsiValue(196)),
-            (ProcessRole::Interactive, Color::AnsiValue(214)),
-            (ProcessRole::None, Color::AnsiValue(120)),
+        app.status = "idle".into();
+        // Idle: the gear's cells are spaces and the whole bar stays chrome.
+        for role in [
+            ProcessRole::System,
+            ProcessRole::Interactive,
+            ProcessRole::None,
         ] {
             app.role = role;
             let frame = app.frame(80, 24);
-            let (title, rest) = frame.lines[23]
-                .0
-                .split_at(STATUS_TITLE.len() + STATUS_MARKER.len());
-            assert!(title.iter().all(|cell| cell.color == expected), "{role:?}");
+            let (title, rest) = frame.lines[23].0.split_at(STATUS_IDLE.chars().count());
+            assert!(
+                title
+                    .iter()
+                    .all(|cell| cell.character == ' ' && cell.color == STATUS_COLOR),
+                "{role:?}"
+            );
             assert!(!rest.is_empty());
             assert!(rest.iter().all(|cell| cell.color == STATUS_COLOR));
         }
@@ -1926,16 +1955,50 @@ mod tests {
                 .all(|cell| cell.color == STATUS_COLOR)
         );
 
-        app.status = "idle".into();
         app.begin_operation();
         assert!(!app.input_enabled);
         assert_eq!(app.status, "starting turn");
-        let frame = app.frame(80, 24);
+        // Working: the gear appears in the role's color during the visible half-second,
+        // and disappears into spaces of the same width during the off half-second.
+        for (role, expected) in [
+            (ProcessRole::System, Color::AnsiValue(196)),
+            (ProcessRole::Interactive, Color::AnsiValue(214)),
+            (ProcessRole::None, Color::AnsiValue(120)),
+        ] {
+            app.role = role;
+            app.busy_since = Instant::now();
+            let frame = app.frame(80, 24);
+            assert_eq!(frame.lines[23].0[1].character, '⚙', "{role:?}");
+            assert_eq!(frame.lines[23].0[1].color, expected, "{role:?}");
+
+            app.busy_since = Instant::now() - BLINK_HALF;
+            let off = app.frame(80, 24);
+            let (title, rest) = off.lines[23].0.split_at(STATUS_IDLE.chars().count());
+            assert!(
+                title
+                    .iter()
+                    .all(|cell| cell.character == ' ' && cell.color == STATUS_COLOR),
+                "{role:?}"
+            );
+            assert!(rest.iter().all(|cell| cell.color == STATUS_COLOR));
+        }
         assert!(
-            frame.lines[22].0[..2]
+            app.frame(80, 24).lines[22].0[..2]
                 .iter()
                 .all(|cell| cell.color == Color::DarkGrey)
         );
+    }
+
+    #[test]
+    fn the_gear_blinks_at_1hz() {
+        let at = |millis: u64| gear_visible(Duration::from_millis(millis));
+        assert!(at(0));
+        assert!(at(499));
+        assert!(!at(500));
+        assert!(!at(999));
+        assert!(at(1000));
+        assert!(at(1499));
+        assert!(!at(1500));
     }
 
     #[test]
