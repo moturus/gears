@@ -2,7 +2,8 @@
 //!
 //! Only the structure that matters at a glance is styled: headings, inline
 //! code, fenced code blocks and bold. Everything else keeps the entry's own
-//! color.
+//! color. The markdown markers stay in the text, styled like the content they
+//! enclose, so the transcript still reads as markdown.
 
 use crossterm::style::Color;
 
@@ -123,7 +124,9 @@ fn fence(trimmed: &str) -> bool {
 /// Split a line into plain, inline-code and bold spans. A backtick run opens
 /// code that the next run of the same length closes, and `**` opens bold that
 /// the next `**` closes; whichever marker comes first wins, so code inside a
-/// bold run stays code. An unclosed run stays plain, markers and all.
+/// bold run stays code. The markers stay in the text, styled like the content
+/// they enclose, so the transcript still reads as markdown. An unclosed run
+/// stays plain, markers and all.
 fn inline(line: &str, base: Style) -> Spans {
     let mut spans = Spans::new();
     let mut rest = line;
@@ -145,14 +148,13 @@ fn inline(line: &str, base: Style) -> Spans {
             };
             push(&mut spans, base, &rest[..start]);
             // Code keeps the bold it was opened in, and takes its own color.
-            push(
-                &mut spans,
-                Style {
-                    color: INLINE_CODE,
-                    bold: base.bold,
-                },
-                &after[..end],
-            );
+            let style = Style {
+                color: INLINE_CODE,
+                bold: base.bold,
+            };
+            push(&mut spans, style, &marker);
+            push(&mut spans, style, &after[..end]);
+            push(&mut spans, style, &marker);
             rest = &after[end + ticks..];
         } else {
             let after = &rest[start + 2..];
@@ -160,8 +162,13 @@ fn inline(line: &str, base: Style) -> Spans {
                 break;
             };
             push(&mut spans, base, &rest[..start]);
+            let style = Style::bold(base.color);
+            push(&mut spans, style, "**");
             // The run's own text may still hold code, so style it in turn.
-            spans.extend(inline(&after[..end], Style::bold(base.color)));
+            for (inner, text) in inline(&after[..end], style) {
+                push(&mut spans, inner, &text);
+            }
+            push(&mut spans, style, "**");
             rest = &after[end + 2..];
         }
     }
@@ -214,7 +221,7 @@ mod tests {
             lines[0],
             [
                 (plain(BASE), "run ".to_string()),
-                (plain(INLINE_CODE), "lorry build".to_string()),
+                (plain(INLINE_CODE), "`lorry build`".to_string()),
                 (plain(BASE), " now".to_string()),
             ]
         );
@@ -227,13 +234,13 @@ mod tests {
     }
 
     #[test]
-    fn bold_is_bold_and_its_markers_are_stripped() {
+    fn bold_is_bold_and_keeps_its_markers() {
         let lines = lines("a **b** c", BASE);
         assert_eq!(
             lines[0],
             [
                 (plain(BASE), "a ".to_string()),
-                (bold(BASE), "b".to_string()),
+                (bold(BASE), "**b**".to_string()),
                 (plain(BASE), " c".to_string()),
             ]
         );
@@ -248,7 +255,7 @@ mod tests {
     #[test]
     fn bold_inside_inline_code_is_code() {
         let lines = lines("`**x**`", BASE);
-        assert_eq!(lines[0], [(plain(INLINE_CODE), "**x**".to_string())]);
+        assert_eq!(lines[0], [(plain(INLINE_CODE), "`**x**`".to_string())]);
     }
 
     #[test]
@@ -257,15 +264,15 @@ mod tests {
         assert_eq!(
             lines[0],
             [
-                (bold(BASE), "a ".to_string()),
+                (bold(BASE), "**a ".to_string()),
                 (
                     Style {
                         color: INLINE_CODE,
                         bold: true,
                     },
-                    "b".to_string(),
+                    "`b`".to_string(),
                 ),
-                (bold(BASE), " c".to_string()),
+                (bold(BASE), " c**".to_string()),
             ]
         );
     }

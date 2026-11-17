@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::{OnceLock, mpsc};
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor;
@@ -12,7 +12,7 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
-use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
 
 use crate::platform::ProcessRole;
@@ -1804,7 +1804,7 @@ mod tests {
             spans(1),
             [
                 (styled(Color::White), "       run ".to_string()),
-                (styled(markdown::INLINE_CODE), "lorry build".to_string()),
+                (styled(markdown::INLINE_CODE), "`lorry build`".to_string()),
             ]
         );
         assert_eq!(
@@ -1832,12 +1832,12 @@ mod tests {
             lines[0].spans,
             [
                 (styled(Color::White), "agent> a ".to_string()),
-                (bold(Color::White), "b".to_string()),
+                (bold(Color::White), "**b**".to_string()),
                 (styled(Color::White), " c".to_string()),
             ]
         );
-        // The markers are gone from what the terminal is asked to print.
-        assert!(!visible(&app).contains("**"));
+        // The markers stay in what the terminal is asked to print.
+        assert!(visible(&app).contains("**b**"));
 
         let frame = app.frame(80, 24);
         // The transcript is anchored to the bottom, so find its row.
@@ -2179,11 +2179,9 @@ mod tests {
             assert!(rest.iter().all(|cell| cell.style.color == STATUS_COLOR));
         }
         assert_eq!(STATUS_COLOR, Color::AnsiValue(222));
-        assert!(
-            app.frame(80, 24).lines[22].0[..2]
-                .iter()
-                .all(|cell| cell.style.color == STATUS_COLOR)
-        );
+        assert!(app.frame(80, 24).lines[22].0[..2]
+            .iter()
+            .all(|cell| cell.style.color == STATUS_COLOR));
 
         app.begin_operation();
         assert!(!app.input_enabled);
@@ -2213,11 +2211,9 @@ mod tests {
             );
             assert!(rest.iter().all(|cell| cell.style.color == STATUS_COLOR));
         }
-        assert!(
-            app.frame(80, 24).lines[22].0[..2]
-                .iter()
-                .all(|cell| cell.style.color == Color::DarkGrey)
-        );
+        assert!(app.frame(80, 24).lines[22].0[..2]
+            .iter()
+            .all(|cell| cell.style.color == Color::DarkGrey));
     }
 
     #[test]
