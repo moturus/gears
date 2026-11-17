@@ -1,6 +1,7 @@
 mod history;
 pub mod jsonl;
 pub mod line;
+mod markdown;
 pub mod select;
 pub mod tui;
 pub mod tui_editor;

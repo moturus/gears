@@ -11,13 +11,14 @@ use crossterm::event::{
     KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
 
 use crate::platform::ProcessRole;
 use crate::runtime::{Event, Observer, Runtime, SessionSummary, Waiting};
 use crate::ui::history::Kind;
+use crate::ui::markdown;
 use crate::ui::tui_editor::{Edit, Editor};
 
 const POLL: Duration = Duration::from_millis(50);
@@ -25,7 +26,8 @@ const TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const ENABLE_TMUX_KEYS: &str = "\x1b[>4;2m";
 const DISABLE_TMUX_KEYS: &str = "\x1b[>4;0m";
 // rmux `status::AMBER`: keep shared terminal chrome visually consistent.
-const STATUS_COLOR: Color = Color::AnsiValue(222);
+// Inline code in the transcript reuses it, so the two ambers stay in step.
+pub(super) const STATUS_COLOR: Color = Color::AnsiValue(222);
 // The status title is the gear and its variation selector followed by one
 // space. U+FE0F is zero-width; StyledLine attaches it to the gear cell so the
 // cell model still matches the columns the terminal prints. Idle and the
@@ -204,14 +206,16 @@ struct Layout {
 struct StyledChar {
     character: char,
     mark: Option<char>,
-    color: Color,
+    style: markdown::Style,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StyledLine(Vec<StyledChar>);
 
 impl StyledLine {
-    fn push(&mut self, color: Color, text: &str, width: usize) {
+    /// A bare `Color` is a plain style, so the chrome's callers stay unchanged.
+    fn push(&mut self, style: impl Into<markdown::Style>, text: &str, width: usize) {
+        let style = style.into();
         for character in text.chars() {
             if matches!(character, '\u{fe0e}' | '\u{fe0f}') {
                 if let Some(last) = self.0.last_mut() {
@@ -225,7 +229,7 @@ impl StyledLine {
             self.0.push(StyledChar {
                 character,
                 mark: None,
-                color,
+                style,
             });
         }
     }
@@ -537,8 +541,11 @@ impl App {
         let end = lines.len().saturating_sub(self.scroll.min(max_scroll));
         let start = end.saturating_sub(layout.transcript_rows);
         let transcript_start = layout.transcript_rows.saturating_sub(end - start);
-        for (index, (kind, line)) in lines[start..end].iter().enumerate() {
-            frame.lines[transcript_start + index].push(color(*kind), line, width);
+        for (index, line) in lines[start..end].iter().enumerate() {
+            let target = &mut frame.lines[transcript_start + index];
+            for (style, text) in &line.spans {
+                target.push(*style, text, width);
+            }
         }
         let editor_first = cursor_row
             .saturating_add(1)
@@ -594,7 +601,7 @@ impl App {
         frame
     }
 
-    fn transcript_lines(&self, width: usize) -> Vec<(Kind, String)> {
+    fn transcript_lines(&self, width: usize) -> Vec<TranscriptLine> {
         let mut result = Vec::new();
         for entry in &self.transcript {
             let prefix = match entry.kind {
@@ -610,18 +617,46 @@ impl App {
             // Continuation lines are indented by the prefix's own width, so a
             // multi-line entry keeps its columns straight.
             let indent = " ".repeat(prefix.len());
-            for (index, line) in wrap(&entry.text, available).into_iter().enumerate() {
-                result.push((
-                    entry.kind,
-                    format!(
-                        "{}{line}",
-                        if index == 0 { prefix } else { indent.as_str() }
-                    ),
-                ));
+            let base = color(entry.kind);
+            // Only the agent's prose is markdown; the other entries are
+            // already structured by their prefix.
+            let styled: Vec<markdown::Spans> = if entry.kind == Kind::Assistant {
+                markdown::lines(&entry.text, base)
+            } else {
+                entry
+                    .text
+                    .split('\n')
+                    .map(|line| vec![(base.into(), line.to_string())])
+                    .collect()
+            };
+            for (index, spans) in styled.into_iter().enumerate() {
+                let lead = if index == 0 { prefix } else { indent.as_str() };
+                for (wrapped, spans) in markdown::wrap(spans, available).into_iter().enumerate() {
+                    let mut line = TranscriptLine {
+                        kind: entry.kind,
+                        spans: Vec::new(),
+                    };
+                    markdown::push(
+                        &mut line.spans,
+                        base,
+                        if wrapped == 0 { lead } else { indent.as_str() },
+                    );
+                    for (style, text) in spans {
+                        markdown::push(&mut line.spans, style, &text);
+                    }
+                    result.push(line);
+                }
             }
         }
         result
     }
+}
+
+/// One transcript row: the entry it came from and the styled spans it draws.
+#[derive(Debug, PartialEq, Eq)]
+struct TranscriptLine {
+    kind: Kind,
+    spans: Vec<(markdown::Style, String)>,
 }
 
 fn paint_frame<W: Write>(output: &mut W, previous: Option<&Frame>, next: &Frame) -> io::Result<()> {
@@ -711,17 +746,32 @@ fn paint_line<W: Write>(
     });
     queue!(output, cursor::MoveTo(common as u16, row))?;
     let mut index = common;
+    // The previous row ended with ResetColor, which clears attributes too, so
+    // the first run only pays for the attribute when it is bold. A run costs an
+    // extra escape only when its weight differs from the run before it.
+    let mut bold = false;
     while index < next.0.len() {
-        let color = next.0[index].color;
+        let style = next.0[index].style;
         let mut text = String::new();
-        while index < next.0.len() && next.0[index].color == color {
+        while index < next.0.len() && next.0[index].style == style {
             text.push(next.0[index].character);
             if let Some(mark) = next.0[index].mark {
                 text.push(mark);
             }
             index += 1;
         }
-        queue!(output, SetForegroundColor(color), Print(text))?;
+        if style.bold != bold {
+            bold = style.bold;
+            queue!(
+                output,
+                SetAttribute(if bold {
+                    Attribute::Bold
+                } else {
+                    Attribute::NormalIntensity
+                })
+            )?;
+        }
+        queue!(output, SetForegroundColor(style.color), Print(text))?;
     }
     if previous.is_some_and(|previous| previous.0.len() > next.0.len()) {
         queue!(output, Clear(ClearType::UntilNewLine))?;
@@ -1359,46 +1409,69 @@ fn single_line(text: &str) -> String {
     clean(text).replace('\n', "↵")
 }
 
-fn wrap(text: &str, width: usize) -> Vec<String> {
+/// Soft-wrap `text` to `width` columns, breaking at spaces so words stay
+/// whole; a word longer than a row is still broken. Each row is the half-open
+/// range of character indices it shows, so a cursor position can be mapped
+/// back to a row and column. A break space stays at the end of its row, which
+/// keeps the ranges contiguous and the space invisible.
+fn wrap_rows(text: &str, width: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
-    let mut result = Vec::new();
-    for original in text.split('\n') {
-        let mut line = String::new();
-        let mut columns = 0;
-        for character in original.chars() {
-            if columns == width {
-                result.push(std::mem::take(&mut line));
-                columns = 0;
+    let characters: Vec<char> = text.chars().collect();
+    let mut rows = Vec::new();
+    let mut start = 0;
+    loop {
+        let newline = characters[start..]
+            .iter()
+            .position(|character| *character == '\n')
+            .map(|index| start + index);
+        let end = newline.unwrap_or(characters.len());
+        let mut cursor = start;
+        loop {
+            if end - cursor <= width {
+                rows.push((cursor, end));
+                break;
             }
-            if character == '\t' {
-                line.push(' ');
-            } else {
-                line.push(character);
-            }
-            columns += 1;
+            let window = cursor + width;
+            let split = characters[cursor..window]
+                .iter()
+                .rposition(|character| matches!(character, ' ' | '\t'))
+                .filter(|index| *index > 0)
+                .map_or(window, |index| cursor + index + 1);
+            rows.push((cursor, split));
+            cursor = split;
         }
-        result.push(line);
+        match newline {
+            Some(index) => start = index + 1,
+            None => break,
+        }
     }
-    if result.is_empty() {
-        result.push(String::new());
-    }
-    result
+    rows
+}
+
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let characters: Vec<char> = text.chars().collect();
+    wrap_rows(text, width)
+        .into_iter()
+        .map(|(start, end)| {
+            characters[start..end]
+                .iter()
+                .map(|character| if *character == '\t' { ' ' } else { *character })
+                .collect()
+        })
+        .collect()
 }
 
 fn editor_cursor(text: &str, cursor: usize, width: usize) -> (usize, usize) {
-    let mut row = 0;
-    let mut column = 0;
-    for character in text[..cursor].chars() {
-        if character == '\n' || column == width {
-            row += 1;
-            column = 0;
-            if character == '\n' {
-                continue;
-            }
-        }
-        column += 1;
-    }
-    (row, column)
+    // The editor's cursor is a byte offset; rows count characters.
+    let cursor = text
+        .get(..cursor)
+        .map_or_else(|| text.chars().count(), |prefix| prefix.chars().count());
+    let rows = wrap_rows(text, width);
+    let row = rows
+        .iter()
+        .rposition(|(start, _)| *start <= cursor)
+        .unwrap_or(0);
+    (row, cursor - rows[row].0)
 }
 
 fn clipped(text: &str, width: usize) -> String {
@@ -1679,7 +1752,7 @@ mod tests {
         app.push(Kind::Notice, "one\ntwo\nthree".to_string(), false);
         app.push(Kind::User, "first\nsecond".to_string(), false);
         assert_eq!(
-            app.transcript_lines(80),
+            plain(&app.transcript_lines(80)),
             [
                 (Kind::Notice, "note> one".to_string()),
                 (Kind::Notice, "      two".to_string()),
@@ -1687,6 +1760,120 @@ mod tests {
                 (Kind::User, "you> first".to_string()),
                 (Kind::User, "     second".to_string()),
             ]
+        );
+    }
+
+    fn plain(lines: &[TranscriptLine]) -> Vec<(Kind, String)> {
+        lines
+            .iter()
+            .map(|line| {
+                (
+                    line.kind,
+                    line.spans.iter().map(|(_, text)| text.as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn styled(color: Color) -> markdown::Style {
+        markdown::Style::plain(color)
+    }
+
+    fn bold(color: Color) -> markdown::Style {
+        markdown::Style::bold(color)
+    }
+
+    #[test]
+    fn agent_markdown_is_colored() {
+        let mut app = app();
+        app.push(
+            Kind::Assistant,
+            "# Title\nrun `lorry build`\n```\ncode\n```".to_string(),
+            false,
+        );
+        let lines = app.transcript_lines(80);
+        let spans = |index: usize| lines[index].spans.clone();
+        assert_eq!(
+            spans(0),
+            [
+                (styled(Color::White), "agent> ".to_string()),
+                (styled(markdown::HEADING), "# Title".to_string()),
+            ]
+        );
+        assert_eq!(
+            spans(1),
+            [
+                (styled(Color::White), "       run ".to_string()),
+                (styled(markdown::INLINE_CODE), "lorry build".to_string()),
+            ]
+        );
+        assert_eq!(
+            spans(2),
+            [
+                (styled(Color::White), "       ".to_string()),
+                (styled(markdown::CODE_BLOCK), "```".to_string()),
+            ]
+        );
+        assert_eq!(
+            spans(3),
+            [
+                (styled(Color::White), "       ".to_string()),
+                (styled(markdown::CODE_BLOCK), "code".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_bold_reaches_the_frame_as_an_attribute() {
+        let mut app = app();
+        app.push(Kind::Assistant, "a **b** c".to_string(), false);
+        let lines = app.transcript_lines(80);
+        assert_eq!(
+            lines[0].spans,
+            [
+                (styled(Color::White), "agent> a ".to_string()),
+                (bold(Color::White), "b".to_string()),
+                (styled(Color::White), " c".to_string()),
+            ]
+        );
+        // The markers are gone from what the terminal is asked to print.
+        assert!(!visible(&app).contains("**"));
+
+        let frame = app.frame(80, 24);
+        // The transcript is anchored to the bottom, so find its row.
+        let row = frame
+            .lines
+            .iter()
+            .find(|line| line.0.iter().any(|cell| cell.character == 'b'))
+            .expect("the transcript row is on screen");
+        let cell = |character| {
+            row.0
+                .iter()
+                .find(|cell| cell.character == character)
+                .unwrap()
+        };
+        assert!(cell('b').style.bold);
+        assert!(!cell('a').style.bold);
+        assert!(!cell('c').style.bold);
+
+        let mut output = Vec::new();
+        paint_line(&mut output, 0, None, row).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1m"), "{output:?}");
+        // Bold ends before the trailing " c".
+        assert!(output.contains("\x1b[22m"), "{output:?}");
+    }
+
+    #[test]
+    fn other_entries_keep_their_plain_color() {
+        let mut app = app();
+        app.push(Kind::User, "# not a heading `x` **y**".to_string(), false);
+        assert_eq!(
+            app.transcript_lines(80)[0].spans,
+            [(
+                styled(Color::Green),
+                "you> # not a heading `x` **y**".to_string()
+            )]
         );
     }
 
@@ -1755,24 +1942,38 @@ mod tests {
 
     #[test]
     fn a_long_picker_title_wraps_above_the_choices() {
+        let text = |frame: Frame| {
+            frame
+                .lines
+                .iter()
+                .map(|line| {
+                    line.0
+                        .iter()
+                        .map(|styled| styled.character)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
         let frame = picker_frame(
             10,
-            5,
+            6,
             "Reset Gears: remove",
             &["No".into(), "Yes".into()],
             0,
         );
-        let text = frame
-            .lines
-            .iter()
-            .map(|line| {
-                line.0
-                    .iter()
-                    .map(|styled| styled.character)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(text, ["Reset Gear", "s: remove", "> No", "  Yes", ""]);
+        assert_eq!(
+            text(frame),
+            ["Reset ", "Gears: ", "remove", "> No", "  Yes", ""]
+        );
+        // A short screen keeps the selected choice in view.
+        let small = picker_frame(
+            10,
+            5,
+            "Reset Gears: remove",
+            &["No".into(), "Yes".into()],
+            1,
+        );
+        assert_eq!(text(small), ["Reset ", "Gears: ", "remove", "> Yes", ""]);
     }
 
     #[test]
@@ -1780,6 +1981,16 @@ mod tests {
         assert_eq!(wrap("abcdef", 3), ["abc", "def"]);
         assert_eq!(editor_cursor("abcdef", 6, 3), (1, 3));
         assert_eq!(editor_cursor("ab\ncd", 5, 3), (1, 2));
+    }
+
+    #[test]
+    fn wrapping_keeps_words_whole() {
+        assert_eq!(wrap("hello world", 8), ["hello ", "world"]);
+        assert_eq!(wrap("a bb ccc dddd", 6), ["a bb ", "ccc ", "dddd"]);
+        // A word longer than the row is still broken.
+        assert_eq!(wrap("abcdefgh ij", 4), ["abcd", "efgh", " ij"]);
+        assert_eq!(editor_cursor("hello world", 8, 8), (1, 2));
+        assert_eq!(editor_cursor("hello world", 6, 8), (1, 0));
     }
 
     #[test]
@@ -1961,17 +2172,17 @@ mod tests {
             assert!(
                 title
                     .iter()
-                    .all(|cell| cell.character == ' ' && cell.color == STATUS_COLOR),
+                    .all(|cell| cell.character == ' ' && cell.style.color == STATUS_COLOR),
                 "{role:?}"
             );
             assert!(!rest.is_empty());
-            assert!(rest.iter().all(|cell| cell.color == STATUS_COLOR));
+            assert!(rest.iter().all(|cell| cell.style.color == STATUS_COLOR));
         }
         assert_eq!(STATUS_COLOR, Color::AnsiValue(222));
         assert!(
             app.frame(80, 24).lines[22].0[..2]
                 .iter()
-                .all(|cell| cell.color == STATUS_COLOR)
+                .all(|cell| cell.style.color == STATUS_COLOR)
         );
 
         app.begin_operation();
@@ -1989,7 +2200,7 @@ mod tests {
             let frame = app.frame(80, 24);
             assert_eq!(frame.lines[23].0[1].character, '\u{26ed}', "{role:?}");
             assert_eq!(frame.lines[23].0[1].mark, Some('\u{fe0f}'), "{role:?}");
-            assert_eq!(frame.lines[23].0[1].color, expected, "{role:?}");
+            assert_eq!(frame.lines[23].0[1].style.color, expected, "{role:?}");
 
             app.busy_since = Instant::now() - BLINK_HALF;
             let off = app.frame(80, 24);
@@ -1997,15 +2208,15 @@ mod tests {
             assert!(
                 title
                     .iter()
-                    .all(|cell| cell.character == ' ' && cell.color == STATUS_COLOR),
+                    .all(|cell| cell.character == ' ' && cell.style.color == STATUS_COLOR),
                 "{role:?}"
             );
-            assert!(rest.iter().all(|cell| cell.color == STATUS_COLOR));
+            assert!(rest.iter().all(|cell| cell.style.color == STATUS_COLOR));
         }
         assert!(
             app.frame(80, 24).lines[22].0[..2]
                 .iter()
-                .all(|cell| cell.color == Color::DarkGrey)
+                .all(|cell| cell.style.color == Color::DarkGrey)
         );
     }
 
