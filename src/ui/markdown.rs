@@ -7,7 +7,7 @@
 
 use crossterm::style::Color;
 
-use crate::ui::tui::STATUS_COLOR;
+use crate::ui::tui::{STATUS_COLOR, columns};
 
 /// Headings are light amber (the color inline code used to have), inline code
 /// the status bar's amber (the same amber rush uses for the interactive
@@ -43,30 +43,38 @@ impl From<Color> for Style {
 /// A logical line as styled spans, before wrapping.
 pub(super) type Spans = Vec<(Style, String)>;
 
-/// Style `text` line by line. Fenced code blocks keep their state across
-/// lines, so the whole entry is styled at once.
+/// Style all of `text` line by line, for the tests that check styling. The
+/// transcript no longer uses this: it styles one source line at a time as the
+/// entry streams in, which is what `source_line` is for.
+#[cfg(test)]
 pub(super) fn lines(text: &str, base: Color) -> Vec<Spans> {
-    let base = Style::from(base);
-    let mut result = Vec::new();
     let mut fenced = false;
-    for line in text.split('\n') {
-        let trimmed = line.trim_start();
-        if fence(trimmed) {
-            fenced = !fenced;
-            result.push(vec![(Style::plain(CODE_BLOCK), line.to_string())]);
-        } else if fenced {
-            result.push(vec![(Style::plain(CODE_BLOCK), line.to_string())]);
-        } else if heading(trimmed) {
-            result.push(vec![(Style::plain(HEADING), line.to_string())]);
-        } else {
-            result.push(inline(line, base));
-        }
+    text.split('\n')
+        .map(|line| source_line(line, base, &mut fenced))
+        .collect()
+}
+
+/// Style one source line, advancing `fenced` and leaving it for the next line.
+/// The transcript wraps entries a line at a time as they stream in, so the
+/// fence state has to travel with the caller instead of the whole text.
+pub(super) fn source_line(text: &str, base: Color, fenced: &mut bool) -> Spans {
+    let base = Style::from(base);
+    let trimmed = text.trim_start();
+    if fence(trimmed) {
+        *fenced = !*fenced;
+        vec![(Style::plain(CODE_BLOCK), text.to_string())]
+    } else if *fenced {
+        vec![(Style::plain(CODE_BLOCK), text.to_string())]
+    } else if heading(trimmed) {
+        vec![(Style::plain(HEADING), text.to_string())]
+    } else {
+        inline(text, base)
     }
-    result
 }
 
 /// Wrap styled spans to `width` columns, keeping each span's style. Rows break
-/// at spaces so words stay whole, and a word longer than a row is still broken.
+/// at spaces so words stay whole, and a word longer than a row is still broken;
+/// a wide glyph that does not fit the rest of its row starts the next one.
 /// Tabs become spaces, as in the plain wrapper.
 pub(super) fn wrap(spans: Spans, width: usize) -> Vec<Spans> {
     let width = width.max(1);
@@ -79,11 +87,26 @@ pub(super) fn wrap(spans: Spans, width: usize) -> Vec<Spans> {
     let mut lines = Vec::new();
     let mut start = 0;
     loop {
-        if characters.len() - start <= width {
+        // The longest run of characters that fits the row.
+        let mut used = 0;
+        let mut window = start;
+        while window < characters.len() {
+            let columns = columns(characters[window].1);
+            if used + columns > width {
+                break;
+            }
+            used += columns;
+            window += 1;
+        }
+        if window == characters.len() {
             lines.push(row(&characters[start..]));
             break;
         }
-        let window = start + width;
+        if window == start {
+            // A glyph wider than the whole row still takes one, which the row
+            // then clips.
+            window += 1;
+        }
         let split = characters[start..window]
             .iter()
             .rposition(|(_, character)| *character == ' ')
@@ -91,15 +114,33 @@ pub(super) fn wrap(spans: Spans, width: usize) -> Vec<Spans> {
             .map_or(window, |index| start + index + 1);
         lines.push(row(&characters[start..split]));
         start = split;
+        if start == characters.len() {
+            // The last row was the last glyph; there is no tail to wrap.
+            break;
+        }
     }
     lines
 }
 
-/// One wrapped row, with adjacent characters of the same style merged.
+/// One wrapped row, with adjacent characters of the same style merged. The run
+/// is built in place: a `String` per character made wrapping a large entry
+/// cost one allocation per glyph.
 fn row(characters: &[(Style, char)]) -> Spans {
     let mut spans = Spans::new();
+    let mut run: Option<(Style, String)> = None;
     for (style, character) in characters {
-        push(&mut spans, *style, &character.to_string());
+        match &mut run {
+            Some((last, text)) if last == style => text.push(*character),
+            _ => {
+                if let Some((style, text)) = run.take() {
+                    spans.push((style, text));
+                }
+                run = Some((*style, character.to_string()));
+            }
+        }
+    }
+    if let Some((style, text)) = run {
+        spans.push((style, text));
     }
     spans
 }
@@ -335,6 +376,20 @@ mod tests {
     #[test]
     fn wrapping_an_empty_line_yields_one_empty_line() {
         assert_eq!(wrap(Vec::new(), 10), [Vec::new()]);
+    }
+
+    #[test]
+    fn wrapping_counts_a_wide_glyph_as_two_columns() {
+        // Two columns per glyph at width 5: two glyphs per row, never a split.
+        let wrapped = wrap(vec![(plain(BASE), "日本語のテキスト".to_string())], 5);
+        assert_eq!(text(&wrapped[0]), "日本");
+        assert_eq!(text(&wrapped[1]), "語の");
+        assert_eq!(text(&wrapped[3]), "スト");
+        assert_eq!(wrapped.len(), 4);
+
+        // A row too narrow for one wide glyph still advances.
+        let narrow = wrap(vec![(plain(BASE), "日本".to_string())], 1);
+        assert_eq!(narrow.len(), 2);
     }
 
     #[test]
