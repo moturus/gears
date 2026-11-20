@@ -237,17 +237,13 @@ fn ask_url(
     }
 }
 
-/// The key file is readable by its owner only.
 fn save_key(path: &Path, key: &str) -> Result<(), String> {
-    let error = |error: std::io::Error| format!("{}: {error}", path.display());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(error)?;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    let mut file = options.open(path).map_err(error)?;
-    std::io::Write::write_all(&mut file, format!("{key}\n").as_bytes()).map_err(error)?;
-    file.sync_data().map_err(error)
+    let (parent, name) = path
+        .parent()
+        .zip(path.file_name())
+        .ok_or_else(|| format!("{}: expected a key file", path.display()))?;
+    crate::state::StateRoot::new(parent.to_path_buf())?
+        .replace_config_file(Path::new(name), format!("{key}\n").as_bytes())
 }
 
 #[cfg(test)]
@@ -293,8 +289,6 @@ mod tests {
     /// `config/`, which changes by hand.
     const CONFIG: &str = "\
 version = 1
-system_prompt_linux = 'SYSTEM.md'
-system_prompt_motor_os = 'SYSTEM.md'
 default_provider = 'openrouter'
 
 [providers.openrouter]

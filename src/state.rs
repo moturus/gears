@@ -8,6 +8,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 const TEMP_PREFIX: &str = ".gears-tmp-";
 static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
 
+enum FileAccess {
+    Default,
+    Config,
+    Preserve,
+}
+
 #[derive(Debug, Clone)]
 pub struct StateRoot {
     root: PathBuf,
@@ -82,7 +88,11 @@ impl StateRoot {
 
     /// Replace one Gears-owned file without exposing a partially written value.
     pub fn replace_file(&self, relative: &Path, bytes: &[u8]) -> Result<(), String> {
-        self.replace(relative, bytes, false)
+        self.replace(relative, bytes, FileAccess::Default)
+    }
+
+    pub(crate) fn replace_config_file(&self, relative: &Path, bytes: &[u8]) -> Result<(), String> {
+        self.replace(relative, bytes, FileAccess::Config)
     }
 
     /// Replace a workspace file, preserving the
@@ -92,10 +102,10 @@ impl StateRoot {
         relative: &Path,
         bytes: &[u8],
     ) -> Result<(), String> {
-        self.replace(relative, bytes, true)
+        self.replace(relative, bytes, FileAccess::Preserve)
     }
 
-    fn replace(&self, relative: &Path, bytes: &[u8], preserve_access: bool) -> Result<(), String> {
+    fn replace(&self, relative: &Path, bytes: &[u8], access: FileAccess) -> Result<(), String> {
         let destination = self.file(relative)?;
         let parent = destination.parent().expect("state files have a parent");
         let temp = parent.join(format!(
@@ -103,16 +113,22 @@ impl StateRoot {
             std::process::id(),
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| format!("{}: {error}", temp.display()))?;
         let result = (|| {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            let mut file = options
-                .open(&temp)
-                .map_err(|error| format!("{}: {error}", temp.display()))?;
+            if matches!(access, FileAccess::Config)
+                && crate::platform::process_role() == crate::platform::ProcessRole::Interactive
+            {
+                protect_interactive_config(&file)
+                    .map_err(|error| format!("{}: {error:?}", temp.display()))?;
+            }
             file.write_all(bytes)
                 .and_then(|()| file.sync_data())
                 .map_err(|error| format!("{}: {error}", temp.display()))?;
-            if preserve_access {
+            if matches!(access, FileAccess::Preserve) {
                 preserve_permissions(&destination, &temp)?;
                 file.sync_all()
                     .map_err(|error| format!("{}: {error}", temp.display()))?;
@@ -120,6 +136,7 @@ impl StateRoot {
             std::fs::rename(&temp, &destination)
                 .map_err(|error| format!("{}: {error}", destination.display()))
         })();
+        drop(file);
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
         }
@@ -165,7 +182,7 @@ impl StateRoot {
         table.insert("version".into(), toml::Value::Integer(version.into()));
         let text =
             toml::to_string(&table).map_err(|error| format!("cannot serialize {name}: {error}"))?;
-        self.replace_file(Path::new(name), text.as_bytes())
+        self.replace_config_file(Path::new(name), text.as_bytes())
     }
 
     /// Remove only temporary files made by `replace_file` after a crash.
@@ -175,6 +192,22 @@ impl StateRoot {
         };
         cleanup_temporary_files(&root)
     }
+}
+
+/// Set the mode on the open temporary file while it is still empty.
+fn protect_interactive_config(file: &std::fs::File) -> moto_rt::Result<()> {
+    use moto_sdk::async_runtime::LocalRuntime;
+    use moto_sdk::io::fs::{AccessPermissions, FsClient, RolePermissions};
+    use std::os::fd::AsRawFd;
+
+    let entry = moto_rt::fs::get_file_attr(file.as_raw_fd())?.entry_id;
+    let mode = RolePermissions::new(
+        AccessPermissions::Rwx,
+        AccessPermissions::Rw,
+        AccessPermissions::None,
+    );
+    LocalRuntime::try_new()?
+        .block_on(async { FsClient::connect()?.set_all_permissions(entry, mode).await })
 }
 
 fn preserve_permissions(source: &Path, temporary: &Path) -> Result<(), String> {

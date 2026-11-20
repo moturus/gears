@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+pub(crate) const SYSTEM_PROMPT_FILE: &str = "SYSTEM.md";
 const DEFAULT_CONTEXT_TOKENS: u64 = 128_000;
 /// The smallest window Gears accepts, from the configuration or /context set.
 pub const MIN_CONTEXT_TOKENS: u64 = 4096;
@@ -72,11 +73,7 @@ pub struct Config {
     pub log_level: crate::trace::Level,
     pub max_tool_rounds: usize,
     pub context: ContextConfig,
-    /// The system prompt file this build reads, named by the configuration and
-    /// found beside it. It is never a path.
-    pub system_prompt_file: String,
-    /// That file's text, read when the configuration is loaded from a file. A
-    /// configuration that was only parsed has none.
+    /// Contents of SYSTEM.md beside the loaded configuration.
     pub system_prompt: String,
     /// The file this configuration was read from. It seeds a missing user
     /// gears.toml when interactive defaults are saved for the first time.
@@ -101,7 +98,6 @@ impl Default for Config {
                 output_reserve_tokens: DEFAULT_OUTPUT_RESERVE,
                 recent_tail_tokens: DEFAULT_RECENT_TAIL,
             },
-            system_prompt_file: String::new(),
             system_prompt: String::new(),
             source_path: None,
         }
@@ -114,10 +110,6 @@ struct RawConfig {
     version: u32,
     default_provider: Option<String>,
     default_model: Option<String>,
-    /// The system prompt file for each platform. Both are required: Gears sends
-    /// the one for the platform it was built for.
-    system_prompt_linux: String,
-    system_prompt_motor_os: String,
     #[serde(default)]
     net: RawNet,
     provider: Option<RawProvider>,
@@ -305,7 +297,7 @@ impl Config {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let source = self.source_path.as_deref().ok_or_else(|| {
                     format!(
-                        "{}: not found; copy config/gears.toml there first",
+                        "{}: not found; copy config/gears.toml and config/SYSTEM.md there first",
                         path.display()
                     )
                 })?;
@@ -326,7 +318,7 @@ impl Config {
             // prompt written first: the next start reads it there.
             self.seed_system_prompt(&state)?;
         }
-        state.replace_file(Path::new("gears.toml"), text.as_bytes())
+        state.replace_config_file(Path::new("gears.toml"), text.as_bytes())
     }
 
     /// Write this run's system prompt beside a gears.toml Gears just seeded,
@@ -335,11 +327,11 @@ impl Config {
         if self.system_prompt.is_empty() {
             return Ok(());
         }
-        let name = Path::new(&self.system_prompt_file);
+        let name = Path::new(SYSTEM_PROMPT_FILE);
         if state.existing_file(name)?.is_some() {
             return Ok(());
         }
-        state.replace_file(name, self.system_prompt.as_bytes())
+        state.replace_config_file(name, self.system_prompt.as_bytes())
     }
 
     fn read_config(path: &Path) -> Result<Option<Self>, String> {
@@ -353,8 +345,8 @@ impl Config {
                 if crate::platform::process_role() == crate::platform::ProcessRole::None {
                     config.check_no_stored_keys()?;
                 }
+                config.system_prompt = Self::read_system_prompt(path)?;
                 config.source_path = Some(path.to_path_buf());
-                config.read_system_prompt()?;
                 Ok(Some(config))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -362,17 +354,8 @@ impl Config {
         }
     }
 
-    /// Read this build's system prompt from beside the file this configuration
-    /// came from. Only a loaded configuration knows where that is.
-    fn read_system_prompt(&mut self) -> Result<(), String> {
-        let source = self
-            .source_path
-            .as_deref()
-            .ok_or("the system prompt needs the file this configuration came from")?;
-        let directory = source
-            .parent()
-            .ok_or_else(|| format!("{}: no directory", source.display()))?;
-        let path = directory.join(&self.system_prompt_file);
+    fn read_system_prompt(source: &Path) -> Result<String, String> {
+        let path = source.with_file_name(SYSTEM_PROMPT_FILE);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -387,8 +370,7 @@ impl Config {
         if text.trim().is_empty() {
             return Err(format!("{}: the system prompt is empty", path.display()));
         }
-        self.system_prompt = text;
-        Ok(())
+        Ok(text)
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -408,9 +390,6 @@ impl Config {
                 raw.version
             ));
         }
-        prompt_file_name("system_prompt_linux", &raw.system_prompt_linux)?;
-        prompt_file_name("system_prompt_motor_os", &raw.system_prompt_motor_os)?;
-        let system_prompt_file = platform_prompt_file(&raw).to_string();
         let egress_allowlist = validate_hosts(raw.net.egress_allowlist.unwrap_or_default())?;
         let plain_http_allowlist =
             validate_hosts(raw.net.plain_http_allowlist.unwrap_or_default())?;
@@ -495,7 +474,6 @@ impl Config {
             log_level,
             max_tool_rounds,
             context,
-            system_prompt_file,
             system_prompt: String::new(),
             source_path: None,
         })
@@ -621,45 +599,12 @@ fn valid_name(name: &str) -> bool {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// The system prompt file this build sends. The platform is chosen when Gears
-/// is built, not when it runs.
-#[cfg(target_os = "motor")]
-fn platform_prompt_file(raw: &RawConfig) -> &str {
-    &raw.system_prompt_motor_os
-}
-
-#[cfg(not(target_os = "motor"))]
-fn platform_prompt_file(raw: &RawConfig) -> &str {
-    &raw.system_prompt_linux
-}
-
-/// A system prompt lives beside the configuration that names it, so the
-/// configuration gives a file name and nothing else.
-fn prompt_file_name(label: &str, name: &str) -> Result<(), String> {
-    let mut components = Path::new(name).components();
-    let bare = matches!(components.next(), Some(std::path::Component::Normal(_)))
-        && components.next().is_none()
-        && !name.contains(['/', '\\']);
-    if !bare {
-        return Err(format!(
-            "{label} must be a file name beside gears.toml, not a path: {name:?}"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The prompt settings every gears.toml carries: a file name in the
-    /// configuration's own directory.
-    const PROMPTS: &str =
-        "system_prompt_linux = 'SYSTEM.md'\nsystem_prompt_motor_os = 'SYSTEM.md'\n";
-
-    /// Configuration text for the tests, with the mandatory prompt settings.
     fn configured(body: &str) -> String {
-        format!("version = 1\n{PROMPTS}{body}")
+        format!("version = 1\n{body}")
     }
 
     #[test]
@@ -822,6 +767,8 @@ plain_http_allowlist = ["192.168.4.1"]"#,
     fn unknown_keys_are_refused_in_every_section() {
         for body in [
             "unknown = 1",
+            "system_prompt_linux = 'other.md'",
+            "system_prompt_motor_os = 'other.md'",
             "[after_turn]\ncommand = ['/review']",
             "[provider]\nkey_file = '/secret/key'",
             "[providers.local]\nbase_url = 'https://local.test/v1'\nmodle = 'm'",
@@ -836,84 +783,23 @@ plain_http_allowlist = ["192.168.4.1"]"#,
     }
 
     #[test]
-    fn the_prompt_settings_are_mandatory_file_names() {
-        for (body, field) in [
-            (
-                "system_prompt_motor_os = 'SYSTEM.md'\n",
-                "system_prompt_linux",
-            ),
-            (
-                "system_prompt_linux = 'SYSTEM.md'\n",
-                "system_prompt_motor_os",
-            ),
-        ] {
-            let error = Config::parse(&format!("version = 1\n{body}")).unwrap_err();
-            assert!(error.contains(field), "{body}: {error}");
-        }
-        for name in [
-            "/etc/prompts.md",
-            "prompts/SYSTEM.md",
-            "./SYSTEM.md",
-            "..",
-            "",
-        ] {
-            let error = Config::parse(&format!(
-                "version = 1\nsystem_prompt_linux = '{name}'\nsystem_prompt_motor_os = 'SYSTEM.md'\n"
-            ))
-            .unwrap_err();
-            assert!(error.contains("beside gears.toml"), "{name}: {error}");
-            let error = Config::parse(&format!(
-                "version = 1\nsystem_prompt_linux = 'SYSTEM.md'\nsystem_prompt_motor_os = '{name}'\n"
-            ))
-            .unwrap_err();
-            assert!(error.contains("beside gears.toml"), "{name}: {error}");
-        }
-    }
-
-    #[test]
-    fn the_build_chooses_the_prompt_for_its_platform() {
-        let config = Config::parse(&format!(
-            "version = 1\nsystem_prompt_linux = 'LINUX.md'\nsystem_prompt_motor_os = 'MOTOR.md'\n"
-        ))
-        .unwrap();
-        let expected = if cfg!(target_os = "motor") {
-            "MOTOR.md"
-        } else {
-            "LINUX.md"
-        };
-        assert_eq!(config.system_prompt_file, expected);
-        // Nothing is read until the configuration is loaded from a file.
-        assert!(config.system_prompt.is_empty());
-    }
-
-    #[test]
     fn the_prompt_is_read_from_beside_the_loaded_configuration() {
         let root = std::env::temp_dir().join(format!("gears-prompt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::write(root.join("prompts/SYSTEM.md"), "Elsewhere.\n").unwrap();
         let path = root.join("gears.toml");
-        std::fs::write(
-            &path,
-            "version = 1\nsystem_prompt_linux = 'PROMPT.md'\nsystem_prompt_motor_os = 'PROMPT.md'\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "version = 1\n").unwrap();
+        let prompt = root.join("SYSTEM.md");
         let error = Config::read_config(&path).unwrap_err();
-        assert!(error.contains("PROMPT.md"), "{error}");
-        std::fs::write(root.join("PROMPT.md"), " \n").unwrap();
+        assert!(error.contains(prompt.to_str().unwrap()), "{error}");
+        std::fs::write(&prompt, " \n").unwrap();
         let error = Config::read_config(&path).unwrap_err();
         assert!(error.contains("is empty"), "{error}");
-        std::fs::write(root.join("PROMPT.md"), "Work carefully.\n").unwrap();
+        std::fs::write(&prompt, "Work carefully.\n").unwrap();
         let config = Config::read_config(&path).unwrap().unwrap();
-        assert_eq!(config.system_prompt_file, "PROMPT.md");
         assert_eq!(config.system_prompt, "Work carefully.\n");
         assert_eq!(config.source_path.as_deref(), Some(path.as_path()));
-        // A prompt elsewhere in the tree is not read.
-        std::fs::create_dir_all(root.join("prompts")).unwrap();
-        std::fs::write(root.join("prompts/PROMPT.md"), "Elsewhere.\n").unwrap();
-        assert_eq!(
-            Config::read_config(&path).unwrap().unwrap().system_prompt,
-            "Work carefully.\n"
-        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1039,14 +925,12 @@ reasoning_echo = false
         let text = configured("[provider]\nbase_url = 'https://one.test/v1'\n");
         let source = root.join("loaded.toml");
         std::fs::write(&source, &text).unwrap();
-        let mut config = Config::parse(&text).unwrap();
+        let config = Config::parse(&text).unwrap();
         let directory = root.join("fresh");
         let error = config.save_context_default(&directory, 64_000).unwrap_err();
         assert!(error.contains("not found"), "{error}");
-        config.source_path = Some(source);
-        // A seeded gears.toml needs the prompt it names beside it, so this run's
-        // prompt is written first.
-        config.system_prompt = "You are a test agent.\n".to_string();
+        std::fs::write(root.join("SYSTEM.md"), "You are a test agent.\n").unwrap();
+        let config = Config::load_user(Some(&source)).unwrap();
         config.save_context_default(&directory, 64_000).unwrap();
         assert_eq!(
             std::fs::read_to_string(directory.join("SYSTEM.md")).unwrap(),

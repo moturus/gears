@@ -42,11 +42,11 @@ Without a chosen model, an interactive start asks for the provider, model and
 key; /setup asks again at any time.
 As None, supply OPENROUTER_API_KEY for this run or paste the key when prompted.
 `gears reset` and /reset ask, then remove keys, saved settings and sessions
-from the Gears directory (keeping gears.toml and the system prompt it names)
+from the Gears directory (keeping gears.toml and SYSTEM.md)
 and .gears/ from the current directory.
 /model ID and /context set TOKENS save their changes as defaults in the user's
 gears.toml. Use /provider NAME --default to save the provider and model defaults.
-The system prompt is read from the file gears.toml names beside itself.
+Gears reads SYSTEM.md from the same directory as the loaded gears.toml.
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

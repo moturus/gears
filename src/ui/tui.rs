@@ -2435,11 +2435,7 @@ mod tests {
         let config = crate::config::Config::default();
         let directory = root.join("state");
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("gears.toml"),
-            "version = 1\nsystem_prompt_linux = \"SYSTEM.md\"\nsystem_prompt_motor_os = \"SYSTEM.md\"\n",
-        )
-        .unwrap();
+        std::fs::write(directory.join("gears.toml"), "version = 1\n").unwrap();
         let mut app = App::new(&runtime, true).unwrap();
         handle_command(&mut runtime, &mut app, "/context", &config).unwrap();
         let frame = visible(&mut app);

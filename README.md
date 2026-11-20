@@ -10,6 +10,7 @@ Start `gears`. The first time, it asks which provider to use (the shipped
 `gears.toml` offers OpenRouter, OpenAI and a local server), the local server's
 address, a model from the provider's list or any other id, and the API key.
 Interactive saves a key entered at the hidden prompt in the Gears directory.
+Configuration and key files Gears writes as Interactive have mode `rwxrw----`.
 Use `/setup` to choose again.
 
 Each provider names its key file (`api_key_file`, kept in the Gears directory);
@@ -64,8 +65,6 @@ and `/none/cfg/gears/gears.toml` for None. Set
 A minimal file is:
 
     version = 1
-    system_prompt_linux = "SYSTEM.md"
-    system_prompt_motor_os = "SYSTEM.md"
 
     [provider]
     base_url = "https://openrouter.ai/api/v1"
@@ -74,16 +73,13 @@ A minimal file is:
     [models]
     used = ["provider/model", "another/model"]
 
-[config/gears.toml](config/gears.toml) is the complete starting point: copy it,
-and the `config/SYSTEM.md` it names, into the Gears directory.
+To use the shipped configuration, populate the Gears directory with
+[gears.toml](config/gears.toml) and [SYSTEM.md](config/SYSTEM.md).
 
-The two system prompt settings are required. Each names a file beside the
-`gears.toml` that gives it; an absolute or relative path is refused. Gears reads
-the one for the platform it was built for, which is fixed when it is compiled,
-not when it runs. The file is read when the configuration is read, so an edit
-takes effect at the next start; a missing or empty prompt is an error. When
-Gears seeds a Gears directory with a `gears.toml`, it writes the prompt it is
-running with beside that file.
+Gears reads `SYSTEM.md` from the directory containing the loaded `gears.toml`,
+including when you use `--config`. A missing or empty prompt stops startup.
+Edits take effect on the next start. When Gears first saves defaults to a new
+Gears directory, it copies the current prompt there if `SYSTEM.md` is missing.
 
 Important optional fields are:
 
@@ -196,8 +192,7 @@ user prompt; clone copies the current active branch into a new file.
 `gears reset` (or `/reset` in a running Gears) asks once, then removes
 everything the user and Gears added: key files, saved settings and model
 choices, and sessions in the Gears directory, and `.gears/` in the current
-directory. It keeps what an installation provides: `gears.toml` and the system
-prompt file that configuration names. `/reset` continues in a new session; the
+directory. It keeps `gears.toml` and `SYSTEM.md`. `/reset` starts a new session. The
 provider, model and key already loaded stay in use until Gears restarts. `gears
 reset` refuses to run inside another Gears.
 
@@ -238,12 +233,10 @@ your model, using a context size the model supports:
 
 Tool use requires a model and chat template supporting tool calls. An
 unauthenticated local server needs no key file. Save this as `gears.toml` in
-the role's Gears directory, with the `SYSTEM.md` it names beside it:
+the role's Gears directory alongside `SYSTEM.md`.
 
 ```toml
 version = 1
-system_prompt_linux = "SYSTEM.md"
-system_prompt_motor_os = "SYSTEM.md"
 
 [provider]
 base_url = "http://192.168.4.1:8080/v1"

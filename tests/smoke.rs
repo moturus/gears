@@ -49,7 +49,9 @@ fn gears(root: &Path, workspace: &Path, config: &Path) -> Command {
 
 #[test]
 fn a_first_run_keeps_settings_and_role_appropriate_keys_in_the_gears_directory() {
-    let root = fixture("first-run");
+    // Both roles can traverse /none/tmp, so a denied read tests the file mode.
+    let root = Path::new("/none/tmp").join(format!("gears-first-run-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let directory = root.join("gears-directory");
@@ -113,9 +115,9 @@ models = ["vendor/first", "vendor/second"]
     assert_eq!(std::fs::read_dir(&shipped).unwrap().count(), before);
     // Both roles keep the model. Only None needs the key again.
     let output = run(if none {
-        b"sk-second-run\n/quit\n"
+        b"sk-second-run\n/context set 64000\n/context set 65000\n/quit\n"
     } else {
-        b"/quit\n"
+        b"/context set 64000\n/context set 65000\n/quit\n"
     });
     assert!(output.status.success(), "{output:?}");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Choose a provider"));
@@ -123,10 +125,18 @@ models = ["vendor/first", "vendor/second"]
         String::from_utf8_lossy(&output.stderr).contains("API key"),
         none
     );
-    // None uses its own settings when the source tree also has a configuration.
-    for file in ["gears.toml", support::SYSTEM_PROMPT_FILE] {
-        std::fs::copy(shipped.join(file), directory.join(file)).unwrap();
+    // /context seeds gears.toml and SYSTEM.md, then replaces gears.toml.
+    let settings = std::fs::read_to_string(directory.join("gears.toml")).unwrap();
+    let saved = gears::config::Config::parse_in(&settings, &directory).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(directory.join("SYSTEM.md")).unwrap(),
+        support::SYSTEM_PROMPT
+    );
+    assert_eq!(saved.context.window_tokens, 65000);
+    if process_role() == ProcessRole::Interactive {
+        assert_private_config(&directory);
     }
+    // None uses its own settings when the source tree also has a configuration.
     let output = run(if none {
         b"sk-third-run\n/quit\n"
     } else {
@@ -138,6 +148,35 @@ models = ["vendor/first", "vendor/second"]
         !none
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn assert_private_config(directory: &Path) {
+    let read_as_none = |path: &Path| {
+        Command::new("/user/bin/wc")
+            .env(moto_sys::caps::MOTOR_OS_CAPS_ENV_KEY, "0x304")
+            .arg("-c")
+            .arg(path)
+            .output()
+            .unwrap()
+    };
+    let control = directory.join("readable-control");
+    std::fs::write(&control, "public").unwrap();
+    assert!(read_as_none(&control).status.success());
+    for name in ["shipped.key", "provider.toml", "gears.toml", "SYSTEM.md"] {
+        let path = directory.join(name);
+        let listing = Command::new("/user/bin/ls")
+            .arg("-l")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(listing.status.success(), "{listing:?}");
+        let text = String::from_utf8(listing.stdout).unwrap();
+        assert_eq!(text.split_whitespace().next(), Some("-rwxrw----"), "{text}");
+        assert!(
+            !read_as_none(&path).status.success(),
+            "None could read {name}"
+        );
+    }
 }
 
 #[test]

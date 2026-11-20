@@ -22,9 +22,10 @@ toml = "0.8.10"
 toml_edit = "0.22.27"
 yaml_serde = "=0.10.7"
 
-# Native process control and terminal-input readiness on Motor OS.
+# Native process control, terminal input and filesystem role permissions.
 ctrlc = { git = "https://github.com/moturus/rust-ctrlc.git", branch = "motor-os-rustc" }
 moto-rt = "0.17.6"
+moto-sdk = "0.2.0"
 moto-sys = "0.3.0"
 
 # The local TLS provider mock (examples/mock-provider.rs) is test-only.
