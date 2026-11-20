@@ -714,15 +714,12 @@ mod tests {
 
     #[test]
     fn a_provider_ca_is_passed_without_changing_the_url() {
+        let ca = "/none/dev/gears/tests/tls/TEST_ONLY_CA.pem";
         let argv = build_argv(
             &request("https://127.0.0.1:9443/v1/chat/completions"),
-            Some("/devtools/tests/gears/TEST_ONLY_CA.pem"),
+            Some(ca),
         );
-        assert!(
-            argv.windows(2)
-                .any(|w| w == ["--cacert", "/devtools/tests/gears/TEST_ONLY_CA.pem"]),
-            "{argv:?}"
-        );
+        assert!(argv.windows(2).any(|w| w == ["--cacert", ca]), "{argv:?}");
         assert_eq!(
             argv.last().unwrap(),
             "https://127.0.0.1:9443/v1/chat/completions"

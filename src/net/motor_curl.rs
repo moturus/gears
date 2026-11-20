@@ -6,7 +6,7 @@ use std::path::Path;
 
 /// Where the image installs curl. An absolute path on purpose: Motor OS
 /// spawns take the name as given, with no PATH search to lean on.
-pub const MOTOR_CURL: &str = "/system/bin/curl";
+pub const MOTOR_CURL: &str = "/user/bin/curl";
 
 pub struct MotorCurl {
     transport: CurlTransport,

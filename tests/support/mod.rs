@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-pub const SHELL: &str = "/system/bin/rush";
+pub const SHELL: &str = "/user/bin/rush";
 
 /// The system prompt file every test configuration names, and its text.
 pub const SYSTEM_PROMPT_FILE: &str = "SYSTEM.md";

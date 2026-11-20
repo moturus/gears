@@ -28,7 +28,7 @@ but `lorry` is close enough.
 
  ## Motor OS documentation
 
-/devtools/www/ should contain some high-level documents on Motor OS;
+/user/lib/www/ should contain some high-level documents on Motor OS;
 if not there, ask the user where to find them.
 
 Use `curl` to inspect crates.io and github.com.

@@ -14,13 +14,13 @@ use crate::tools::{Context, MODEL_STREAM_BYTES};
 
 pub const DESCRIPTION: &str = "Run a rush command; directory and exports persist within this \
      session. Use rg instead of grep; sysbox has head, tail, diff, find, wc, cat, less (no \
-     tail -f), and mkdir -p. Use gix instead of git; sed is on the developer image. For missing \
+     tail -f), and mkdir -p. Use gix instead of git; sed comes with the toolchain. For missing \
      commands use sed or rg -o/-r for awk, : > FILE for touch, shell parameter expansion for \
      basename or dirname, redirection for tee, the tool timeout for timeout, and a fixed path \
      under /user/tmp for mktemp. Commands are not sandboxed.";
 
-const SHELL: &str = "/system/bin/rush";
-const FIXED_PATH: &str = "/system/bin:/devtools/bin";
+const SHELL: &str = "/user/bin/rush";
+const FIXED_PATH: &str = "/user/bin:/user/bin/dev";
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TIMEOUT_SECONDS: u64 = 120;

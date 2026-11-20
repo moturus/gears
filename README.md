@@ -9,8 +9,8 @@ UIs, and five built-in tools. It does not prescribe a coding workflow.
 Start `gears`. The first time, it asks which provider to use (the shipped
 `gears.toml` offers OpenRouter, OpenAI and a local server), the local server's
 address, a model from the provider's list or any other id, and the API key,
-which is typed hidden and saved in the Gears directory. Later starts ask nothing; `/setup` asks again. A `-p` run never
-asks. Nothing needs editing in `gears.toml`.
+which is typed hidden and saved in the Gears directory. Later starts ask nothing;
+`/setup` asks again. A `-p` run never asks. Nothing needs editing in `gears.toml`.
 
 Each provider names its key file (`api_key_file`, kept in the Gears directory);
 `OPENROUTER_API_KEY` overrides it for one run, and a provider without a key
@@ -32,7 +32,7 @@ configured one, and its host is allowed for egress.
 
 Gears always provides five tools: `sh`, `read_file`, `write_file`, `patch_file`
 and `search_session`. `sh` receives one string command and runs it in the
-selected workspace through `/system/bin/rush -c` on Motor OS. It
+selected workspace through `/user/bin/rush -c` on Motor OS. It
 is not a sandbox: a command has the same filesystem authority as Gears and may
 leave the workspace. Stdout, stderr, status, timeout, cancellation, and
 truncation remain distinct. The working directory and exports it saves live
@@ -268,9 +268,9 @@ to a local server. If the server uses authentication, give the provider an
 
 Check the host connection and start Gears from the desired guest workspace:
 
-    /system/bin/curl --proto =http http://192.168.4.1:8080/health
-    /devtools/bin/gears ask "Reply with a short hello."
-    /devtools/bin/gears
+    /user/bin/curl --proto =http http://192.168.4.1:8080/health
+    gears ask "Reply with a short hello."
+    gears
 
 Use `--ui line` for the line interface or `-vv` for transport diagnostics.
 Gears appends `/chat/completions` to the configured API root. Match the Gears
@@ -278,11 +278,11 @@ context settings to the server's context capacity.
 
 ## Build and test
 
-Gears supports Motor OS only. Copy this repository into a writable directory such as
-`/devtools/src/gears` on a developer image. Provision dependencies, then build
-and test entirely inside Motor OS:
+Gears supports Motor OS only. On a VM with the native toolchain installed,
+copy this repository into a writable directory such as `/none/dev/gears`.
+Provision dependencies, then build and test entirely inside Motor OS:
 
-    cd /devtools/src/gears
+    cd /none/dev/gears
     lorry vendor --accept-all
     rush tests/full-test.sh --release
 

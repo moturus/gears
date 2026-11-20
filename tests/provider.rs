@@ -165,7 +165,6 @@ fn client_errors_are_not_retried() {
 /// Exercise the transport with the local platform's curl binary.
 #[test]
 fn provider_streams_through_the_motor_curl_transport() {
-    let program = "/system/bin/curl";
     let server = MockServer::start_one(sse_response(&[
         r#"{"choices":[{"index":0,"delta":{"content":"hello "}}]}"#,
         r#"{"choices":[{"index":0,"delta":{"content":"motor"},"finish_reason":"stop"}]}"#,
@@ -173,7 +172,8 @@ fn provider_streams_through_the_motor_curl_transport() {
     .unwrap();
     let policy =
         EgressPolicy::new(&["127.0.0.1".into()]).with_plain_http_allowlist(&["127.0.0.1".into()]);
-    let http = MotorCurl::with_program(program, policy)
+    let http = MotorCurl::new(policy)
+        .unwrap()
         .with_secret("OPENROUTER_API_KEY", "fixture-motor-key");
     let provider = OpenAiCompat::new(http, Endpoint::new(&server.url("/v1")).unwrap());
     let mut rendered = Rendered::default();

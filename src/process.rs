@@ -318,7 +318,7 @@ pub fn run(
 }
 
 fn shell_program() -> &'static str {
-    "/system/bin/rush"
+    "/user/bin/rush"
 }
 
 fn drain<R: Read + Send + 'static>(

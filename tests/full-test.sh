@@ -1,4 +1,4 @@
-#!/system/bin/rush
+#!/user/bin/rush
 # Native acceptance gate: all tests and mock providers run on this OS.
 set -eu
 . "${0%/*}/native.sh"

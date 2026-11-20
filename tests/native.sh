@@ -8,8 +8,8 @@ case "${1:-}" in
   --release) PROFILE=release; PROFILE_ARG=--release ;;
   *) echo "usage: $0 [--release]" >&2; exit 2 ;;
 esac
-SEARCH_PROGRAM=/system/bin/rg
-SHELL_PROGRAM=/system/bin/rush
+SEARCH_PROGRAM=/user/bin/rg
+SHELL_PROGRAM=/user/bin/rush
 BIN_DIR="$ROOT_DIR/target/lorry/$PROFILE"
 build() {
   lorry "$@" ${PROFILE_ARG:+"$PROFILE_ARG"}

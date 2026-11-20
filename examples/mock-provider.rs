@@ -450,7 +450,7 @@ mod tests {
         let server =
             std::thread::spawn(move || serve(listener, scripts, Some(config), &args).unwrap());
 
-        let output = Command::new("/system/bin/curl")
+        let output = Command::new(gears::net::motor_curl::MOTOR_CURL)
             .args(["--silent", "--show-error", "--http1.1", "--noproxy", "*"])
             .arg("--cacert")
             .arg(fixture("TEST_ONLY_CA.pem"))

@@ -29,8 +29,8 @@ fn debug_name_may_be_gears(name: &str, limit: usize) -> bool {
 fn native_command_names_preserve_gears_and_unknown_live_owners() {
     for name in [
         "gears",
-        "/devtools/bin/gears",
-        "/devtools/bin/gears --ui line",
+        "/user/bin/gears",
+        "/user/bin/gears --ui line",
         "/user/my tools/gears -p hi",
         "/user/long-executable-path/gea…",
         "",
@@ -39,9 +39,9 @@ fn native_command_names_preserve_gears_and_unknown_live_owners() {
         assert!(debug_name_may_be_gears(name, 32), "{name}");
     }
     for name in [
-        "/system/bin/sysbox sleep 30",
-        "/system/bin/rush -c hi",
-        "/devtools/bin/gears-other",
+        "/user/bin/sysbox sleep 30",
+        "/user/bin/rush -c hi",
+        "/user/bin/gears-other",
         "not-gears",
     ] {
         assert!(!debug_name_may_be_gears(name, 32), "{name}");

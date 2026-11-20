@@ -1,4 +1,4 @@
-//! Hermetic built-in tool checks, also installed as a developer-image test.
+//! Hermetic built-in tool checks for the native test suite.
 
 use std::path::Path;
 
