@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use gears::mock::{MockServer, sse_response};
+use gears::platform::{ProcessRole, process_role};
 
 fn fixture(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("gears-smoke-{name}-{}", std::process::id()));
@@ -47,7 +48,7 @@ fn gears(root: &Path, workspace: &Path, config: &Path) -> Command {
 }
 
 #[test]
-fn a_first_run_asks_provider_model_and_key_and_saves_them_in_the_gears_directory() {
+fn a_first_run_keeps_settings_and_role_appropriate_keys_in_the_gears_directory() {
     let root = fixture("first-run");
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -77,6 +78,7 @@ models = ["vendor/first", "vendor/second"]
             .env(gears::directory::ENV, &directory)
             .env_remove("GEARS_LOCK_OWNER")
             .env_remove("OPENROUTER_API_KEY")
+            .env(moto_rt::process::STDIO_IS_TERMINAL_ENV_KEY, "true")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -88,29 +90,53 @@ models = ["vendor/first", "vendor/second"]
     let shipped = source.join("config");
     let before = std::fs::read_dir(&shipped).unwrap().count();
     // The shipped settings apply: the provider, its second model, then the key.
-    let output = run(b"1\n2\nsk-first-run\n/quit\n");
+    // A single terminal write spans setup and the session. Both use one
+    // Ctrl-C handler, and /status must survive in the reader's input queue.
+    let output = run(b"1\n2\nsk-first-run\n/status\n/quit\n");
     assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Choose a provider"), "{stderr}");
+    assert!(stderr.contains("model: vendor/second"), "{stderr}");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("sk-first-run"));
-    assert_eq!(
-        std::fs::read_to_string(directory.join("shipped.key")).unwrap(),
-        "sk-first-run\n"
-    );
+    let none = process_role() == ProcessRole::None;
+    let key_file = directory.join("shipped.key");
+    if none {
+        assert!(!key_file.exists());
+    } else {
+        assert_eq!(
+            std::fs::read_to_string(&key_file).unwrap(),
+            "sk-first-run\n"
+        );
+    }
     let saved = std::fs::read_to_string(directory.join("provider.toml")).unwrap();
     assert!(saved.contains("vendor/second"), "{saved}");
     assert_eq!(std::fs::read_dir(&shipped).unwrap().count(), before);
-    // The next start asks nothing.
-    let output = run(b"/quit\n");
+    // Both roles keep the model. Only None needs the key again.
+    let output = run(if none {
+        b"sk-second-run\n/quit\n"
+    } else {
+        b"/quit\n"
+    });
     assert!(output.status.success(), "{output:?}");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Choose a provider"));
-    // With settings of its own too, Gears asks which to use.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).contains("API key"),
+        none
+    );
+    // None uses its own settings when the source tree also has a configuration.
     for file in ["gears.toml", support::SYSTEM_PROMPT_FILE] {
         std::fs::copy(shipped.join(file), directory.join(file)).unwrap();
     }
-    let output = run(b"\n");
+    let output = run(if none {
+        b"sk-third-run\n/quit\n"
+    } else {
+        b"\n"
+    });
     assert!(output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("running from its source tree"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).contains("running from its source tree"),
+        !none
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -929,6 +955,20 @@ fn keys_come_only_from_the_providers_key_file_or_the_environment() {
             command.env("OPENROUTER_API_KEY", key);
         }
         let output = command.output().unwrap();
+        if process_role() == ProcessRole::None
+            && let Some(path) = key_file
+        {
+            assert!(!output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                format!(
+                    "API key available to None user at {}: please remove it.\n",
+                    path.display()
+                )
+            );
+            assert!(server.requests().is_empty());
+            continue;
+        }
         assert!(
             output.status.success(),
             "{}",

@@ -49,7 +49,6 @@ fn check(gears: &Path, root: &Path) -> Result<(), String> {
         };
         let server = MockServer::start(scripts).map_err(|error| error.to_string())?;
         let key = workspace.join("key");
-        std::fs::write(&key, "fixture-owned-key").map_err(|error| error.to_string())?;
         let config = workspace.join("gears.toml");
         super::config::write(
             &config,
@@ -80,13 +79,14 @@ fn check(gears: &Path, root: &Path) -> Result<(), String> {
                 timeout: Duration::from_secs(10),
                 max_output_bytes: 65536,
                 env: vec![
+                    (gears::provider::KEY_ENV.into(), "fixture-owned-key".into()),
                     ("HOME".into(), workspace.display().to_string()),
                     (
                         gears::directory::ENV.into(),
                         workspace.join(".gears").display().to_string(),
                     ),
                 ],
-                remove_env: vec![gears::provider::KEY_ENV.into()],
+                remove_env: Vec::new(),
             },
             &cancellation,
             &mut |stream, text| {

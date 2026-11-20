@@ -14,9 +14,13 @@ pub fn run(
     initial: Option<String>,
     interactive: bool,
     config: &crate::config::Config,
+    prompts: Option<SetupPrompts>,
 ) -> Result<(), String> {
     runtime.set_interactive(interactive)?;
-    let mut input = Input::new()?;
+    let mut input = match prompts {
+        Some(prompts) => prompts.0,
+        None => Input::new()?,
+    };
     let mut renderer = Renderer::default();
     if interactive {
         show_history(runtime)?;
@@ -128,9 +132,7 @@ fn command(
             Ok(Command::Continue)
         }
         "setup" => {
-            let current = super::current_config(config)?;
-            let directory = crate::directory::default_root()?;
-            match crate::setup::run(&current, &directory, &mut InputAsk(input))? {
+            match runtime.setup(&mut InputAsk(input))? {
                 Some(chosen) => runtime.apply_setup(&chosen.provider, chosen.model, renderer)?,
                 None => eprintln!("Setup cancelled."),
             }
@@ -248,6 +250,7 @@ fn command(
             } else {
                 argument.to_string()
             };
+            runtime.ask_provider_key(&provider, &mut InputAsk(input))?;
             runtime.set_provider(&provider, renderer)?;
             if save_default {
                 runtime.save_default_selection()?;
@@ -548,8 +551,8 @@ impl Input {
 
     /// Like `read_line`, but what is typed is not shown.
     fn read_hidden(&mut self, prompt: &str) -> Result<Option<String>, String> {
-        print!("{prompt}");
-        io::stdout().flush().map_err(|error| error.to_string())?;
+        eprint!("{prompt}");
+        io::stderr().flush().map_err(|error| error.to_string())?;
         let line = match &mut self.raw {
             Some(raw) => read_raw_line(
                 &mut self.queued,
@@ -567,7 +570,7 @@ impl Input {
                 }
             }
         };
-        println!();
+        eprintln!();
         line
     }
 

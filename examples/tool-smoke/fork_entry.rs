@@ -31,7 +31,6 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let config = root.join("gears.toml");
     let key = root.join("key");
-    std::fs::write(&key, "fixture").map_err(|error| error.to_string())?;
     super::config::write(
         &config,
         &format!(
@@ -60,13 +59,14 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
         timeout: Duration::from_secs(10),
         max_output_bytes: 65536,
         env: vec![
+            (gears::provider::KEY_ENV.into(), "fixture".into()),
             ("HOME".into(), root.display().to_string()),
             (
                 gears::directory::ENV.into(),
                 directory.display().to_string(),
             ),
         ],
-        remove_env: vec![gears::provider::KEY_ENV.into()],
+        remove_env: Vec::new(),
     };
     let output =
         run(&request, &Cancellation::new(), &mut |_, _| {}).map_err(|error| error.to_string())?;

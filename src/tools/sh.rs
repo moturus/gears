@@ -17,7 +17,7 @@ pub const DESCRIPTION: &str = "Run a rush command; directory and exports persist
      tail -f), and mkdir -p. Use gix instead of git; sed comes with the toolchain. For missing \
      commands use sed or rg -o/-r for awk, : > FILE for touch, shell parameter expansion for \
      basename or dirname, redirection for tee, the tool timeout for timeout, and a fixed path \
-     under /user/tmp for mktemp. Commands are not sandboxed.";
+     under $TMPDIR for mktemp. Commands are not sandboxed.";
 
 const SHELL: &str = "/user/bin/rush";
 const FIXED_PATH: &str = "/user/bin:/user/bin/dev";

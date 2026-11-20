@@ -7,6 +7,7 @@ use gears::cli::{Action, Args, Output, SessionStart};
 use gears::config::{Config, Found, NamedProvider};
 use gears::net::EgressPolicy;
 use gears::net::motor_curl::MotorCurl as HttpBackend;
+use gears::platform::{ProcessRole, process_role};
 use gears::provider::{
     ApiKey, Endpoint, EventSink, KEY_ENV, Message, OpenAiCompat, Provider, Request, StreamEvent,
 };
@@ -14,13 +15,14 @@ use gears::provider_choice::ProviderChoice;
 use gears::run_lock::DirectoryLock;
 use gears::runtime::{ProviderFactory, Runtime};
 use gears::session::{Session, Store};
+use gears::setup::ProviderKeys;
+use gears::ui::line::SetupPrompts;
+use gears::ui::select::Selected;
 
 fn main() -> ExitCode {
     let key_from_env = std::env::var(KEY_ENV).ok();
-    if key_from_env.is_some() {
-        // SAFETY: process startup is still single-threaded.
-        unsafe { std::env::remove_var(KEY_ENV) };
-    }
+    // SAFETY: process startup is still single-threaded.
+    unsafe { std::env::remove_var(KEY_ENV) };
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let args = match Args::parse(&arguments) {
         Ok(args) => args,
@@ -87,30 +89,11 @@ fn reset(args: &Args) -> ExitCode {
 }
 
 fn run(args: Args, key_from_env: Option<String>) -> ExitCode {
-    // Only an interactive agent run asks setup questions.
-    let setup_ui =
-        match (args.action == Action::Run && args.prompt.is_none() && args.output == Output::Text)
-            .then(|| {
-                gears::ui::select::choose(args.ui, false, || {
-                    (
-                        std::io::stdin().is_terminal(),
-                        std::io::stdout().is_terminal(),
-                    )
-                })
-            })
-            .transpose()
-        {
-            Ok(ui) => ui,
-            Err(error) => {
-                diagnostic(&error);
-                return ExitCode::FAILURE;
-            }
-        };
-    let mut config = match load_config(&args, setup_ui) {
-        Ok(Some(config)) => config,
+    let (mut config, mut ui) = match StartupUi::load(&args) {
+        Ok(Some(startup)) => startup,
         Ok(None) => return ExitCode::SUCCESS,
         Err(error) => {
-            diagnostic(&format!("config: {error}"));
+            eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
@@ -167,9 +150,10 @@ fn run(args: Args, key_from_env: Option<String>) -> ExitCode {
             "could not install the interrupt handler",
         );
     }
+    let keys = ProviderKeys::new(key_from_env);
     let result = match args.action {
-        Action::Ask => ask(&args, &config, choice.as_ref(), key_from_env),
-        Action::Run => agent(&args, &config, choice.as_ref(), key_from_env, setup_ui),
+        Action::Ask => ask(&args, &config, choice.as_ref(), keys, &mut ui),
+        Action::Run => agent(&args, &config, choice.as_ref(), keys, ui),
         Action::Version | Action::Help | Action::Reset => unreachable!(),
     };
     match result {
@@ -184,17 +168,14 @@ fn run(args: Args, key_from_env: Option<String>) -> ExitCode {
 
 /// `--config`, else what `Found::detect` finds. With both the user's and the
 /// source tree's, an interactive run asks; `None` if the user cancelled.
-fn load_config(
-    args: &Args,
-    setup_ui: Option<gears::ui::select::Selected>,
-) -> Result<Option<Config>, String> {
+fn load_config(args: &Args, ui: &mut StartupUi) -> Result<Option<Config>, String> {
     if args.config.is_some() {
         return Config::load_user(args.config.as_deref()).map(Some);
     }
     let found = Found::detect();
-    let source_tree = match (&found, setup_ui) {
-        (Found::Both { user, package }, Some(ui)) => {
-            match gears::setup::ask_settings(asker(ui)?.as_mut(), user, package)? {
+    let source_tree = match &found {
+        Found::Both { user, package } if ui.interactive => {
+            match ui.ask(|ask| gears::setup::ask_settings(ask, user, package))? {
                 Some(source_tree) => source_tree,
                 None => return Ok(None),
             }
@@ -204,45 +185,79 @@ fn load_config(
     Config::load_found(&found, source_tree).map(Some)
 }
 
-/// Setup questions in the UI the session will use; closed before it starts.
-fn asker(ui: gears::ui::select::Selected) -> Result<Box<dyn gears::setup::Ask>, String> {
-    Ok(match ui {
-        gears::ui::select::Selected::Tui => Box::new(gears::ui::tui::SetupScreen::enter()?),
-        gears::ui::select::Selected::Line => Box::new(gears::ui::line::SetupPrompts::new()?),
-    })
+struct StartupUi {
+    selected: Selected,
+    interactive: bool,
+    // The line session takes this reader, its queued input and its Ctrl-C handler.
+    line: Option<SetupPrompts>,
+}
+
+impl StartupUi {
+    fn load(args: &Args) -> Result<Option<(Config, Self)>, String> {
+        if process_role() == ProcessRole::None {
+            // Refuse a stored credential before opening or even selecting a UI.
+            let config = Config::load_user(args.config.as_deref())?;
+            return Ok(Some((config, Self::new(args)?)));
+        }
+        let mut ui = Self::new(args)?;
+        let config =
+            load_config(args, &mut ui).map_err(|error| format!("gears: config: {error}"))?;
+        Ok(config.map(|config| (config, ui)))
+    }
+
+    fn new(args: &Args) -> Result<Self, String> {
+        let interactive = args.action == Action::Run && args.prompt.is_none();
+        let selected = gears::ui::select::choose(args.ui, !interactive, || {
+            (
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            )
+        })
+        .map_err(|error| format!("gears: {error}"))?;
+        Ok(Self {
+            selected,
+            interactive,
+            line: None,
+        })
+    }
+
+    fn ask<T>(
+        &mut self,
+        question: impl FnOnce(&mut dyn gears::setup::Ask) -> Result<T, String>,
+    ) -> Result<T, String> {
+        match self.selected {
+            Selected::Tui => question(&mut gears::ui::tui::SetupScreen::enter()?),
+            Selected::Line => {
+                let input = match self.line.as_mut() {
+                    Some(input) => input,
+                    None => self.line.insert(SetupPrompts::new()?),
+                };
+                question(input)
+            }
+        }
+    }
 }
 
 fn agent(
     args: &Args,
     config: &Config,
     choice: Option<&ProviderChoice>,
-    key_from_env: Option<String>,
-    setup_ui: Option<gears::ui::select::Selected>,
+    mut keys: ProviderKeys,
+    mut ui: StartupUi,
 ) -> Result<(), String> {
     let mut config = config.clone();
     let workspace = args.workspace.clone().map_or_else(
         || std::env::current_dir().map_err(|error| format!("current directory: {error}")),
         Ok,
     )?;
-    let one_shot = args.prompt.is_some();
-    let selected = gears::ui::select::choose(args.ui, one_shot, || {
-        (
-            std::io::stdin().is_terminal(),
-            std::io::stdout().is_terminal(),
-        )
-    })?;
     let store = Store::new(&workspace)?;
     let mut session = open_session(&store, args)?;
     let (provider_name, selected_provider, model) = select(args, &config, choice, Some(&session))?;
-    let missing_key = key_from_env.is_none()
-        && selected_provider
-            .key_file
-            .as_ref()
-            .is_some_and(|path| !path.exists());
-    let (provider_name, selected_provider, model) = match (setup_ui, model) {
-        (Some(ui), None) => {
+    let (provider_name, selected_provider, model) = match model {
+        None if ui.interactive => {
             let directory = gears::directory::default_root()?;
-            let chosen = gears::setup::run(&config, &directory, asker(ui)?.as_mut())?
+            let chosen = ui
+                .ask(|ask| gears::setup::run(&config, &directory, ask, &mut keys))?
                 .ok_or("setup cancelled")?;
             if let Some(saved) = ProviderChoice::load_default()? {
                 config.apply_urls(&saved.urls)?;
@@ -252,16 +267,10 @@ fn agent(
                 .ok_or_else(|| format!("unknown provider {:?}", chosen.provider))?;
             (chosen.provider, provider, chosen.model)
         }
-        (Some(ui), Some(model)) if missing_key => {
-            if !gears::setup::ask_key(asker(ui)?.as_mut(), &provider_name, &selected_provider)? {
-                return Err("setup cancelled".into());
-            }
-            (provider_name, selected_provider, model)
-        }
-        (_, model) => (provider_name, selected_provider, model.ok_or(NO_MODEL)?),
+        model => (provider_name, selected_provider, model.ok_or(NO_MODEL)?),
     };
     let config = &config;
-    let key = load_key(&selected_provider, key_from_env.clone())?;
+    let key = startup_key(&mut keys, &provider_name, &selected_provider, &mut ui)?;
     let provider: Arc<dyn Provider> = Arc::new(connect(
         config,
         &provider_name,
@@ -275,7 +284,7 @@ fn agent(
     let mut runtime = Runtime::new(provider, store, session, config, model)?;
     let factory_config = config.clone();
     let verbosity = args.verbosity;
-    let factory: ProviderFactory = Arc::new(move |name| {
+    let factory: ProviderFactory = Arc::new(move |name, keys| {
         // `/setup` may have saved a new address since startup.
         let mut factory_config = factory_config.clone();
         if let Some(saved) = ProviderChoice::load_default()? {
@@ -284,13 +293,13 @@ fn agent(
         let selected = factory_config
             .provider(name)
             .ok_or_else(|| format!("unknown provider {name:?}"))?;
-        let key = load_key(&selected, key_from_env.clone())?;
+        let key = keys.load(name, &selected)?;
         Ok(
             Arc::new(connect(&factory_config, name, &selected, &key, verbosity)?)
                 as Arc<dyn Provider>,
         )
     });
-    runtime.install_provider_factory(factory);
+    runtime.install_provider_factory(keys, factory);
     if args.output == Output::Jsonl {
         return gears::ui::jsonl::run(
             &mut runtime,
@@ -298,13 +307,16 @@ fn agent(
             std::io::stdout().lock(),
         );
     }
-    let interactive = !one_shot;
-    let result = match selected {
-        gears::ui::select::Selected::Line => {
-            gears::ui::line::run(&mut runtime, args.prompt.clone(), interactive, config)
-        }
-        gears::ui::select::Selected::Tui => {
-            gears::ui::tui::run(&mut runtime, args.prompt.clone(), interactive, config)
+    let result = match ui.selected {
+        Selected::Line => gears::ui::line::run(
+            &mut runtime,
+            args.prompt.clone(),
+            ui.interactive,
+            config,
+            ui.line,
+        ),
+        Selected::Tui => {
+            gears::ui::tui::run(&mut runtime, args.prompt.clone(), ui.interactive, config)
         }
     };
     for notice in runtime.close() {
@@ -337,11 +349,12 @@ fn ask(
     args: &Args,
     config: &Config,
     choice: Option<&ProviderChoice>,
-    key_from_env: Option<String>,
+    mut keys: ProviderKeys,
+    ui: &mut StartupUi,
 ) -> Result<(), String> {
     let (provider_name, selected_provider, model) = select(args, config, choice, None)?;
     let model = model.ok_or(NO_MODEL)?;
-    let key = load_key(&selected_provider, key_from_env)?;
+    let key = startup_key(&mut keys, &provider_name, &selected_provider, ui)?;
     let provider = connect(
         config,
         &provider_name,
@@ -420,14 +433,19 @@ fn select(
     Ok((provider_name, provider, model))
 }
 
-/// `None` for a provider without a key file: it gets no key, not even one
-/// from the environment, so a cloud key never reaches a local server.
-fn load_key(provider: &NamedProvider, from_env: Option<String>) -> Result<Option<ApiKey>, String> {
-    match (&provider.key_file, from_env) {
-        (None, _) => Ok(None),
-        (Some(_), Some(key)) => ApiKey::parse(&key, KEY_ENV).map(Some),
-        (Some(path), None) => ApiKey::from_file(path).map(Some),
+fn startup_key(
+    keys: &mut ProviderKeys,
+    name: &str,
+    provider: &NamedProvider,
+    ui: &mut StartupUi,
+) -> Result<Option<ApiKey>, String> {
+    if keys.needs_input(name, provider)
+        && (ui.interactive || process_role() == ProcessRole::None)
+        && !ui.ask(|ask| keys.ask_missing(ask, name, provider))?
+    {
+        return Err("API key entry cancelled".into());
     }
+    keys.load(name, provider)
 }
 
 fn connect(

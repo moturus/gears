@@ -1,10 +1,12 @@
 //! First-run and `/setup` questions: the provider, a local server's address,
-//! the model and the API key. Answers are saved in the Gears directory, never
-//! in `gears.toml`.
+//! the model and the API key. The None role keeps its keys in memory.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::{Config, NamedProvider};
+use crate::platform::{ProcessRole, process_role};
+use crate::provider::{ApiKey, KEY_ENV};
 use crate::provider_choice::ProviderChoice;
 
 /// How a UI asks; `None` means the user cancelled.
@@ -45,7 +47,12 @@ pub fn ask_settings(
 
 /// Ask for a provider, its address when it is a local server, a model and a
 /// missing key; save them in `directory`. `None` if the user cancelled.
-pub fn run(config: &Config, directory: &Path, ask: &mut dyn Ask) -> Result<Option<Chosen>, String> {
+pub fn run(
+    config: &Config,
+    directory: &Path,
+    ask: &mut dyn Ask,
+    keys: &mut ProviderKeys,
+) -> Result<Option<Chosen>, String> {
     let mut names = config.providers.keys().cloned().collect::<Vec<_>>();
     if names.is_empty() {
         return Err("gears.toml defines no providers".into());
@@ -87,7 +94,7 @@ pub fn run(config: &Config, directory: &Path, ask: &mut dyn Ask) -> Result<Optio
     } else {
         models[index].clone()
     };
-    if !ask_key(ask, &name, provider)? {
+    if !keys.ask_missing(ask, &name, provider)? {
         return Ok(None);
     }
     let mut urls = ProviderChoice::load_at(directory)?
@@ -113,26 +120,84 @@ pub fn run(config: &Config, directory: &Path, ask: &mut dyn Ask) -> Result<Optio
     }))
 }
 
-/// Ask for the key when the provider's key file is missing. False if cancelled.
-pub fn ask_key(ask: &mut dyn Ask, name: &str, provider: &NamedProvider) -> Result<bool, String> {
-    let Some(path) = provider.key_file.as_deref().filter(|path| !path.exists()) else {
-        return Ok(true);
-    };
-    let title = format!("API key for {name} (saved in {})", path.display());
-    loop {
-        let Some(text) = ask.text(&title, true)? else {
-            return Ok(false);
-        };
-        if text.trim().is_empty() {
-            return Ok(false);
+/// The environment override applies to this run. A pasted key belongs to the
+/// provider it was entered for, including when switching back to that provider.
+#[derive(Default)]
+pub struct ProviderKeys {
+    from_env: Option<String>,
+    pasted: BTreeMap<String, ApiKey>,
+}
+
+impl ProviderKeys {
+    pub fn new(from_env: Option<String>) -> Self {
+        Self {
+            from_env,
+            ..Self::default()
         }
-        match crate::provider::ApiKey::parse(&text, "the key") {
-            Ok(key) => {
-                save_key(path, key.expose())?;
+    }
+
+    pub fn needs_input(&self, name: &str, provider: &NamedProvider) -> bool {
+        self.from_env.is_none()
+            && provider.key_file.as_ref().is_some_and(|path| {
+                if process_role() == ProcessRole::None {
+                    !self.pasted.contains_key(name)
+                } else {
+                    !path.exists()
+                }
+            })
+    }
+
+    /// False if the user cancelled the hidden prompt.
+    pub fn ask_missing(
+        &mut self,
+        ask: &mut dyn Ask,
+        name: &str,
+        provider: &NamedProvider,
+    ) -> Result<bool, String> {
+        let Some(path) = provider
+            .key_file
+            .as_deref()
+            .filter(|_| self.needs_input(name, provider))
+        else {
+            return Ok(true);
+        };
+        let memory_only = process_role() == ProcessRole::None;
+        let title = if memory_only {
+            format!("Paste the API key for {name} (this run only)")
+        } else {
+            format!("API key for {name} (saved in {})", path.display())
+        };
+        while let Some(text) = ask.text(&title, true)? {
+            if text.trim().is_empty() {
+                break;
+            }
+            if let Ok(key) = ApiKey::parse(&text, "the key") {
+                if memory_only {
+                    self.pasted.insert(name.into(), key);
+                } else {
+                    save_key(path, key.expose())?;
+                }
                 return Ok(true);
             }
-            Err(_) => continue,
         }
+        Ok(false)
+    }
+
+    pub fn load(&self, name: &str, provider: &NamedProvider) -> Result<Option<ApiKey>, String> {
+        let Some(path) = &provider.key_file else {
+            return Ok(None);
+        };
+        let key = if let Some(key) = &self.from_env {
+            ApiKey::parse(key, KEY_ENV)?
+        } else if process_role() == ProcessRole::None {
+            self.pasted
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("use /setup to enter the API key for {name}"))?
+        } else {
+            ApiKey::from_file(path)?
+        };
+        Ok(Some(key))
     }
 }
 
@@ -262,30 +327,40 @@ plain_http_allowlist = ['127.0.0.1']
     }
 
     #[test]
-    fn a_cloud_provider_asks_model_and_hidden_key_and_saves_both() {
+    fn a_cloud_provider_asks_for_a_hidden_key_and_reuses_it() {
         let (root, config) = fixture("cloud");
+        let mut keys = ProviderKeys::default();
         let mut ask = script(vec![
             Answer::Pick(0),
             Answer::Pick(1),
             Answer::Type(" sk-typed \n"),
         ]);
-        let chosen = run(&config, &root, &mut ask).unwrap().unwrap();
+        let chosen = run(&config, &root, &mut ask, &mut keys).unwrap().unwrap();
         assert_eq!(chosen.provider, "openrouter");
         assert_eq!(chosen.model, "vendor/pro");
         assert!(ask.asked[0].starts_with("Choose a provider: openrouter "));
         assert!(ask.asked[2].ends_with("hidden=true"), "{:?}", ask.asked);
+        let path = root.join("openrouter.key");
+        if process_role() == ProcessRole::None {
+            assert!(!path.exists());
+        } else {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "sk-typed\n");
+        }
         assert_eq!(
-            std::fs::read_to_string(root.join("openrouter.key")).unwrap(),
-            "sk-typed\n"
+            keys.load("openrouter", &config.providers["openrouter"])
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-typed"
         );
         let saved = ProviderChoice::load_at(&root).unwrap().unwrap();
         assert_eq!(
             (saved.provider.as_str(), saved.model.as_str()),
             ("openrouter", "vendor/pro")
         );
-        // With the key saved, choosing again asks no key question.
+        // Choosing the same provider again reuses its key.
         let mut again = script(vec![Answer::Pick(0), Answer::Pick(0)]);
-        run(&config, &root, &mut again).unwrap().unwrap();
+        run(&config, &root, &mut again, &mut keys).unwrap().unwrap();
         assert_eq!(again.asked.len(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -293,6 +368,7 @@ plain_http_allowlist = ['127.0.0.1']
     #[test]
     fn a_local_server_asks_its_address_and_needs_no_key() {
         let (root, config) = fixture("local");
+        let mut keys = ProviderKeys::default();
         // The default provider comes first, then the others sorted: local is second.
         let index = 1;
         let mut ask = script(vec![
@@ -303,7 +379,7 @@ plain_http_allowlist = ['127.0.0.1']
             Answer::Pick(1),
             Answer::Type("my-model"),
         ]);
-        let chosen = run(&config, &root, &mut ask).unwrap().unwrap();
+        let chosen = run(&config, &root, &mut ask, &mut keys).unwrap().unwrap();
         assert_eq!(
             chosen,
             Chosen {
@@ -320,7 +396,7 @@ plain_http_allowlist = ['127.0.0.1']
         assert_eq!(saved.urls["local"], "http://10.0.0.5:8080/v1");
         // Picking the configured address again drops the saved one.
         let mut again = script(vec![Answer::Pick(index), Answer::Pick(0), Answer::Pick(0)]);
-        run(&config, &root, &mut again).unwrap().unwrap();
+        run(&config, &root, &mut again, &mut keys).unwrap().unwrap();
         assert!(
             ProviderChoice::load_at(&root)
                 .unwrap()
@@ -340,7 +416,16 @@ plain_http_allowlist = ['127.0.0.1']
             vec![Answer::Pick(0), Answer::Pick(0), Answer::Cancel],
             vec![Answer::Pick(0), Answer::Pick(0), Answer::Type("")],
         ] {
-            assert_eq!(run(&config, &root, &mut script(answers)).unwrap(), None);
+            assert_eq!(
+                run(
+                    &config,
+                    &root,
+                    &mut script(answers),
+                    &mut ProviderKeys::default()
+                )
+                .unwrap(),
+                None
+            );
         }
         assert!(ProviderChoice::load_at(&root).unwrap().is_none());
         assert!(!root.join("openrouter.key").exists());

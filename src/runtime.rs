@@ -11,6 +11,7 @@ use crate::provider::{
     ToolOutcome, ToolSpec, Usage, UsageMeter,
 };
 use crate::session::{Compaction, Session, SessionInfo, Store, TreeItem};
+use crate::setup::ProviderKeys;
 use crate::tools::{Context, Registry};
 
 /// What a tool call returned to the model.
@@ -99,13 +100,15 @@ where
     }
 }
 
-pub type ProviderFactory = Arc<dyn Fn(&str) -> Result<Arc<dyn Provider>, String> + Send + Sync>;
+pub type ProviderFactory =
+    Arc<dyn Fn(&str, &ProviderKeys) -> Result<Arc<dyn Provider>, String> + Send + Sync>;
 
 pub struct Runtime {
     provider: Arc<dyn Provider>,
     provider_name: String,
     tools: Registry,
     provider_factory: Option<ProviderFactory>,
+    keys: ProviderKeys,
     store: Store,
     session: Session,
     prompt: Effective,
@@ -159,6 +162,7 @@ impl Runtime {
             provider,
             provider_name,
             provider_factory: None,
+            keys: ProviderKeys::default(),
             store,
             session,
             tools,
@@ -205,8 +209,35 @@ impl Runtime {
         &self.provider_name
     }
 
-    pub fn install_provider_factory(&mut self, factory: ProviderFactory) {
+    pub fn install_provider_factory(&mut self, keys: ProviderKeys, factory: ProviderFactory) {
+        self.keys = keys;
         self.provider_factory = Some(factory);
+    }
+
+    pub(crate) fn setup(
+        &mut self,
+        ask: &mut dyn crate::setup::Ask,
+    ) -> Result<Option<crate::setup::Chosen>, String> {
+        let directory = self.store.directory();
+        let mut config = self.config.clone();
+        if let Some(choice) = crate::provider_choice::ProviderChoice::load_at(directory)? {
+            config.apply_urls(&choice.urls)?;
+        }
+        crate::setup::run(&config, directory, ask, &mut self.keys)
+    }
+
+    pub(crate) fn ask_provider_key(
+        &mut self,
+        name: &str,
+        ask: &mut dyn crate::setup::Ask,
+    ) -> Result<(), String> {
+        if crate::platform::process_role() == crate::platform::ProcessRole::None
+            && let Some(provider) = self.config.providers.get(name)
+            && !self.keys.ask_missing(ask, name, provider)?
+        {
+            return Err("API key entry cancelled".into());
+        }
+        Ok(())
     }
 
     pub fn usage(&self) -> &UsageMeter {
@@ -450,7 +481,7 @@ impl Runtime {
             .provider_factory
             .as_ref()
             .ok_or("provider switching is not configured")?;
-        let provider = factory(name)?;
+        let provider = factory(name, &self.keys)?;
         self.cancellation.reset();
         let prompt = self.refresh_prompt()?;
         emit_notices(observer, self.take_startup_notices())?;
@@ -477,7 +508,7 @@ impl Runtime {
                 .provider_factory
                 .as_ref()
                 .ok_or("provider switching is not configured")?;
-            self.provider = factory(provider)?;
+            self.provider = factory(provider, &self.keys)?;
         } else {
             self.set_provider(provider, observer)?;
         }
@@ -621,7 +652,7 @@ impl Runtime {
                 .provider_factory
                 .as_ref()
                 .ok_or("provider switching is not configured")?;
-            Some(factory(&provider_name)?)
+            Some(factory(&provider_name, &self.keys)?)
         } else {
             None
         };

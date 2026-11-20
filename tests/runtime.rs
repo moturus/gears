@@ -13,7 +13,7 @@ use gears::provider::{
     Completion, ContentBlock, Endpoint, EventSink, FinishReason, Message, OpenAiCompat, Provider,
     ProviderError, Quirks, Request, StreamEvent, ToolCall, ToolOutcome,
 };
-use gears::runtime::{Event, Runtime, Waiting};
+use gears::runtime::{Event, ProviderFactory, Runtime, Waiting};
 use gears::session::Store;
 
 struct Scripted {
@@ -912,13 +912,14 @@ fn a_provider_switch_is_recorded_and_used_on_the_next_turn() {
     let second = Scripted::new(vec![answer("second answer")]);
     let mut runtime = fixture.runtime(first.clone(), &Config::default());
     let next = second.clone();
-    runtime.install_provider_factory(Arc::new(move |name| {
+    let factory: ProviderFactory = Arc::new(move |name, _| {
         if name == "second" {
             Ok(next.clone() as Arc<dyn Provider>)
         } else {
             Err(format!("unknown provider {name}"))
         }
-    }));
+    });
+    runtime.install_provider_factory(Default::default(), factory);
     runtime.turn("one".to_string(), &mut |_| Ok(())).unwrap();
     runtime.set_provider("second", &mut |_| Ok(())).unwrap();
     assert_eq!(runtime.provider_name(), "second");
@@ -968,13 +969,14 @@ fn switched_provider_sees_reasoning_cache_markers_and_retry_notice() {
         &Config::default(),
     );
     let second_url = second.url("/v1");
-    runtime.install_provider_factory(Arc::new(move |name| {
+    let factory: ProviderFactory = Arc::new(move |name, _| {
         if name == "second" {
             Ok(make_provider(&second_url, name))
         } else {
             Err(format!("unknown provider {name}"))
         }
-    }));
+    });
+    runtime.install_provider_factory(Default::default(), factory);
     runtime.turn("one".into(), &mut |_| Ok(())).unwrap();
     runtime.set_provider("second", &mut |_| Ok(())).unwrap();
     let mut events = Vec::new();
@@ -1040,13 +1042,14 @@ fn resuming_another_session_restores_its_provider() {
     )
     .unwrap();
     let next = second.clone();
-    runtime.install_provider_factory(Arc::new(move |name| {
+    let factory: ProviderFactory = Arc::new(move |name, _| {
         if name == "second" {
             Ok(next.clone() as Arc<dyn Provider>)
         } else {
             Err(format!("unknown provider {name}"))
         }
-    }));
+    });
+    runtime.install_provider_factory(Default::default(), factory);
     runtime.resume(&second_id).unwrap();
     assert_eq!(runtime.provider_name(), "second");
     runtime.turn("hello".to_string(), &mut |_| Ok(())).unwrap();

@@ -13,5 +13,8 @@ pub fn default_root() -> Result<PathBuf, String> {
         crate::state::StateRoot::new(root.clone())?;
         return Ok(root);
     }
-    Ok(PathBuf::from("/user/cfg/gears"))
+    Ok(PathBuf::from(match crate::platform::process_role() {
+        crate::platform::ProcessRole::None => "/none/cfg/gears",
+        _ => "/user/cfg/gears",
+    }))
 }

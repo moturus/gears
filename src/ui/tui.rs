@@ -1317,16 +1317,12 @@ fn handle_command(
             app.restore_history(runtime)?;
             show_runtime_notices(runtime, app);
         }
-        "setup" => {
-            let current = super::current_config(config)?;
-            let directory = crate::directory::default_root()?;
-            match crate::setup::run(&current, &directory, &mut AppAsk(app))? {
-                Some(chosen) => {
-                    runtime.apply_setup(&chosen.provider, chosen.model, &mut AppObserver(app))?;
-                }
-                None => app.push(Kind::Notice, "Setup cancelled.".into(), false),
+        "setup" => match runtime.setup(&mut AppAsk(app))? {
+            Some(chosen) => {
+                runtime.apply_setup(&chosen.provider, chosen.model, &mut AppObserver(app))?;
             }
-        }
+            None => app.push(Kind::Notice, "Setup cancelled.".into(), false),
+        },
         "reset" => {
             let choices = ["No".to_string(), "Yes".to_string()];
             if picker(app, crate::reset::DESCRIPTION, &choices)? != Some(1) {
@@ -1491,6 +1487,7 @@ fn handle_command(
             } else {
                 argument.to_string()
             };
+            runtime.ask_provider_key(&provider, &mut AppAsk(app))?;
             runtime.set_provider(&provider, &mut AppObserver(app))?;
             if save_default {
                 runtime.save_default_selection()?;

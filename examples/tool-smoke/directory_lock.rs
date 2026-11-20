@@ -35,7 +35,6 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
 fn check(gears: &Path, root: &Path) -> Result<(), String> {
     let server = MockServer::start(vec![]).map_err(|error| error.to_string())?;
     let key = root.join("key");
-    std::fs::write(&key, "fixture-lock-key").map_err(|error| error.to_string())?;
     let config = root.join("gears.toml");
     super::config::write(
         &config,
@@ -56,7 +55,7 @@ fn check(gears: &Path, root: &Path) -> Result<(), String> {
             .env("HOME", root)
             .env(gears::directory::ENV, root.join(".gears"))
             .env_remove("GEARS_LOCK_OWNER")
-            .env_remove(gears::provider::KEY_ENV);
+            .env(gears::provider::KEY_ENV, "fixture-lock-key");
         command
     };
     let mut first = Running(

@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct ApiKey(String);
 
 impl ApiKey {

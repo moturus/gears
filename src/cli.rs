@@ -40,6 +40,7 @@ Interactive commands include /new, /resume, /name, /session, /tree, /label,
 /reset, /help, and /quit.
 Without a chosen model, an interactive start asks for the provider, model and
 key; /setup asks again at any time.
+As None, supply OPENROUTER_API_KEY for this run or paste the key when prompted.
 `gears reset` and /reset ask, then remove keys, saved settings and sessions
 from the Gears directory (keeping gears.toml and the system prompt it names)
 and .gears/ from the current directory.

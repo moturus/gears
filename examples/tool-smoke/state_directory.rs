@@ -18,7 +18,6 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
         r#"{"choices":[{"index":0,"delta":{"content":"Isolated response."},"finish_reason":"stop"}]}"#
     ])).map_err(|e| e.to_string())?;
     let key = selected.join("key");
-    std::fs::write(&key, "fixture").map_err(|e| e.to_string())?;
     let config = selected.join("gears.toml");
     let settings = format!(
         "[provider]\nbase_url={:?}\napi_key_file={:?}\nmodel='config-model'\n[net]\negress_allowlist=['127.0.0.1']\nplain_http_allowlist=['127.0.0.1']\n",
@@ -50,8 +49,11 @@ pub fn smoke(gears: &Path) -> Result<(), String> {
         stdin: None,
         timeout: Duration::from_secs(30),
         max_output_bytes: 65536,
-        env: vec![(gears::directory::ENV.into(), selected.display().to_string())],
-        remove_env: vec!["GEARS_LOCK_OWNER".into(), gears::provider::KEY_ENV.into()],
+        env: vec![
+            (gears::directory::ENV.into(), selected.display().to_string()),
+            (gears::provider::KEY_ENV.into(), "fixture".into()),
+        ],
+        remove_env: vec!["GEARS_LOCK_OWNER".into()],
     };
     let output = run(&request, &Cancellation::new(), &mut |_, _| {}).map_err(|e| e.to_string())?;
     assert!(!output.success());

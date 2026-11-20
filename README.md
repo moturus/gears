@@ -8,13 +8,19 @@ UIs, and five built-in tools. It does not prescribe a coding workflow.
 
 Start `gears`. The first time, it asks which provider to use (the shipped
 `gears.toml` offers OpenRouter, OpenAI and a local server), the local server's
-address, a model from the provider's list or any other id, and the API key,
-which is typed hidden and saved in the Gears directory. Later starts ask nothing;
-`/setup` asks again. A `-p` run never asks. Nothing needs editing in `gears.toml`.
+address, a model from the provider's list or any other id, and the API key.
+Interactive saves a key entered at the hidden prompt in the Gears directory.
+Use `/setup` to choose again.
 
 Each provider names its key file (`api_key_file`, kept in the Gears directory);
 `OPENROUTER_API_KEY` overrides it for one run, and a provider without a key
-file is sent no key. A model can also be given directly:
+file is sent no key. Gears removes the environment variable before starting
+tools. As None, Gears checks every configured provider's key file at startup
+and exits if it finds a readable key. Supply `OPENROUTER_API_KEY` for that
+run or paste the key at the hidden prompt. This also works with `ask` and
+`-p`. Pasted keys stay in memory for their respective providers until exit.
+
+A model can also be given directly:
 
     gears --model provider/model
     gears -p "answer once" --model provider/model
@@ -26,8 +32,8 @@ Use --ui line or --ui tui to choose explicitly.
 Without `--config`, Gears reads `gears.toml` from the Gears directory. Run from
 its own source tree (`lorry run` in the Gears source directory), it uses
 the shipped `config/gears.toml` when the Gears directory has none, and asks
-which to use when both exist. Keys, settings and sessions always stay in the
-Gears directory. A provider address saved in `provider.toml` replaces the
+which to use when both exist as Interactive. None prefers its own settings.
+A provider address saved in `provider.toml` replaces the
 configured one, and its host is allowed for egress.
 
 Gears always provides five tools: `sh`, `read_file`, `write_file`, `patch_file`
@@ -52,7 +58,8 @@ tool processes.
 
 ## Configuration
 
-The default configuration is `/user/cfg/gears/gears.toml`. Set
+The default configuration is `/user/cfg/gears/gears.toml` for Interactive
+and `/none/cfg/gears/gears.toml` for None. Set
 `GEARS_DIRECTORY` to an absolute path to select another Gears directory.
 A minimal file is:
 
@@ -108,7 +115,7 @@ runs until the model stops or Ctrl+C cancels it.
 Saved sessions are versioned append-only JSONL trees grouped by canonical
 workspace:
 
-- /user/cfg/gears/sessions/
+- `sessions/` in the role's Gears directory
 
 Each entry has an id and parent_id. Selecting an earlier entry changes only
 the conversation branch; it does not undo commands or filesystem changes.
@@ -230,8 +237,8 @@ your model, using a context size the model supports:
       --host 192.168.4.1 --port 8080 --ctx-size 32768 --parallel 1 --jinja
 
 Tool use requires a model and chat template supporting tool calls. An
-unauthenticated local server needs no key file. Save this as `/user/cfg/gears/gears.toml`,
-with the `SYSTEM.md` it names beside it:
+unauthenticated local server needs no key file. Save this as `gears.toml` in
+the role's Gears directory, with the `SYSTEM.md` it names beside it:
 
 ```toml
 version = 1
@@ -263,8 +270,8 @@ hosts omit it by default; set `reasoning_echo = true` or `false` under
 
 A provider without `api_key_file` is sent no `Authorization` header, and
 `OPENROUTER_API_KEY` is ignored for it, so a cloud key never travels over HTTP
-to a local server. If the server uses authentication, give the provider an
-`api_key_file` holding its key.
+to a local server. If the server uses authentication, set `api_key_file` for
+that provider. None supplies the key for each run.
 
 Check the host connection and start Gears from the desired guest workspace:
 

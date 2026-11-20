@@ -179,6 +179,32 @@ struct RawContext {
 }
 
 impl Config {
+    /// Check every configured credential, including those for inactive providers.
+    /// A protected file is unavailable to this process and can stay in place.
+    fn check_no_stored_keys(&self) -> Result<(), String> {
+        use std::io::{BufReader, ErrorKind, Read};
+
+        for path in self.providers.values().filter_map(|p| p.key_file.as_ref()) {
+            let file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+                    continue;
+                }
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
+            for byte in BufReader::new(file).bytes() {
+                let byte = byte.map_err(|e| format!("{}: {e}", path.display()))?;
+                if !byte.is_ascii_whitespace() {
+                    return Err(format!(
+                        "API key available to None user at {}: please remove it.",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn provider(&self, name: &str) -> Option<NamedProvider> {
         self.providers.get(name).cloned()
     }
@@ -324,6 +350,9 @@ impl Config {
                 let directory = crate::directory::default_root().ok();
                 let mut config = Self::parse_with_base(&text, directory.as_deref())
                     .map_err(|error| format!("{}: {error}", path.display()))?;
+                if crate::platform::process_role() == crate::platform::ProcessRole::None {
+                    config.check_no_stored_keys()?;
+                }
                 config.source_path = Some(path.to_path_buf());
                 config.read_system_prompt()?;
                 Ok(Some(config))
