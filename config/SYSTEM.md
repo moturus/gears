@@ -40,6 +40,7 @@ Use `curl` to inspect crates.io and github.com.
   of `> /dev/null`
 * There's no `cmp` (yet), use `diff`
 * There's no `git`, so instead of `git diff` use `diff` or `gix diff`
+* Use "Motor OS", not just "Motor", i.e. don't drop "OS"
 
 ## How to work on Rust code on Motor OS
 
